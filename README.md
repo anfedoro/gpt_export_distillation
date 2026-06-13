@@ -74,7 +74,7 @@ uv sync --extra nlp
 
 This installs optional dependencies used only when the NLP mode is explicitly enabled in config.
 
-### Install as a tool
+### Install as a tool from a local checkout
 
 ```bash
 uv tool install /path/to/gpt_export_distillation
@@ -84,6 +84,18 @@ Reinstall after local changes:
 
 ```bash
 uv tool install --reinstall /path/to/gpt_export_distillation
+```
+
+### Install as a tool directly from GitHub
+
+```bash
+uv tool install git+https://github.com/anfedoro/gpt_export_distillation
+```
+
+Reinstall from GitHub:
+
+```bash
+uv tool install --reinstall git+https://github.com/anfedoro/gpt_export_distillation
 ```
 
 ## Quick start
