@@ -1,0 +1,22 @@
+[project]
+name = "gpt-export-distillation"
+version = "0.1.0"
+description = "Distill ChatGPT exports into Markdown-only reviewable folders"
+readme = "README.md"
+authors = [
+    { name = "anfedoro", email = "anfedoro@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = []
+
+[project.optional-dependencies]
+nlp = [
+    "pymorphy3>=2.0.4",
+]
+
+[project.scripts]
+gpt-export-distillation = "gpt_export_distillation:main"
+
+[build-system]
+requires = ["uv_build>=0.11.19,<0.12.0"]
+build-backend = "uv_build"
