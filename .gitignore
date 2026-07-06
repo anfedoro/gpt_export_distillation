@@ -17,3 +17,6 @@ wheels/
 
 # Temporary local run configs
 .tmp_*.toml
+
+# Local knowledge base artifacts
+*.db
