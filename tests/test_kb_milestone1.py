@@ -15,6 +15,8 @@ if str(SRC) not in sys.path:
 from kb.cli import build_edges_command, build_nodes_command, embed_knowledge_blocks, ingest_attachments, ingest_chats  # noqa: E402
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
+from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider  # noqa: E402
+from kb.retrieval.context_pack import ContextPackOptions, build_context_pack  # noqa: E402
 from kb.retrieval.hybrid_search import hybrid_query  # noqa: E402
 from kb.storage.sqlite_store import SQLiteStore, init_db  # noqa: E402
 
@@ -304,6 +306,53 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertIn("hybrid_sim", edge_kinds)
             self.assertEqual(policy_versions, ["similarity-edges-v0"])
             self.assertGreater(shared_terms_rows, 0)
+
+    def test_context_pack_combines_direct_node_and_neighbor_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            chat_dir = root / "Projects" / "Project_17"
+            chat_dir.mkdir(parents=True)
+            (chat_dir / "chat.md").write_text(SAMPLE_CHAT, encoding="utf-8")
+            db = Path(tmp) / "chat_memory.db"
+
+            ingest_chats(root, db, limit=10)
+            embed_knowledge_blocks(
+                db_path=db,
+                provider="mock",
+                dense_provider="mock",
+                sparse_provider="mock",
+            )
+            build_nodes_command(db_path=db, mode="deterministic", sparse_top_k=10)
+            build_edges_command(db_path=db, scope="project", top_k=2)
+
+            payload = build_context_pack(
+                db_path=db,
+                query="memory routing",
+                dense=MockDenseProvider(),
+                sparse=MockSparseProvider(),
+                dense_provider="mock",
+                sparse_provider="mock",
+                dense_model="",
+                sparse_model="",
+                sparse_top_k=10,
+                options=ContextPackOptions(
+                    budget_tokens=200,
+                    direct_limit=2,
+                    node_limit=2,
+                    node_member_limit=2,
+                    neighbor_limit=2,
+                ),
+            )
+
+            self.assertGreaterEqual(len(payload["selected_blocks"]), 1)
+            paths = {trace["path"] for trace in payload["source_trace"]}
+            self.assertIn("query -> block direct", paths)
+            self.assertTrue(any(path.startswith("query -> node:") for path in paths))
+            self.assertIn("query -> block -> neighbor", paths)
+            self.assertLessEqual(
+                sum(item["token_count_estimate"] for item in payload["selected_blocks"]),
+                200,
+            )
 
 
 if __name__ == "__main__":
