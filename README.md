@@ -74,6 +74,17 @@ uv sync --extra nlp
 
 This installs optional dependencies used only when the NLP mode is explicitly enabled in config.
 
+### Install optional knowledge base support
+
+```bash
+cd /path/to/gpt_export_distillation
+uv sync --extra kb
+```
+
+This installs Sentence Transformers support for local dense and sparse embedding providers used by the experimental `kb-index` and `kb-search` commands.
+
+Future extension: Sentence Transformers also supports multimodal models. A later knowledge-base phase can add image or visual attachment indexing for screenshots, diagrams, and rendered pages while preserving `attachment_id`, page, slide, and source-file traceability. This is intentionally outside the text-first MVP and should not be mixed into the current text vector policy without an explicit scoring contract.
+
 ### Install as a tool from a local checkout
 
 ```bash

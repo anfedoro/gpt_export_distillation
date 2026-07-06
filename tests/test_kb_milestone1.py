@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
 from kb.cli import embed_knowledge_blocks, ingest_attachments, ingest_chats  # noqa: E402
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
+from kb.retrieval.hybrid_search import hybrid_query  # noqa: E402
 from kb.storage.sqlite_store import SQLiteStore, init_db  # noqa: E402
 
 
@@ -180,6 +181,38 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertEqual(stats["dense_vectors"], stats["knowledge_blocks"])
             self.assertGreater(stats["sparse_terms"], 0)
             self.assertEqual(linked, stats["knowledge_blocks"])
+
+    def test_hybrid_query_returns_traceable_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            chat_dir = root / "Projects" / "Project_17"
+            chat_dir.mkdir(parents=True)
+            (chat_dir / "chat.md").write_text(SAMPLE_CHAT, encoding="utf-8")
+            db = Path(tmp) / "chat_memory.db"
+
+            ingest_chats(root, db, limit=10)
+            embed_knowledge_blocks(
+                db_path=db,
+                provider="mock",
+                dense_provider="mock",
+                sparse_provider="mock",
+            )
+            payload = hybrid_query(
+                db_path=db,
+                query="memory routing",
+                dense_provider="mock",
+                sparse_provider="mock",
+                limit=3,
+            )
+
+            self.assertGreater(payload["candidate_blocks"], 0)
+            self.assertGreaterEqual(len(payload["results"]), 1)
+            top = payload["results"][0]
+            self.assertIn("Projects/Project_17/chat.md", top["source_path"])
+            self.assertIn("final_score", top)
+            self.assertIn("dense_score", top)
+            self.assertIn("sparse_score", top)
+            self.assertIn("preview", top)
 
 
 if __name__ == "__main__":
