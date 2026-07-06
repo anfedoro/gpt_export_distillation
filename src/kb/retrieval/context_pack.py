@@ -28,6 +28,7 @@ def build_context_pack(
     dense_model: str,
     sparse_model: str,
     sparse_top_k: int,
+    include_low_interest: bool = False,
     project: str | None = None,
     options: ContextPackOptions = ContextPackOptions(),
 ) -> dict[str, Any]:
@@ -44,6 +45,7 @@ def build_context_pack(
                 dense_model_version=dense.model_version if dense else None,
                 sparse_model_name=sparse.model_name if sparse else None,
                 project=project,
+                include_low_interest=include_low_interest,
             ),
             query_dense=query_dense,
             query_sparse=query_sparse,
@@ -63,7 +65,11 @@ def build_context_pack(
             limit=options.node_limit,
         )
         for node_hit in node_hits:
-            members = store.semantic_node_member_blocks(node_hit["node_id"], limit=options.node_member_limit)
+            members = store.semantic_node_member_blocks(
+                node_hit["node_id"],
+                limit=options.node_member_limit,
+                include_low_interest=include_low_interest,
+            )
             for block in members:
                 score = node_hit["score"] * float(block["membership_weight"])
                 _add_candidate(candidates, block, score, f"query -> node:{node_hit['node_type']} -> member block")
@@ -77,7 +83,7 @@ def build_context_pack(
                 )
 
         seed_ids = list(candidates)
-        neighbors = store.neighbor_blocks(seed_ids, limit=options.neighbor_limit)
+        neighbors = store.neighbor_blocks(seed_ids, limit=options.neighbor_limit, include_low_interest=include_low_interest)
         for block in neighbors:
             score = float(block["edge_weight"]) * 0.5
             _add_candidate(candidates, block, score, "query -> block -> neighbor")
@@ -161,6 +167,7 @@ def _add_candidate(candidates: dict[str, dict[str, Any]], block: dict[str, Any],
         "message_id": block["message_id"],
         "role": block["role"],
         "block_type": block["block_type"],
+        "interest_tier": block["interest_tier"],
         "token_count_estimate": block["token_count_estimate"],
         "text": block["text_for_display"],
     }

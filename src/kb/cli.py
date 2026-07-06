@@ -55,6 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     embed.add_argument("--limit", type=int)
     embed.add_argument("--batch-size", type=int, default=32)
     embed.add_argument("--force", action="store_true")
+    embed.add_argument("--skip-low-interest-content", action=argparse.BooleanOptionalAction, default=True)
 
     build_nodes = sub.add_parser("build-nodes", help="Build deterministic semantic nodes.")
     build_nodes.add_argument("--db", required=True)
@@ -135,6 +136,7 @@ def main() -> None:
             limit=args.limit,
             batch_size=args.batch_size,
             force=args.force,
+            skip_low_interest_content=args.skip_low_interest_content,
         )
         print(json.dumps(stats, ensure_ascii=False, indent=2, sort_keys=True))
         return
@@ -267,6 +269,7 @@ def embed_knowledge_blocks(
     limit: int | None = None,
     batch_size: int = 32,
     force: bool = False,
+    skip_low_interest_content: bool = True,
 ) -> dict[str, int | float | str | None]:
     dense_name = dense_provider or provider
     dense = _build_dense_provider(dense_name, dense_model)
@@ -290,6 +293,7 @@ def embed_knowledge_blocks(
             dense_model_version=dense.model_version if dense else None,
             sparse_model_name=sparse.model_name if sparse else None,
             force=force,
+            skip_low_interest_content=skip_low_interest_content,
         )
         for start in range(0, len(rows), batch_size):
             batch = rows[start : start + batch_size]

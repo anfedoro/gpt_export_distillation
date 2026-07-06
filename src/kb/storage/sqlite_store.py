@@ -26,9 +26,23 @@ def init_db(db_path: Path) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        _ensure_interest_tier_columns(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def _ensure_interest_tier_columns(conn: sqlite3.Connection) -> None:
+    _add_column_if_missing(conn, "source_documents", "interest_tier", "TEXT NOT NULL DEFAULT 'normal'")
+    _add_column_if_missing(conn, "knowledge_blocks", "interest_tier", "TEXT NOT NULL DEFAULT 'normal'")
+    conn.execute("UPDATE source_documents SET interest_tier = 'low' WHERE folder_kind = 'common_trash'")
+    conn.execute("UPDATE knowledge_blocks SET interest_tier = 'low' WHERE folder_kind = 'common_trash'")
+
+
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 class SQLiteStore:
@@ -51,13 +65,14 @@ class SQLiteStore:
         self.conn.execute(
             """
             INSERT INTO source_documents (
-                id, path, relative_path, source_kind, folder_kind, project_id, project_name,
+                id, path, relative_path, source_kind, folder_kind, interest_tier, project_id, project_name,
                 file_name, extension, sha256, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(relative_path, sha256) DO UPDATE SET
                 path=excluded.path,
                 source_kind=excluded.source_kind,
                 folder_kind=excluded.folder_kind,
+                interest_tier=excluded.interest_tier,
                 project_id=excluded.project_id,
                 project_name=excluded.project_name,
                 file_name=excluded.file_name,
@@ -70,6 +85,7 @@ class SQLiteStore:
                 item.relative_path,
                 item.detected_kind,
                 item.folder_kind,
+                item.interest_tier,
                 item.project_path,
                 item.project_path,
                 item.file_name,
@@ -138,9 +154,9 @@ class SQLiteStore:
                 """
                 INSERT INTO knowledge_blocks (
                     id, source_type, source_document_id, conversation_id, message_id, block_id,
-                    attachment_id, project_id, folder_kind, role, block_type, text_for_embedding,
+                    attachment_id, project_id, folder_kind, interest_tier, role, block_type, text_for_embedding,
                     text_for_display, token_count_estimate, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     stable_id("attachment_block", attachment_id, block.ordinal, prefix="kb"),
@@ -152,6 +168,7 @@ class SQLiteStore:
                     attachment_id,
                     item.project_path,
                     item.folder_kind,
+                    item.interest_tier,
                     None,
                     block.block_type,
                     text_for_embedding,
@@ -192,11 +209,15 @@ class SQLiteStore:
         dense_model_version: str | None = None,
         sparse_model_name: str | None = None,
         force: bool = False,
+        skip_low_interest_content: bool = True,
     ) -> list[sqlite3.Row]:
         where: list[str] = []
+        pending: list[str] = []
         params: list[Any] = []
+        if skip_low_interest_content:
+            where.append("interest_tier NOT IN ('low', 'quarantine')")
         if not force and dense_model_name is not None:
-            where.append(
+            pending.append(
                 """
                 NOT EXISTS (
                     SELECT 1 FROM dense_vectors dv
@@ -209,7 +230,7 @@ class SQLiteStore:
             )
             params.extend([dense_model_name, dense_model_version])
         if not force and sparse_model_name is not None:
-            where.append(
+            pending.append(
                 """
                 NOT EXISTS (
                     SELECT 1 FROM sparse_terms st
@@ -220,9 +241,11 @@ class SQLiteStore:
                 """
             )
             params.append(sparse_model_name)
+        if pending:
+            where.append("(" + " OR ".join(f"({clause})" for clause in pending) + ")")
         query = "SELECT id, text_for_embedding FROM knowledge_blocks"
         if where:
-            query += " WHERE " + " OR ".join(f"({clause})" for clause in where)
+            query += " WHERE " + " AND ".join(f"({clause})" for clause in where)
         query += " ORDER BY id"
         if limit is not None:
             query += " LIMIT ?"
@@ -317,6 +340,7 @@ class SQLiteStore:
         dense_model_version: str | None,
         sparse_model_name: str | None,
         project: str | None = None,
+        include_low_interest: bool = False,
     ) -> list[dict[str, Any]]:
         params: list[Any] = []
         dense_join = ""
@@ -346,6 +370,8 @@ class SQLiteStore:
             embedding_filters.append("st.owner_id IS NOT NULL")
         if embedding_filters:
             where.append("(" + " OR ".join(embedding_filters) + ")")
+        if not include_low_interest:
+            where.append("kb.interest_tier NOT IN ('low', 'quarantine')")
         if project is not None:
             where.append("kb.project_id = ?")
             params.append(project)
@@ -354,10 +380,12 @@ class SQLiteStore:
                 kb.id AS knowledge_block_id,
                 kb.project_id,
                 kb.folder_kind,
+                kb.interest_tier,
                 kb.conversation_id,
                 kb.message_id,
                 kb.role,
                 kb.block_type,
+                kb.interest_tier,
                 kb.text_for_display,
                 sd.relative_path AS source_path,
                 c.title AS conversation_title,
@@ -382,6 +410,7 @@ class SQLiteStore:
                     "knowledge_block_id": block_id,
                     "project_id": row["project_id"],
                     "folder_kind": row["folder_kind"],
+                    "interest_tier": row["interest_tier"],
                     "conversation_id": row["conversation_id"],
                     "message_id": row["message_id"],
                     "role": row["role"],
@@ -603,6 +632,7 @@ class SQLiteStore:
                 kb.message_id,
                 kb.role,
                 kb.block_type,
+                kb.interest_tier,
                 kb.text_for_display,
                 kb.token_count_estimate,
                 sd.relative_path AS source_path,
@@ -660,7 +690,8 @@ class SQLiteStore:
                 item["sparse_terms"][row["token_text"]] = float(row["weight"])
         return list(grouped.values())
 
-    def semantic_node_member_blocks(self, node_id: str, *, limit: int) -> list[dict[str, Any]]:
+    def semantic_node_member_blocks(self, node_id: str, *, limit: int, include_low_interest: bool = False) -> list[dict[str, Any]]:
+        interest_filter = "" if include_low_interest else "AND kb.interest_tier NOT IN ('low', 'quarantine')"
         query = """
             SELECT
                 kb.id AS knowledge_block_id,
@@ -669,6 +700,7 @@ class SQLiteStore:
                 kb.message_id,
                 kb.role,
                 kb.block_type,
+                kb.interest_tier,
                 kb.text_for_display,
                 kb.token_count_estimate,
                 sd.relative_path AS source_path,
@@ -679,16 +711,17 @@ class SQLiteStore:
             JOIN source_documents sd ON sd.id = kb.source_document_id
             LEFT JOIN conversations c ON c.id = kb.conversation_id
             WHERE snm.node_id = ?
+              {interest_filter}
             ORDER BY snm.membership_weight DESC, kb.token_count_estimate DESC, kb.id
             LIMIT ?
-        """
+        """.format(interest_filter=interest_filter)
         return [dict(row) for row in self.conn.execute(query, (node_id, limit)).fetchall()]
 
-    def neighbor_blocks(self, block_ids: list[str], *, limit: int) -> list[dict[str, Any]]:
+    def neighbor_blocks(self, block_ids: list[str], *, limit: int, include_low_interest: bool = False) -> list[dict[str, Any]]:
         if not block_ids:
             return []
         placeholders = ",".join("?" for _ in block_ids)
-        query = f"""
+        query = """
             WITH edge_hits AS (
                 SELECT
                     CASE WHEN src_id IN ({placeholders}) THEN dst_id ELSE src_id END AS neighbor_id,
@@ -707,6 +740,7 @@ class SQLiteStore:
                 kb.message_id,
                 kb.role,
                 kb.block_type,
+                kb.interest_tier,
                 kb.text_for_display,
                 kb.token_count_estimate,
                 sd.relative_path AS source_path,
@@ -718,9 +752,13 @@ class SQLiteStore:
             JOIN knowledge_blocks kb ON kb.id = eh.neighbor_id
             JOIN source_documents sd ON sd.id = kb.source_document_id
             LEFT JOIN conversations c ON c.id = kb.conversation_id
+            {interest_filter}
             ORDER BY eh.weight DESC, kb.id
             LIMIT ?
-        """
+        """.format(
+            placeholders=placeholders,
+            interest_filter="" if include_low_interest else "WHERE kb.interest_tier NOT IN ('low', 'quarantine')",
+        )
         params = block_ids + block_ids + block_ids + block_ids + [limit]
         return [dict(row) for row in self.conn.execute(query, params).fetchall()]
 
@@ -798,6 +836,7 @@ class SQLiteStore:
     def _insert_knowledge_block(self, conversation: Conversation, messages: list[Message], block: Block) -> None:
         message_by_id = {message.id: message for message in messages}
         message = message_by_id[block.message_id]
+        interest_tier = self._source_interest_tier(conversation.source_document_id)
         text_for_display = block.raw_text
         text_for_embedding = "\n".join(
             part
@@ -814,9 +853,9 @@ class SQLiteStore:
             """
             INSERT OR REPLACE INTO knowledge_blocks (
                 id, source_type, source_document_id, conversation_id, message_id, block_id,
-                attachment_id, project_id, folder_kind, role, block_type, text_for_embedding,
+                attachment_id, project_id, folder_kind, interest_tier, role, block_type, text_for_embedding,
                 text_for_display, token_count_estimate, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 stable_id("chat_block", block.id, prefix="kb"),
@@ -828,6 +867,7 @@ class SQLiteStore:
                 None,
                 conversation.project_id,
                 conversation.folder_kind,
+                interest_tier,
                 message.role,
                 block.block_type,
                 text_for_embedding,
@@ -836,6 +876,13 @@ class SQLiteStore:
                 _json({}),
             ),
         )
+
+    def _source_interest_tier(self, source_document_id: str) -> str:
+        row = self.conn.execute(
+            "SELECT interest_tier FROM source_documents WHERE id = ?",
+            (source_document_id,),
+        ).fetchone()
+        return str(row["interest_tier"]) if row and row["interest_tier"] else "normal"
 
 
 def _json(value: dict[str, Any] | list[Any]) -> str:

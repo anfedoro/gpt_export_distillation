@@ -18,6 +18,7 @@ class InventoryItem:
     folder_kind: str | None
     project_path: str | None
     is_attachment: bool
+    interest_tier: str
 
 
 @dataclass(frozen=True)
