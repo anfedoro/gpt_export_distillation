@@ -9,7 +9,7 @@ import re
 import shutil
 
 from .config import AppConfig
-from .models import ChatDocument, ChatMetrics, InputBundle, MessageRow
+from .models import ChatDocument, ChatMetrics, InputBundle, LibraryFileRecord, MessageRow
 from .nlp import normalize_token
 
 
@@ -462,14 +462,163 @@ def attachment_lines(bundle: InputBundle) -> list[str]:
     return lines
 
 
+def _library_file_label(item: LibraryFileRecord) -> str:
+    return item.normalized_name or item.file_name or item.file_id or "unknown"
+
+
+def _library_file_group_key(value: str | None) -> str:
+    return value if value else "unset"
+
+
+def _format_item_list(items: list[str], limit: int = 5) -> str:
+    if not items:
+        return "[]"
+    visible = items[:limit]
+    suffix = "" if len(items) <= limit else f" +{len(items) - limit} more"
+    return ", ".join(f"`{item}`" for item in visible) + suffix
+
+
+def _group_library_files(
+    bundle: InputBundle,
+    key_func,
+) -> list[tuple[str, list[LibraryFileRecord]]]:
+    groups: dict[str, list[LibraryFileRecord]] = defaultdict(list)
+    for item in bundle.library_files:
+        groups[key_func(item)].append(item)
+    return sorted(
+        groups.items(),
+        key=lambda entry: (-len(entry[1]), entry[0].lower()),
+    )
+
+
+def _conversation_lookup(bundle: InputBundle) -> dict[str, dict]:
+    lookup: dict[str, dict] = {}
+    for conversation in bundle.conversations:
+        conversation_id = conversation.get("conversation_id") or conversation.get("id")
+        if isinstance(conversation_id, str) and conversation_id:
+            lookup[conversation_id] = conversation
+    return lookup
+
+
 def library_lines(bundle: InputBundle) -> list[str]:
     if not bundle.library_files:
         return ["# Library Files", "", "No library file metadata in export."]
-    lines = ["# Library Files", "", f"Entries: `{len(bundle.library_files)}`", ""]
-    for item in bundle.library_files:
-        name = item.get("name") or item.get("file_name") or item.get("id") or "unknown"
-        kind = item.get("mime_type") or item.get("type") or ""
-        lines.append(f"- `{name}` {kind}".rstrip())
+
+    project_like = sum(1 for item in bundle.library_files if item.is_project is True)
+    pinned_entries = sum(1 for item in bundle.library_files if item.pinned_at is not None)
+    unique_knowledge_store_ids = {
+        item.knowledge_store_id for item in bundle.library_files if item.knowledge_store_id
+    }
+    unique_directory_ids = {
+        item.directory_id for item in bundle.library_files if item.directory_id
+    }
+    thread_linked = [item for item in bundle.library_files if item.origination_thread_id]
+    conversation_lookup = _conversation_lookup(bundle)
+    thread_to_template_ids: dict[str, set[str]] = defaultdict(set)
+    thread_to_titles: dict[str, set[str]] = defaultdict(set)
+    thread_to_library_labels: dict[str, list[str]] = defaultdict(list)
+    for item in thread_linked:
+        thread_id = item.origination_thread_id
+        if not thread_id:
+            continue
+        thread_to_library_labels[thread_id].append(_library_file_label(item))
+        conversation = conversation_lookup.get(thread_id)
+        if not conversation:
+            continue
+        template_id = conversation.get("conversation_template_id")
+        if isinstance(template_id, str) and template_id:
+            thread_to_template_ids[thread_id].add(template_id)
+        title = conversation.get("title")
+        if isinstance(title, str) and title.strip():
+            thread_to_titles[thread_id].add(title.strip())
+
+    stable_template_hints = [
+        (
+            thread_id,
+            sorted(template_ids)[0],
+            sorted(thread_to_titles.get(thread_id, set()))[0]
+            if thread_to_titles.get(thread_id)
+            else "",
+            len(thread_to_library_labels[thread_id]),
+        )
+        for thread_id, template_ids in sorted(thread_to_template_ids.items())
+        if len(template_ids) == 1
+    ]
+
+    lines = [
+        "# Library Files",
+        "",
+        f"- `entries`: `{len(bundle.library_files)}`",
+        f"- `project_like_entries`: `{project_like}`",
+        f"- `pinned_entries`: `{pinned_entries}`",
+        f"- `unique_knowledge_store_id`: `{len(unique_knowledge_store_ids)}`",
+        f"- `unique_directory_id`: `{len(unique_directory_ids)}`",
+        f"- `thread_linked_entries`: `{len(thread_linked)}`",
+        "",
+        "## By is_project",
+        "",
+    ]
+    is_project_groups = Counter(
+        "true" if item.is_project is True else "false" if item.is_project is False else "unset"
+        for item in bundle.library_files
+    )
+    for key in ("true", "false", "unset"):
+        count = is_project_groups.get(key)
+        if count:
+            lines.append(f"- `{key}`: `{count}`")
+    lines.extend(["", "## By library_file_category", ""])
+    for group_name, items in _group_library_files(
+        bundle,
+        lambda item: _library_file_group_key(item.library_file_category),
+    ):
+        sample = _format_item_list([_library_file_label(item) for item in items])
+        lines.append(f"- `{group_name}`: `{len(items)}` | {sample}")
+    lines.extend(["", "## By mime_type", ""])
+    for group_name, items in _group_library_files(
+        bundle,
+        lambda item: _library_file_group_key(item.mime_type),
+    ):
+        sample = _format_item_list([_library_file_label(item) for item in items])
+        lines.append(f"- `{group_name}`: `{len(items)}` | {sample}")
+    lines.extend(["", "## By directory_id", ""])
+    for group_name, items in _group_library_files(
+        bundle,
+        lambda item: _library_file_group_key(item.directory_id),
+    ):
+        sample = _format_item_list([_library_file_label(item) for item in items])
+        lines.append(f"- `{group_name}`: `{len(items)}` | {sample}")
+    lines.extend(["", "## By knowledge_store_id", ""])
+    for group_name, items in _group_library_files(
+        bundle,
+        lambda item: _library_file_group_key(item.knowledge_store_id),
+    ):
+        sample = _format_item_list([_library_file_label(item) for item in items])
+        lines.append(f"- `{group_name}`: `{len(items)}` | {sample}")
+    lines.extend(["", "## Project Hints", ""])
+    if stable_template_hints:
+        for thread_id, template_id, title, count in stable_template_hints:
+            title_suffix = f" | `{title}`" if title else ""
+            lines.append(
+                f"- thread `{thread_id}` -> template `{template_id}` | `{count}` file(s){title_suffix}"
+            )
+    else:
+        lines.append(
+            "No stable `origination_thread_id` to `conversation_template_id` correspondence observed in this export."
+        )
+    if thread_to_library_labels:
+        lines.extend(["", "## Thread-Linked Files", ""])
+        for thread_id, labels in sorted(
+            thread_to_library_labels.items(), key=lambda entry: (-len(entry[1]), entry[0])
+        ):
+            title = ""
+            if thread_id in conversation_lookup:
+                conv_title = conversation_lookup[thread_id].get("title")
+                if isinstance(conv_title, str) and conv_title.strip():
+                    title = conv_title.strip()
+            title_suffix = f" | `{title}`" if title else ""
+            lines.append(
+                f"- `{thread_id}`: `{len(labels)}` file(s){title_suffix} | {_format_item_list(sorted(labels))}"
+            )
     return lines
 
 
@@ -660,8 +809,10 @@ def write_output(
             encoding="utf-8",
         )
     if config.output.include_files_summary:
-        (output_root / "FILES.md").write_text(
-            "\n".join(library_lines(bundle)),
+        library_summary = "\n".join(library_lines(bundle))
+        (output_root / "FILES.md").write_text(library_summary, encoding="utf-8")
+        (output_root / "LIBRARY_FILES.md").write_text(
+            library_summary,
             encoding="utf-8",
         )
     return output_root

@@ -18,9 +18,30 @@ class InputBundle:
     source: ExportSource
     conversations: list[dict[str, Any]]
     asset_file_names: dict[str, str] = field(default_factory=dict)
-    library_files: list[dict[str, Any]] = field(default_factory=list)
+    library_files: list["LibraryFileRecord"] = field(default_factory=list)
     shared_conversations: list[dict[str, Any]] = field(default_factory=list)
     manifest: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class LibraryFileRecord:
+    raw: dict[str, Any]
+    file_id: str
+    file_name: str
+    normalized_name: str
+    mime_type: str | None
+    library_file_category: str | None
+    directory_id: str | None
+    knowledge_store_id: str | None
+    knowledge_store_kind: str | None
+    origination_thread_id: str | None
+    origination_message_id: str | None
+    is_project: bool | None
+    pinned_at: str | None
+    context_scopes: tuple[str, ...] = ()
+    context_scopes_v2: tuple[str, ...] = ()
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
 @dataclass(frozen=True)

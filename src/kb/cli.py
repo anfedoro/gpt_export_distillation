@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
+from typing import Iterable, TypeVar
 
 from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider
 from kb.embeddings.sentence_transformer_provider import (
@@ -15,6 +17,9 @@ from kb.ingest.attachment_parser import parse_attachment
 from kb.ingest.chat_md_parser import parse_chat_file, write_parsed_chat_json
 from kb.ingest.tree_walker import scan_tree, write_inventory_jsonl
 from kb.storage.sqlite_store import SQLiteStore, init_db
+
+
+T = TypeVar("T")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_cmd.add_argument("--no-embeddings", action="store_true")
     import_cmd.add_argument("--no-nodes", action="store_true")
     import_cmd.add_argument("--no-edges", action="store_true")
+    import_cmd.add_argument("--quiet", action="store_true", help="Disable progress output on stderr.")
 
     ingest_attachments_parser = sub.add_parser("ingest-attachments", help="Extract supported attachments into knowledge blocks.")
     ingest_attachments_parser.add_argument("--input", required=True)
@@ -78,6 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     embed.add_argument("--batch-size", type=int, default=32)
     embed.add_argument("--force", action="store_true")
     embed.add_argument("--skip-low-interest-content", action=argparse.BooleanOptionalAction, default=True)
+    embed.add_argument("--quiet", action="store_true", help="Disable progress output on stderr.")
 
     build_nodes = sub.add_parser("build-nodes", help="Build deterministic semantic nodes.")
     build_nodes.add_argument("--db", required=True)
@@ -154,6 +161,7 @@ def main() -> None:
             include_embeddings=not args.no_embeddings,
             include_nodes=not args.no_nodes,
             include_edges=not args.no_edges,
+            progress=not args.quiet,
         )
         print(json.dumps(stats, ensure_ascii=False, indent=2, sort_keys=True))
         return
@@ -186,6 +194,7 @@ def main() -> None:
             batch_size=args.batch_size,
             force=args.force,
             skip_low_interest_content=args.skip_low_interest_content,
+            progress=not args.quiet,
         )
         print(json.dumps(stats, ensure_ascii=False, indent=2, sort_keys=True))
         return
@@ -329,14 +338,18 @@ def import_knowledge_base(
     include_embeddings: bool = True,
     include_nodes: bool = True,
     include_edges: bool = True,
+    progress: bool = False,
 ) -> dict[str, object]:
     stages: dict[str, object] = {}
+    _progress_message("stage 1/5 ingest chats", enabled=progress)
     stages["ingest_chats"] = ingest_chats(input_dir=input_dir, db_path=db_path, limit=limit, project=project)
     if include_attachments:
+        _progress_message("stage 2/5 ingest attachments", enabled=progress)
         stages["ingest_attachments"] = ingest_attachments(input_dir=input_dir, db_path=db_path, project=project)
     else:
         stages["ingest_attachments"] = {"skipped": True}
     if include_embeddings:
+        _progress_message("stage 3/5 embed knowledge blocks", enabled=progress)
         stages["embed"] = embed_knowledge_blocks(
             db_path=db_path,
             provider=provider,
@@ -348,14 +361,17 @@ def import_knowledge_base(
             batch_size=batch_size,
             force=force_embeddings,
             skip_low_interest_content=skip_low_interest_content,
+            progress=progress,
         )
     else:
         stages["embed"] = {"skipped": True}
     if include_nodes:
+        _progress_message("stage 4/5 build semantic nodes", enabled=progress)
         stages["build_nodes"] = build_nodes_command(db_path=db_path, mode="deterministic", sparse_top_k=min(sparse_top_k, 50))
     else:
         stages["build_nodes"] = {"skipped": True}
     if include_edges:
+        _progress_message("stage 5/5 build semantic edges", enabled=progress)
         stages["build_edges"] = build_edges_command(
             db_path=db_path,
             scope=edge_scope,
@@ -366,6 +382,7 @@ def import_knowledge_base(
         stages["build_edges"] = {"skipped": True}
     with SQLiteStore(db_path) as store:
         final_stats = store.stats()
+    _progress_message("done", enabled=progress)
     return {"stages": stages, "final": final_stats}
 
 
@@ -382,6 +399,7 @@ def embed_knowledge_blocks(
     batch_size: int = 32,
     force: bool = False,
     skip_low_interest_content: bool = True,
+    progress: bool = False,
 ) -> dict[str, int | float | str | None]:
     dense_name = dense_provider or provider
     dense = _build_dense_provider(dense_name, dense_model)
@@ -407,7 +425,15 @@ def embed_knowledge_blocks(
             force=force,
             skip_low_interest_content=skip_low_interest_content,
         )
-        for start in range(0, len(rows), batch_size):
+        starts = range(0, len(rows), batch_size)
+        batch_iter = _progress_iter(
+            starts,
+            enabled=progress,
+            total=len(starts),
+            description="embedding batches",
+            unit="batch",
+        )
+        for start in batch_iter:
             batch = rows[start : start + batch_size]
             texts = [str(row["text_for_embedding"]) for row in batch]
             dense_results = dense.embed_texts(texts) if dense else [None] * len(batch)
@@ -482,6 +508,37 @@ def _build_sparse_provider(provider_name: str, sparse_model: str, sparse_top_k: 
             raise ValueError("--sparse-top-k must be positive.")
         return SentenceTransformerSparseProvider(sparse_model, top_k=sparse_top_k)
     raise ValueError(f"Unsupported sparse provider: {provider_name}")
+
+
+def _progress_message(message: str, *, enabled: bool) -> None:
+    if enabled:
+        print(f"[kb-index] {message}", file=sys.stderr, flush=True)
+
+
+def _progress_iter(
+    items: Iterable[T],
+    *,
+    enabled: bool,
+    total: int,
+    description: str,
+    unit: str,
+) -> Iterable[T]:
+    if not enabled:
+        return items
+    try:
+        from tqdm.auto import tqdm
+
+        return tqdm(items, total=total, desc=description, unit=unit)
+    except Exception:  # noqa: BLE001
+        return _plain_progress_iter(items, total=total, description=description, unit=unit)
+
+
+def _plain_progress_iter(items: Iterable[T], *, total: int, description: str, unit: str) -> Iterable[T]:
+    step = max(1, total // 20)
+    for index, item in enumerate(items, start=1):
+        if index == 1 or index == total or index % step == 0:
+            print(f"[kb-index] {description}: {index}/{total} {unit}s", file=sys.stderr, flush=True)
+        yield item
 
 
 def build_nodes_command(*, db_path: Path, mode: str = "deterministic", sparse_top_k: int = 50) -> dict[str, int]:

@@ -154,6 +154,7 @@ uv run kb-index import \
 ```
 
 This runs chat ingestion, attachment ingestion, embeddings, deterministic semantic nodes, and scoped semantic edges. It prints one JSON report with per-stage stats plus final table counts.
+Long-running import and embedding commands show progress on stderr by default; pass `--quiet` to keep only the final JSON on stdout.
 
 The lower-level commands are useful for debugging or partial rebuilds:
 
