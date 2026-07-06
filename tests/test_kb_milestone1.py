@@ -16,6 +16,7 @@ from kb.cli import build_edges_command, build_nodes_command, embed_knowledge_blo
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider  # noqa: E402
+from kb.mcp.server import ServerConfig, handle_request  # noqa: E402
 from kb.retrieval.context_pack import ContextPackOptions, build_context_pack  # noqa: E402
 from kb.retrieval.hybrid_search import hybrid_query  # noqa: E402
 from kb.storage.sqlite_store import SQLiteStore, init_db  # noqa: E402
@@ -416,6 +417,51 @@ class KBMilestone1Tests(unittest.TestCase):
                 sum(item["token_count_estimate"] for item in payload["selected_blocks"]),
                 200,
             )
+
+    def test_mcp_server_exposes_only_context_pack_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            chat_dir = root / "Projects" / "Project_17"
+            chat_dir.mkdir(parents=True)
+            (chat_dir / "chat.md").write_text(SAMPLE_CHAT, encoding="utf-8")
+            db = Path(tmp) / "chat_memory.db"
+
+            ingest_chats(root, db, limit=10)
+            embed_knowledge_blocks(
+                db_path=db,
+                provider="mock",
+                dense_provider="mock",
+                sparse_provider="mock",
+            )
+            build_nodes_command(db_path=db, mode="deterministic", sparse_top_k=10)
+            build_edges_command(db_path=db, scope="project", top_k=2)
+            config = ServerConfig(
+                db_path=db,
+                dense_provider="mock",
+                sparse_provider="mock",
+            )
+
+            tools = handle_request(config, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+            self.assertEqual([tool["name"] for tool in tools["result"]["tools"]], ["build_context_pack"])
+
+            response = handle_request(
+                config,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "build_context_pack",
+                        "arguments": {"query": "memory routing", "token_budget": 200},
+                    },
+                },
+            )
+
+            self.assertFalse(response["result"]["isError"])
+            payload = json.loads(response["result"]["content"][0]["text"])
+            self.assertIn("context_text", payload)
+            self.assertIn("source_references", payload)
+            self.assertGreaterEqual(len(payload["selected_blocks"]), 1)
 
 
 if __name__ == "__main__":

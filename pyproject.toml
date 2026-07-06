@@ -21,6 +21,7 @@ kb = [
 gpt-export-distillation = "gpt_export_distillation:main"
 kb-index = "kb.cli:main"
 kb-search = "kb.retrieval.hybrid_search:main"
+kb-mcp = "kb.mcp.server:main"
 
 [build-system]
 requires = ["uv_build>=0.11.19,<0.12.0"]
