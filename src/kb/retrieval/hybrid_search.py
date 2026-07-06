@@ -28,6 +28,21 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--sparse-top-k", type=int, default=128)
     query.add_argument("--json", action="store_true", dest="json_output")
 
+    context = sub.add_parser("context", help="Build a traceable context pack.")
+    context.add_argument("query")
+    context.add_argument("--db", required=True)
+    context.add_argument("--budget-tokens", type=int, default=4000)
+    context.add_argument("--project")
+    context.add_argument("--direct-limit", type=int, default=10)
+    context.add_argument("--node-limit", type=int, default=5)
+    context.add_argument("--node-member-limit", type=int, default=5)
+    context.add_argument("--neighbor-limit", type=int, default=5)
+    context.add_argument("--dense-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
+    context.add_argument("--sparse-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
+    context.add_argument("--dense-model", default="sentence-transformers/all-MiniLM-L6-v2")
+    context.add_argument("--sparse-model", default="naver/splade-cocondenser-ensembledistil")
+    context.add_argument("--sparse-top-k", type=int, default=128)
+
     return parser
 
 
@@ -51,6 +66,31 @@ def main() -> None:
             print(json.dumps(results, ensure_ascii=False, indent=2, sort_keys=True))
         else:
             _print_results(results)
+    elif args.command == "context":
+        from kb.retrieval.context_pack import ContextPackOptions, build_context_pack
+
+        dense = _build_dense_provider(args.dense_provider, args.dense_model)
+        sparse = _build_sparse_provider(args.sparse_provider, args.sparse_model, args.sparse_top_k)
+        payload = build_context_pack(
+            db_path=Path(args.db).expanduser(),
+            query=args.query,
+            dense=dense,
+            sparse=sparse,
+            dense_provider=args.dense_provider,
+            sparse_provider=args.sparse_provider,
+            dense_model=args.dense_model,
+            sparse_model=args.sparse_model,
+            sparse_top_k=args.sparse_top_k,
+            project=args.project,
+            options=ContextPackOptions(
+                budget_tokens=args.budget_tokens,
+                direct_limit=args.direct_limit,
+                node_limit=args.node_limit,
+                node_member_limit=args.node_member_limit,
+                neighbor_limit=args.neighbor_limit,
+            ),
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def hybrid_query(

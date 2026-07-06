@@ -591,6 +591,139 @@ class SQLiteStore:
             ],
         )
 
+    def blocks_by_ids(self, block_ids: list[str]) -> dict[str, dict[str, Any]]:
+        if not block_ids:
+            return {}
+        placeholders = ",".join("?" for _ in block_ids)
+        query = f"""
+            SELECT
+                kb.id AS knowledge_block_id,
+                kb.project_id,
+                kb.conversation_id,
+                kb.message_id,
+                kb.role,
+                kb.block_type,
+                kb.text_for_display,
+                kb.token_count_estimate,
+                sd.relative_path AS source_path,
+                c.title AS conversation_title
+            FROM knowledge_blocks kb
+            JOIN source_documents sd ON sd.id = kb.source_document_id
+            LEFT JOIN conversations c ON c.id = kb.conversation_id
+            WHERE kb.id IN ({placeholders})
+        """
+        return {
+            str(row["knowledge_block_id"]): dict(row)
+            for row in self.conn.execute(query, block_ids).fetchall()
+        }
+
+    def semantic_nodes_for_search(self, *, project: str | None = None) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        where = ""
+        if project is not None:
+            where = "WHERE sn.project_id = ?"
+            params.append(project)
+        query = f"""
+            SELECT
+                sn.id AS node_id,
+                sn.node_type,
+                sn.project_id,
+                sn.title,
+                sn.top_terms_json,
+                dv.vector_json AS dense_vector_json,
+                st.token_text,
+                st.weight
+            FROM semantic_nodes sn
+            LEFT JOIN dense_vectors dv ON dv.id = sn.dense_vector_id
+            LEFT JOIN sparse_terms st
+              ON st.owner_type = 'semantic_node'
+             AND st.owner_id = sn.id
+            {where}
+            ORDER BY sn.id
+        """
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in self.conn.execute(query, params).fetchall():
+            node_id = str(row["node_id"])
+            item = grouped.setdefault(
+                node_id,
+                {
+                    "node_id": node_id,
+                    "node_type": row["node_type"],
+                    "project_id": row["project_id"],
+                    "title": row["title"],
+                    "top_terms_json": row["top_terms_json"],
+                    "dense_vector": json.loads(row["dense_vector_json"]) if row["dense_vector_json"] else None,
+                    "sparse_terms": {},
+                },
+            )
+            if row["token_text"] is not None:
+                item["sparse_terms"][row["token_text"]] = float(row["weight"])
+        return list(grouped.values())
+
+    def semantic_node_member_blocks(self, node_id: str, *, limit: int) -> list[dict[str, Any]]:
+        query = """
+            SELECT
+                kb.id AS knowledge_block_id,
+                kb.project_id,
+                kb.conversation_id,
+                kb.message_id,
+                kb.role,
+                kb.block_type,
+                kb.text_for_display,
+                kb.token_count_estimate,
+                sd.relative_path AS source_path,
+                c.title AS conversation_title,
+                snm.membership_weight
+            FROM semantic_node_members snm
+            JOIN knowledge_blocks kb ON kb.id = snm.knowledge_block_id
+            JOIN source_documents sd ON sd.id = kb.source_document_id
+            LEFT JOIN conversations c ON c.id = kb.conversation_id
+            WHERE snm.node_id = ?
+            ORDER BY snm.membership_weight DESC, kb.token_count_estimate DESC, kb.id
+            LIMIT ?
+        """
+        return [dict(row) for row in self.conn.execute(query, (node_id, limit)).fetchall()]
+
+    def neighbor_blocks(self, block_ids: list[str], *, limit: int) -> list[dict[str, Any]]:
+        if not block_ids:
+            return []
+        placeholders = ",".join("?" for _ in block_ids)
+        query = f"""
+            WITH edge_hits AS (
+                SELECT
+                    CASE WHEN src_id IN ({placeholders}) THEN dst_id ELSE src_id END AS neighbor_id,
+                    CASE WHEN src_id IN ({placeholders}) THEN src_id ELSE dst_id END AS from_block_id,
+                    weight,
+                    edge_kind
+                FROM semantic_edges
+                WHERE src_type = 'block'
+                  AND dst_type = 'block'
+                  AND (src_id IN ({placeholders}) OR dst_id IN ({placeholders}))
+            )
+            SELECT
+                kb.id AS knowledge_block_id,
+                kb.project_id,
+                kb.conversation_id,
+                kb.message_id,
+                kb.role,
+                kb.block_type,
+                kb.text_for_display,
+                kb.token_count_estimate,
+                sd.relative_path AS source_path,
+                c.title AS conversation_title,
+                eh.from_block_id,
+                eh.weight AS edge_weight,
+                eh.edge_kind
+            FROM edge_hits eh
+            JOIN knowledge_blocks kb ON kb.id = eh.neighbor_id
+            JOIN source_documents sd ON sd.id = kb.source_document_id
+            LEFT JOIN conversations c ON c.id = kb.conversation_id
+            ORDER BY eh.weight DESC, kb.id
+            LIMIT ?
+        """
+        params = block_ids + block_ids + block_ids + block_ids + [limit]
+        return [dict(row) for row in self.conn.execute(query, params).fetchall()]
+
     def _insert_conversation(self, conversation: Conversation) -> None:
         self.conn.execute(
             """
