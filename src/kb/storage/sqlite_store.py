@@ -276,6 +276,73 @@ class SQLiteStore:
         force: bool = False,
         skip_low_interest_content: bool = True,
     ) -> list[sqlite3.Row]:
+        query, params = self._knowledge_blocks_for_embedding_query(
+            limit=limit,
+            dense_model_name=dense_model_name,
+            dense_model_version=dense_model_version,
+            sparse_model_name=sparse_model_name,
+            force=force,
+            skip_low_interest_content=skip_low_interest_content,
+        )
+        return list(self.conn.execute(query, params).fetchall())
+
+    def count_knowledge_blocks_for_embedding(
+        self,
+        *,
+        limit: int | None = None,
+        dense_model_name: str | None = None,
+        dense_model_version: str | None = None,
+        sparse_model_name: str | None = None,
+        force: bool = False,
+        skip_low_interest_content: bool = True,
+    ) -> int:
+        query, params = self._knowledge_blocks_for_embedding_query(
+            limit=limit,
+            dense_model_name=dense_model_name,
+            dense_model_version=dense_model_version,
+            sparse_model_name=sparse_model_name,
+            force=force,
+            skip_low_interest_content=skip_low_interest_content,
+            count_only=True,
+        )
+        return int(self.conn.execute(query, params).fetchone()[0])
+
+    def knowledge_blocks_for_embedding_batch(
+        self,
+        *,
+        after_id: str | None,
+        batch_size: int,
+        dense_model_name: str | None = None,
+        dense_model_version: str | None = None,
+        sparse_model_name: str | None = None,
+        force: bool = False,
+        skip_low_interest_content: bool = True,
+    ) -> list[sqlite3.Row]:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        query, params = self._knowledge_blocks_for_embedding_query(
+            limit=batch_size,
+            dense_model_name=dense_model_name,
+            dense_model_version=dense_model_version,
+            sparse_model_name=sparse_model_name,
+            force=force,
+            skip_low_interest_content=skip_low_interest_content,
+            after_id=after_id,
+        )
+        return list(self.conn.execute(query, params).fetchall())
+
+    def _knowledge_blocks_for_embedding_query(
+        self,
+        *,
+        limit: int | None,
+        dense_model_name: str | None,
+        dense_model_version: str | None,
+        sparse_model_name: str | None,
+        force: bool,
+        skip_low_interest_content: bool,
+        after_id: str | None = None,
+        count_only: bool = False,
+    ) -> tuple[str, list[Any]]:
         where: list[str] = []
         pending: list[str] = []
         params: list[Any] = []
@@ -308,14 +375,21 @@ class SQLiteStore:
             params.append(sparse_model_name)
         if pending:
             where.append("(" + " OR ".join(f"({clause})" for clause in pending) + ")")
-        query = "SELECT id, text_for_embedding FROM knowledge_blocks"
+        if after_id is not None:
+            where.append("id > ?")
+            params.append(after_id)
+        query = "SELECT COUNT(*) AS cnt FROM knowledge_blocks" if count_only else "SELECT id, text_for_embedding FROM knowledge_blocks"
         if where:
             query += " WHERE " + " AND ".join(f"({clause})" for clause in where)
-        query += " ORDER BY id"
-        if limit is not None:
+        if not count_only:
+            query += " ORDER BY id"
+        if limit is not None and not count_only:
             query += " LIMIT ?"
             params.append(limit)
-        return list(self.conn.execute(query, params).fetchall())
+        if limit is not None and count_only:
+            query = f"SELECT MIN(cnt, ?) FROM ({query})"
+            params = [limit, *params]
+        return query, params
 
     def upsert_dense_vector(
         self,
