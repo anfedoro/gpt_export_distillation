@@ -68,15 +68,19 @@ def _parse_metadata(text: str) -> dict[str, Any]:
 
 
 def _parse_messages(text: str, source_document_id: str) -> list[Message]:
-    matches = list(MESSAGE_HEADING_RE.finditer(text))
+    matches = _message_heading_matches(text)
     messages: list[Message] = []
     for idx, match in enumerate(matches):
         start = match.end()
         end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-        ordinal = int(match.group(1))
+        heading_ordinal = int(match.group(1))
+        ordinal = idx + 1
         role = ROLE_MAP.get(match.group(2).strip().lower(), "unknown")
         section = text[start:end].strip("\n")
         attrs, body = _split_message_attrs(section)
+        metadata_json = {k: v for k, v in attrs.items() if k not in {"message_id", "time_utc"}}
+        if heading_ordinal != ordinal:
+            metadata_json["heading_ordinal"] = heading_ordinal
         message_id = attrs.get("message_id")
         message = Message(
             id=stable_id(source_document_id, ordinal, message_id, prefix="msg"),
@@ -86,10 +90,30 @@ def _parse_messages(text: str, source_document_id: str) -> list[Message]:
             message_id=message_id,
             time_utc=attrs.get("time_utc"),
             raw_text=body,
-            metadata_json={k: v for k, v in attrs.items() if k not in {"message_id", "time_utc"}},
+            metadata_json=metadata_json,
         )
         messages.append(message)
     return messages
+
+
+def _message_heading_matches(text: str) -> list[re.Match[str]]:
+    matches: list[re.Match[str]] = []
+    in_fence = False
+    for line_match in re.finditer(r"^.*(?:\n|$)", text, flags=re.MULTILINE):
+        line = line_match.group(0)
+        if line == "":
+            continue
+        stripped = line.rstrip("\n")
+        fence_match = FENCE_RE.match(stripped)
+        if fence_match:
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        heading_match = MESSAGE_HEADING_RE.match(text, line_match.start())
+        if heading_match:
+            matches.append(heading_match)
+    return matches
 
 
 def _split_message_attrs(section: str) -> tuple[dict[str, str], str]:

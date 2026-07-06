@@ -38,6 +38,28 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--limit", type=int)
     ingest.add_argument("--project")
 
+    import_cmd = sub.add_parser("import", help="Build a query-ready knowledge DB from a distilled export tree.")
+    import_cmd.add_argument("--input", required=True)
+    import_cmd.add_argument("--db", required=True)
+    import_cmd.add_argument("--limit", type=int, help="Limit chat markdown ingestion; attachments are still scanned.")
+    import_cmd.add_argument("--project")
+    import_cmd.add_argument("--provider", choices=["sentence-transformers", "mock"], default="sentence-transformers")
+    import_cmd.add_argument("--dense-provider", choices=["sentence-transformers", "mock", "none"])
+    import_cmd.add_argument("--sparse-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
+    import_cmd.add_argument("--dense-model", default="sentence-transformers/all-MiniLM-L6-v2")
+    import_cmd.add_argument("--sparse-model", default="naver/splade-cocondenser-ensembledistil")
+    import_cmd.add_argument("--sparse-top-k", type=int, default=128)
+    import_cmd.add_argument("--batch-size", type=int, default=32)
+    import_cmd.add_argument("--force-embeddings", action="store_true")
+    import_cmd.add_argument("--skip-low-interest-content", action=argparse.BooleanOptionalAction, default=True)
+    import_cmd.add_argument("--edge-scope", choices=["conversation", "project", "attachment"], default="project")
+    import_cmd.add_argument("--edge-top-k", type=int, default=10)
+    import_cmd.add_argument("--edge-max-group-size", type=int, default=1000)
+    import_cmd.add_argument("--no-attachments", action="store_true")
+    import_cmd.add_argument("--no-embeddings", action="store_true")
+    import_cmd.add_argument("--no-nodes", action="store_true")
+    import_cmd.add_argument("--no-edges", action="store_true")
+
     ingest_attachments_parser = sub.add_parser("ingest-attachments", help="Extract supported attachments into knowledge blocks.")
     ingest_attachments_parser.add_argument("--input", required=True)
     ingest_attachments_parser.add_argument("--db", required=True)
@@ -66,6 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_edges.add_argument("--db", required=True)
     build_edges.add_argument("--scope", choices=["conversation", "project", "attachment"], default="project")
     build_edges.add_argument("--top-k", type=int, default=10)
+    build_edges.add_argument("--max-group-size", type=int, default=1000)
     build_edges.add_argument("--no-dense", action="store_true")
     build_edges.add_argument("--no-sparse", action="store_true")
 
@@ -105,6 +128,32 @@ def main() -> None:
             db_path=Path(args.db).expanduser(),
             limit=args.limit,
             project=args.project,
+        )
+        print(json.dumps(stats, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if args.command == "import":
+        stats = import_knowledge_base(
+            input_dir=Path(args.input).expanduser(),
+            db_path=Path(args.db).expanduser(),
+            limit=args.limit,
+            project=args.project,
+            provider=args.provider,
+            dense_provider=args.dense_provider,
+            sparse_provider=args.sparse_provider,
+            dense_model=args.dense_model,
+            sparse_model=args.sparse_model,
+            sparse_top_k=args.sparse_top_k,
+            batch_size=args.batch_size,
+            force_embeddings=args.force_embeddings,
+            skip_low_interest_content=args.skip_low_interest_content,
+            edge_scope=args.edge_scope,
+            edge_top_k=args.edge_top_k,
+            edge_max_group_size=args.edge_max_group_size,
+            include_attachments=not args.no_attachments,
+            include_embeddings=not args.no_embeddings,
+            include_nodes=not args.no_nodes,
+            include_edges=not args.no_edges,
         )
         print(json.dumps(stats, ensure_ascii=False, indent=2, sort_keys=True))
         return
@@ -157,6 +206,7 @@ def main() -> None:
             top_k=args.top_k,
             include_dense=not args.no_dense,
             include_sparse=not args.no_sparse,
+            max_group_size=args.max_group_size,
         )
         print(json.dumps(stats, ensure_ascii=False, indent=2, sort_keys=True))
         return
@@ -255,6 +305,68 @@ def ingest_attachments(input_dir: Path, db_path: Path, limit: int | None = None,
         "blocks_created": blocks_created,
         "skipped": skipped,
     }
+
+
+def import_knowledge_base(
+    *,
+    input_dir: Path,
+    db_path: Path,
+    limit: int | None = None,
+    project: str | None = None,
+    provider: str = "sentence-transformers",
+    dense_provider: str | None = None,
+    sparse_provider: str = "sentence-transformers",
+    dense_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+    sparse_model: str = "naver/splade-cocondenser-ensembledistil",
+    sparse_top_k: int = 128,
+    batch_size: int = 32,
+    force_embeddings: bool = False,
+    skip_low_interest_content: bool = True,
+    edge_scope: str = "project",
+    edge_top_k: int = 10,
+    edge_max_group_size: int = 1000,
+    include_attachments: bool = True,
+    include_embeddings: bool = True,
+    include_nodes: bool = True,
+    include_edges: bool = True,
+) -> dict[str, object]:
+    stages: dict[str, object] = {}
+    stages["ingest_chats"] = ingest_chats(input_dir=input_dir, db_path=db_path, limit=limit, project=project)
+    if include_attachments:
+        stages["ingest_attachments"] = ingest_attachments(input_dir=input_dir, db_path=db_path, project=project)
+    else:
+        stages["ingest_attachments"] = {"skipped": True}
+    if include_embeddings:
+        stages["embed"] = embed_knowledge_blocks(
+            db_path=db_path,
+            provider=provider,
+            dense_provider=dense_provider,
+            sparse_provider=sparse_provider,
+            dense_model=dense_model,
+            sparse_model=sparse_model,
+            sparse_top_k=sparse_top_k,
+            batch_size=batch_size,
+            force=force_embeddings,
+            skip_low_interest_content=skip_low_interest_content,
+        )
+    else:
+        stages["embed"] = {"skipped": True}
+    if include_nodes:
+        stages["build_nodes"] = build_nodes_command(db_path=db_path, mode="deterministic", sparse_top_k=min(sparse_top_k, 50))
+    else:
+        stages["build_nodes"] = {"skipped": True}
+    if include_edges:
+        stages["build_edges"] = build_edges_command(
+            db_path=db_path,
+            scope=edge_scope,
+            top_k=edge_top_k,
+            max_group_size=edge_max_group_size,
+        )
+    else:
+        stages["build_edges"] = {"skipped": True}
+    with SQLiteStore(db_path) as store:
+        final_stats = store.stats()
+    return {"stages": stages, "final": final_stats}
 
 
 def embed_knowledge_blocks(
@@ -398,6 +510,7 @@ def build_edges_command(
     top_k: int = 10,
     include_dense: bool = True,
     include_sparse: bool = True,
+    max_group_size: int = 1000,
 ) -> dict[str, int]:
     if not include_dense and not include_sparse:
         raise ValueError("At least one of dense or sparse edges must be enabled.")
@@ -409,6 +522,7 @@ def build_edges_command(
             top_k=top_k,
             include_dense=include_dense,
             include_sparse=include_sparse,
+            max_group_size=max_group_size,
         )
         store.commit()
         table_stats = store.stats()
@@ -417,6 +531,7 @@ def build_edges_command(
         "edges_created": stats.edges_created,
         "groups_processed": stats.groups_processed,
         "candidate_pairs": stats.candidate_pairs,
+        "groups_skipped": stats.groups_skipped,
     }
 
 

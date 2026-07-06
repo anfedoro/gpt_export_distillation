@@ -74,14 +74,9 @@ uv sync --extra nlp
 
 This installs optional dependencies used only when the NLP mode is explicitly enabled in config.
 
-### Install optional knowledge base support
+### Knowledge base dependencies
 
-```bash
-cd /path/to/gpt_export_distillation
-uv sync --extra kb
-```
-
-This installs Sentence Transformers support for local dense and sparse embedding providers used by the experimental `kb-index` and `kb-search` commands.
+Sentence Transformers support is installed by default because the published `kb-index`, `kb-search`, and `kb-mcp` console scripts use local dense and sparse embedding providers.
 
 Future extension: Sentence Transformers also supports multimodal models. A later knowledge-base phase can add image or visual attachment indexing for screenshots, diagrams, and rendered pages while preserving `attachment_id`, page, slide, and source-file traceability. This is intentionally outside the text-first MVP and should not be mixed into the current text vector policy without an explicit scoring contract.
 
@@ -149,7 +144,18 @@ gpt-export-distillation \
 
 The experimental knowledge-base layer works on the Markdown archive produced by this tool. It stores all state in one local SQLite file and keeps source references back to project folders, Markdown files, conversations, messages, and attachments.
 
-Build a fresh DB:
+Build a query-ready DB in one command:
+
+```bash
+uv run kb-index import \
+  --input /path/to/distilled-export \
+  --db chat_memory.db \
+  --sparse-top-k 128
+```
+
+This runs chat ingestion, attachment ingestion, embeddings, deterministic semantic nodes, and scoped semantic edges. It prints one JSON report with per-stage stats plus final table counts.
+
+The lower-level commands are useful for debugging or partial rebuilds:
 
 ```bash
 uv run kb-index ingest-chats \
@@ -159,12 +165,8 @@ uv run kb-index ingest-chats \
 uv run kb-index ingest-attachments \
   --input /path/to/distilled-export \
   --db chat_memory.db
-```
 
-Create embeddings and graph structures:
-
-```bash
-uv run --extra kb kb-index embed \
+uv run kb-index embed \
   --db chat_memory.db \
   --sparse-top-k 128
 
@@ -175,17 +177,25 @@ uv run kb-index build-nodes \
 uv run kb-index build-edges \
   --db chat_memory.db \
   --scope project \
-  --top-k 10
+  --top-k 10 \
+  --max-group-size 1000
 ```
+
+`build-edges` always creates cheap `temporal_neighbor` edges, but it only builds similarity edges for blocks that already have dense vectors or sparse terms. Large groups above `--max-group-size` skip pairwise similarity to avoid accidental full project-level NxN work.
 
 By default, files under `Common/potential_trash` are assigned `interest_tier=low`. Embedding and retrieval skip `low` and `quarantine` content unless explicitly enabled:
 
 ```bash
-uv run --extra kb kb-index embed \
+uv run kb-index embed \
   --db chat_memory.db \
   --no-skip-low-interest-content
 
-uv run --extra kb kb-search context \
+uv run kb-index import \
+  --input /path/to/distilled-export \
+  --db chat_memory.db \
+  --no-skip-low-interest-content
+
+uv run kb-search context \
   "query text" \
   --db chat_memory.db \
   --include-low-interest
@@ -194,12 +204,12 @@ uv run --extra kb kb-search context \
 Manual retrieval:
 
 ```bash
-uv run --extra kb kb-search query \
+uv run kb-search query \
   "memory routing" \
   --db chat_memory.db \
   --limit 10
 
-uv run --extra kb kb-search context \
+uv run kb-search context \
   "memory routing" \
   --db chat_memory.db \
   --budget-tokens 4000
@@ -214,7 +224,7 @@ The local MCP server exposes the knowledge base as a narrow stdio JSON-RPC tool 
 Run it locally:
 
 ```bash
-uv run --extra kb kb-mcp \
+uv run kb-mcp \
   --db /absolute/path/to/chat_memory.db
 ```
 

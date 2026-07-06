@@ -12,7 +12,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from kb.cli import build_edges_command, build_nodes_command, embed_knowledge_blocks, ingest_attachments, ingest_chats  # noqa: E402
+from kb.cli import build_edges_command, build_nodes_command, embed_knowledge_blocks, import_knowledge_base, ingest_attachments, ingest_chats  # noqa: E402
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider  # noqa: E402
@@ -112,6 +112,28 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertEqual(parsed.conversation.message_count, 3)
             self.assertEqual(parsed.messages[-1].message_id, "msg-assistant-2")
             self.assertIn("### 1. Architecture", parsed.messages[-1].raw_text)
+
+    def test_parse_chat_ignores_message_headings_inside_code_fences(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "chat.md"
+            path.write_text(
+                SAMPLE_CHAT
+                + "\n### 3. USER\n"
+                + "- `message_id`: msg-user-2\n\n"
+                + "```markdown\n"
+                + "### 1. USER\n"
+                + "- `message_id`: fake-message\n\n"
+                + "This is an example, not a real message.\n"
+                + "```\n",
+                encoding="utf-8",
+            )
+
+            parsed = parse_chat_file(path, source_document_id="src-1")
+
+            self.assertEqual(parsed.conversation.message_count, 3)
+            self.assertEqual([message.ordinal for message in parsed.messages], [1, 2, 3])
+            self.assertEqual(parsed.messages[-1].message_id, "msg-user-2")
+            self.assertIn("fake-message", parsed.messages[-1].raw_text)
 
     def test_init_and_ingest_chats_are_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -370,6 +392,51 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertIn("hybrid_sim", edge_kinds)
             self.assertEqual(policy_versions, ["similarity-edges-v0"])
             self.assertGreater(shared_terms_rows, 0)
+
+    def test_build_edges_without_embeddings_skips_similarity_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            chat_dir = root / "Projects" / "Project_17"
+            chat_dir.mkdir(parents=True)
+            (chat_dir / "chat.md").write_text(SAMPLE_CHAT, encoding="utf-8")
+            db = Path(tmp) / "chat_memory.db"
+
+            ingest_chats(root, db, limit=10)
+            stats = build_edges_command(db_path=db, scope="project", top_k=2)
+
+            self.assertEqual(stats["candidate_pairs"], 0)
+            with SQLiteStore(db) as store:
+                edge_kinds = [
+                    row["edge_kind"]
+                    for row in store.conn.execute("SELECT DISTINCT edge_kind FROM semantic_edges ORDER BY edge_kind").fetchall()
+                ]
+            self.assertEqual(edge_kinds, ["temporal_neighbor"])
+
+    def test_import_knowledge_base_runs_full_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            chat_dir = root / "Projects" / "Project_17"
+            attachment_dir = chat_dir / "attachments"
+            attachment_dir.mkdir(parents=True)
+            (chat_dir / "chat.md").write_text(SAMPLE_CHAT, encoding="utf-8")
+            (attachment_dir / "note.txt").write_text("memory routing attachment", encoding="utf-8")
+            db = Path(tmp) / "chat_memory.db"
+
+            stats = import_knowledge_base(
+                input_dir=root,
+                db_path=db,
+                provider="mock",
+                dense_provider="mock",
+                sparse_provider="mock",
+                edge_top_k=2,
+            )
+
+            self.assertEqual(stats["stages"]["ingest_chats"]["failed_chats"], 0)
+            self.assertGreater(stats["stages"]["ingest_attachments"]["extracted"], 0)
+            self.assertGreater(stats["stages"]["embed"]["blocks_embedded"], 0)
+            self.assertGreater(stats["stages"]["build_nodes"]["nodes_created"], 0)
+            self.assertGreater(stats["stages"]["build_edges"]["edges_created"], 0)
+            self.assertGreater(stats["final"]["knowledge_blocks"], 0)
 
     def test_context_pack_combines_direct_node_and_neighbor_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
