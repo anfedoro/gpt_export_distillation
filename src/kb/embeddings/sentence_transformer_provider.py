@@ -8,6 +8,8 @@ from kb.embeddings.base import DenseEmbeddingProvider, SparseEmbeddingProvider
 class SentenceTransformerDenseProvider(DenseEmbeddingProvider):
     def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> None:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        # Avoid a non-daemon Transformers safetensors auto-conversion thread that can block CLI shutdown.
+        os.environ.setdefault("DISABLE_SAFETENSORS_CONVERSION", "1")
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError as exc:
@@ -37,6 +39,8 @@ class SentenceTransformerSparseProvider(SparseEmbeddingProvider):
         top_k: int = 128,
     ) -> None:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        # Avoid a non-daemon Transformers safetensors auto-conversion thread that can block CLI shutdown.
+        os.environ.setdefault("DISABLE_SAFETENSORS_CONVERSION", "1")
         try:
             from sentence_transformers import SparseEncoder
         except ImportError as exc:
