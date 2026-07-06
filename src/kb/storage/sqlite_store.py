@@ -307,6 +307,93 @@ class SQLiteStore:
             (dense_vector_id, sparse_vector_id, knowledge_block_id),
         )
 
+    def searchable_knowledge_blocks(
+        self,
+        *,
+        dense_model_name: str | None,
+        dense_model_version: str | None,
+        sparse_model_name: str | None,
+        project: str | None = None,
+    ) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        dense_join = ""
+        sparse_join = ""
+        if dense_model_name is not None:
+            dense_join = """
+            LEFT JOIN dense_vectors dv
+              ON dv.owner_type = 'knowledge_block'
+             AND dv.owner_id = kb.id
+             AND dv.model_name = ?
+             AND COALESCE(dv.model_version, '') = COALESCE(?, '')
+            """
+            params.extend([dense_model_name, dense_model_version])
+        if sparse_model_name is not None:
+            sparse_join = """
+            LEFT JOIN sparse_terms st
+              ON st.owner_type = 'knowledge_block'
+             AND st.owner_id = kb.id
+             AND st.model_name = ?
+            """
+            params.append(sparse_model_name)
+        where = []
+        embedding_filters = []
+        if dense_model_name is not None:
+            embedding_filters.append("dv.id IS NOT NULL")
+        if sparse_model_name is not None:
+            embedding_filters.append("st.owner_id IS NOT NULL")
+        if embedding_filters:
+            where.append("(" + " OR ".join(embedding_filters) + ")")
+        if project is not None:
+            where.append("kb.project_id = ?")
+            params.append(project)
+        query = f"""
+            SELECT
+                kb.id AS knowledge_block_id,
+                kb.project_id,
+                kb.folder_kind,
+                kb.conversation_id,
+                kb.message_id,
+                kb.role,
+                kb.block_type,
+                kb.text_for_display,
+                sd.relative_path AS source_path,
+                c.title AS conversation_title,
+                dv.vector_json AS dense_vector_json,
+                st.token_text,
+                st.weight
+            FROM knowledge_blocks kb
+            JOIN source_documents sd ON sd.id = kb.source_document_id
+            LEFT JOIN conversations c ON c.id = kb.conversation_id
+            {dense_join}
+            {sparse_join}
+        """
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY kb.id"
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in self.conn.execute(query, params).fetchall():
+            block_id = str(row["knowledge_block_id"])
+            item = grouped.setdefault(
+                block_id,
+                {
+                    "knowledge_block_id": block_id,
+                    "project_id": row["project_id"],
+                    "folder_kind": row["folder_kind"],
+                    "conversation_id": row["conversation_id"],
+                    "message_id": row["message_id"],
+                    "role": row["role"],
+                    "block_type": row["block_type"],
+                    "text_for_display": row["text_for_display"],
+                    "source_path": row["source_path"],
+                    "conversation_title": row["conversation_title"],
+                    "dense_vector": json.loads(row["dense_vector_json"]) if row["dense_vector_json"] else None,
+                    "sparse_terms": {},
+                },
+            )
+            if row["token_text"] is not None:
+                item["sparse_terms"][row["token_text"]] = float(row["weight"])
+        return list(grouped.values())
+
     def _insert_conversation(self, conversation: Conversation) -> None:
         self.conn.execute(
             """
