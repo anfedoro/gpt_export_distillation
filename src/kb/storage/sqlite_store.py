@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from kb.ingest.tree_walker import InventoryItem
+from kb.ingest.attachment_parser import ParsedAttachment
 from kb.model.entities import Block, Conversation, Message, ParsedChat
 from kb.model.ids import stable_id
 
@@ -22,8 +23,12 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 def init_db(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with connect(db_path) as conn:
+    conn = connect(db_path)
+    try:
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 class SQLiteStore:
@@ -85,6 +90,76 @@ class SQLiteStore:
             self._insert_block(block)
         for block in parsed.blocks:
             self._insert_knowledge_block(conversation, parsed.messages, block)
+
+    def insert_parsed_attachment(self, input_root: Path, item: InventoryItem, source_document_id: str, parsed: ParsedAttachment) -> None:
+        attachment_id = stable_id(source_document_id, "attachment", prefix="att")
+        path = input_root / item.relative_path
+        self.conn.execute("DELETE FROM attachment_documents WHERE id = ?", (attachment_id,))
+        self.conn.execute(
+            """
+            INSERT INTO attachment_documents (
+                id, source_document_id, linked_conversation_id, linked_message_id, path,
+                relative_path, file_name, extension, mime_type, sha256, extraction_status,
+                metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                attachment_id,
+                source_document_id,
+                None,
+                None,
+                str(path),
+                item.relative_path,
+                item.file_name,
+                item.extension,
+                parsed.mime_type,
+                item.sha256,
+                parsed.extraction_status,
+                _json(parsed.metadata_json),
+            ),
+        )
+        self.conn.execute(
+            "DELETE FROM knowledge_blocks WHERE source_type = 'attachment_block' AND attachment_id = ?",
+            (attachment_id,),
+        )
+        for block in parsed.blocks:
+            text_for_display = block.text
+            text_for_embedding = "\n".join(
+                part
+                for part in [
+                    f"Project: {item.project_path}" if item.project_path else None,
+                    f"Attachment: {item.relative_path}",
+                    f"Block type: {block.block_type}",
+                    f"Content: {block.text}",
+                ]
+                if part
+            )
+            self.conn.execute(
+                """
+                INSERT INTO knowledge_blocks (
+                    id, source_type, source_document_id, conversation_id, message_id, block_id,
+                    attachment_id, project_id, folder_kind, role, block_type, text_for_embedding,
+                    text_for_display, token_count_estimate, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    stable_id("attachment_block", attachment_id, block.ordinal, prefix="kb"),
+                    "attachment_block",
+                    source_document_id,
+                    None,
+                    None,
+                    None,
+                    attachment_id,
+                    item.project_path,
+                    item.folder_kind,
+                    None,
+                    block.block_type,
+                    text_for_embedding,
+                    text_for_display,
+                    max(1, len(text_for_embedding.split())),
+                    _json(block.metadata_json),
+                ),
+            )
 
     def commit(self) -> None:
         self.conn.commit()

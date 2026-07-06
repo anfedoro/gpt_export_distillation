@@ -12,7 +12,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from kb.cli import ingest_chats  # noqa: E402
+from kb.cli import ingest_attachments, ingest_chats  # noqa: E402
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.storage.sqlite_store import SQLiteStore, init_db  # noqa: E402
@@ -111,6 +111,36 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertEqual(stats["messages"], 2)
             self.assertGreaterEqual(stats["blocks"], 4)
             self.assertEqual(stats["knowledge_blocks"], stats["blocks"])
+
+    def test_ingest_attachments_extracts_text_and_tracks_unsupported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            attachments = root / "Projects" / "Project_17" / "attachments"
+            attachments.mkdir(parents=True)
+            (attachments / "note.txt").write_text("Attachment memory text", encoding="utf-8")
+            (attachments / "image.png").write_bytes(b"not really an image")
+            db = Path(tmp) / "chat_memory.db"
+
+            stats = ingest_attachments(root, db)
+            again = ingest_attachments(root, db)
+
+            self.assertEqual(stats["attempted"], 2)
+            self.assertEqual(stats["extracted"], 1)
+            self.assertEqual(stats["unsupported"], 1)
+            self.assertEqual(again["attempted"], 2)
+            with SQLiteStore(db) as store:
+                db_stats = store.stats()
+                rows = store.conn.execute(
+                    "SELECT extraction_status FROM attachment_documents ORDER BY file_name"
+                ).fetchall()
+                kb_rows = store.conn.execute(
+                    "SELECT block_type, text_for_display FROM knowledge_blocks WHERE source_type = 'attachment_block'"
+                ).fetchall()
+            self.assertEqual(db_stats["attachment_documents"], 2)
+            self.assertEqual(db_stats["knowledge_blocks"], 1)
+            self.assertEqual([row["extraction_status"] for row in rows], ["unsupported", "extracted"])
+            self.assertEqual(kb_rows[0]["block_type"], "text")
+            self.assertIn("Attachment memory text", kb_rows[0]["text_for_display"])
 
 
 if __name__ == "__main__":
