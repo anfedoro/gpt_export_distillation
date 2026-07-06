@@ -68,6 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_cmd.add_argument("--sparse-torch-compile", action="store_true")
     import_cmd.add_argument("--sparse-top-k", type=int, default=128)
     import_cmd.add_argument("--batch-size", type=int, default=32)
+    import_cmd.add_argument("--embedding-pass-mode", choices=["joint", "separate"], default="joint")
     import_cmd.add_argument("--memory-report-every", type=int, default=0, help="Print process memory every N embedding batches.")
     import_cmd.add_argument("--force-embeddings", action="store_true")
     import_cmd.add_argument("--skip-low-interest-content", action=argparse.BooleanOptionalAction, default=True)
@@ -104,6 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
     embed.add_argument("--sparse-top-k", type=int, default=128)
     embed.add_argument("--limit", type=int)
     embed.add_argument("--batch-size", type=int, default=32)
+    embed.add_argument("--embedding-pass-mode", choices=["joint", "separate"], default="joint")
     embed.add_argument("--memory-report-every", type=int, default=0, help="Print process memory every N batches.")
     embed.add_argument("--force", action="store_true")
     embed.add_argument("--skip-low-interest-content", action=argparse.BooleanOptionalAction, default=True)
@@ -183,6 +185,7 @@ def main() -> None:
             sparse_torch_compile=args.sparse_torch_compile,
             sparse_top_k=args.sparse_top_k,
             batch_size=args.batch_size,
+            embedding_pass_mode=args.embedding_pass_mode,
             memory_report_every=args.memory_report_every,
             force_embeddings=args.force_embeddings,
             skip_low_interest_content=args.skip_low_interest_content,
@@ -232,6 +235,7 @@ def main() -> None:
             sparse_top_k=args.sparse_top_k,
             limit=args.limit,
             batch_size=args.batch_size,
+            embedding_pass_mode=args.embedding_pass_mode,
             memory_report_every=args.memory_report_every,
             force=args.force,
             skip_low_interest_content=args.skip_low_interest_content,
@@ -378,6 +382,7 @@ def import_knowledge_base(
     sparse_torch_compile: bool = False,
     sparse_top_k: int = 128,
     batch_size: int = 32,
+    embedding_pass_mode: str = "joint",
     memory_report_every: int = 0,
     force_embeddings: bool = False,
     skip_low_interest_content: bool = True,
@@ -417,6 +422,7 @@ def import_knowledge_base(
             sparse_torch_compile=sparse_torch_compile,
             sparse_top_k=sparse_top_k,
             batch_size=batch_size,
+            embedding_pass_mode=embedding_pass_mode,
             memory_report_every=memory_report_every,
             force=force_embeddings,
             skip_low_interest_content=skip_low_interest_content,
@@ -446,6 +452,82 @@ def import_knowledge_base(
 
 
 def embed_knowledge_blocks(
+    *,
+    db_path: Path,
+    provider: str = "sentence-transformers",
+    dense_provider: str | None = None,
+    sparse_provider: str = "sentence-transformers",
+    dense_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+    sparse_model: str = "naver/splade-cocondenser-ensembledistil",
+    dense_device: str | None = None,
+    sparse_device: str | None = None,
+    dense_backend: str = "torch",
+    sparse_backend: str = "torch",
+    dense_torch_dtype: str = "auto",
+    sparse_torch_dtype: str = "auto",
+    dense_torch_compile: bool = False,
+    sparse_torch_compile: bool = False,
+    sparse_top_k: int = 128,
+    limit: int | None = None,
+    batch_size: int = 32,
+    embedding_pass_mode: str = "joint",
+    memory_report_every: int = 0,
+    force: bool = False,
+    skip_low_interest_content: bool = True,
+    progress: bool = False,
+) -> dict[str, int | float | str | None]:
+    if embedding_pass_mode == "separate":
+        return _embed_knowledge_blocks_separate(
+            db_path=db_path,
+            provider=provider,
+            dense_provider=dense_provider,
+            sparse_provider=sparse_provider,
+            dense_model=dense_model,
+            sparse_model=sparse_model,
+            dense_device=dense_device,
+            sparse_device=sparse_device,
+            dense_backend=dense_backend,
+            sparse_backend=sparse_backend,
+            dense_torch_dtype=dense_torch_dtype,
+            sparse_torch_dtype=sparse_torch_dtype,
+            dense_torch_compile=dense_torch_compile,
+            sparse_torch_compile=sparse_torch_compile,
+            sparse_top_k=sparse_top_k,
+            limit=limit,
+            batch_size=batch_size,
+            memory_report_every=memory_report_every,
+            force=force,
+            skip_low_interest_content=skip_low_interest_content,
+            progress=progress,
+        )
+    if embedding_pass_mode != "joint":
+        raise ValueError(f"Unsupported embedding_pass_mode: {embedding_pass_mode}")
+    return _embed_knowledge_blocks_joint(
+        db_path=db_path,
+        provider=provider,
+        dense_provider=dense_provider,
+        sparse_provider=sparse_provider,
+        dense_model=dense_model,
+        sparse_model=sparse_model,
+        dense_device=dense_device,
+        sparse_device=sparse_device,
+        dense_backend=dense_backend,
+        sparse_backend=sparse_backend,
+        dense_torch_dtype=dense_torch_dtype,
+        sparse_torch_dtype=sparse_torch_dtype,
+        dense_torch_compile=dense_torch_compile,
+        sparse_torch_compile=sparse_torch_compile,
+        sparse_top_k=sparse_top_k,
+        limit=limit,
+        batch_size=batch_size,
+        memory_report_every=memory_report_every,
+        force=force,
+        skip_low_interest_content=skip_low_interest_content,
+        progress=progress,
+    )
+
+
+def _embed_knowledge_blocks_joint(
     *,
     db_path: Path,
     provider: str = "sentence-transformers",
@@ -599,6 +681,124 @@ def embed_knowledge_blocks(
         "avg_sparse_non_zero_count": sparse_nnz_total / sparse_vectors if sparse_vectors else 0,
         "peak_rss_mb": peak_rss_mb,
         "errors": errors,
+    }
+
+
+def _embed_knowledge_blocks_separate(
+    *,
+    db_path: Path,
+    provider: str,
+    dense_provider: str | None,
+    sparse_provider: str,
+    dense_model: str,
+    sparse_model: str,
+    dense_device: str | None,
+    sparse_device: str | None,
+    dense_backend: str,
+    sparse_backend: str,
+    dense_torch_dtype: str,
+    sparse_torch_dtype: str,
+    dense_torch_compile: bool,
+    sparse_torch_compile: bool,
+    sparse_top_k: int,
+    limit: int | None,
+    batch_size: int,
+    memory_report_every: int,
+    force: bool,
+    skip_low_interest_content: bool,
+    progress: bool,
+) -> dict[str, int | float | str | None | dict[str, int | float | str | None]]:
+    dense_name = dense_provider or provider
+    if dense_name == "none" or sparse_provider == "none":
+        return _embed_knowledge_blocks_joint(
+            db_path=db_path,
+            provider=provider,
+            dense_provider=dense_provider,
+            sparse_provider=sparse_provider,
+            dense_model=dense_model,
+            sparse_model=sparse_model,
+            dense_device=dense_device,
+            sparse_device=sparse_device,
+            dense_backend=dense_backend,
+            sparse_backend=sparse_backend,
+            dense_torch_dtype=dense_torch_dtype,
+            sparse_torch_dtype=sparse_torch_dtype,
+            dense_torch_compile=dense_torch_compile,
+            sparse_torch_compile=sparse_torch_compile,
+            sparse_top_k=sparse_top_k,
+            limit=limit,
+            batch_size=batch_size,
+            memory_report_every=memory_report_every,
+            force=force,
+            skip_low_interest_content=skip_low_interest_content,
+            progress=progress,
+        )
+    _progress_message("embedding pass 1/2 dense", enabled=progress)
+    dense_stats = _embed_knowledge_blocks_joint(
+        db_path=db_path,
+        provider=provider,
+        dense_provider=dense_provider,
+        sparse_provider="none",
+        dense_model=dense_model,
+        sparse_model=sparse_model,
+        dense_device=dense_device,
+        sparse_device=sparse_device,
+        dense_backend=dense_backend,
+        sparse_backend=sparse_backend,
+        dense_torch_dtype=dense_torch_dtype,
+        sparse_torch_dtype=sparse_torch_dtype,
+        dense_torch_compile=dense_torch_compile,
+        sparse_torch_compile=sparse_torch_compile,
+        sparse_top_k=sparse_top_k,
+        limit=limit,
+        batch_size=batch_size,
+        memory_report_every=memory_report_every,
+        force=force,
+        skip_low_interest_content=skip_low_interest_content,
+        progress=progress,
+    )
+    _release_batch_memory()
+    _progress_message("embedding pass 2/2 sparse", enabled=progress)
+    sparse_stats = _embed_knowledge_blocks_joint(
+        db_path=db_path,
+        provider=provider,
+        dense_provider="none",
+        sparse_provider=sparse_provider,
+        dense_model=dense_model,
+        sparse_model=sparse_model,
+        dense_device=dense_device,
+        sparse_device=sparse_device,
+        dense_backend=dense_backend,
+        sparse_backend=sparse_backend,
+        dense_torch_dtype=dense_torch_dtype,
+        sparse_torch_dtype=sparse_torch_dtype,
+        dense_torch_compile=dense_torch_compile,
+        sparse_torch_compile=sparse_torch_compile,
+        sparse_top_k=sparse_top_k,
+        limit=limit,
+        batch_size=batch_size,
+        memory_report_every=memory_report_every,
+        force=force,
+        skip_low_interest_content=skip_low_interest_content,
+        progress=progress,
+    )
+    return {
+        "embedding_pass_mode": "separate",
+        "dense_pass": dense_stats,
+        "sparse_pass": sparse_stats,
+        "dense_model": dense_stats["dense_model"],
+        "dense_model_version": dense_stats["dense_model_version"],
+        "sparse_model": sparse_stats["sparse_model"],
+        "sparse_model_version": sparse_stats["sparse_model_version"],
+        "candidate_blocks": max(int(dense_stats["candidate_blocks"]), int(sparse_stats["candidate_blocks"])),
+        "blocks_embedded": max(int(dense_stats["blocks_embedded"]), int(sparse_stats["blocks_embedded"])),
+        "dense_vectors": int(dense_stats["dense_vectors"]),
+        "sparse_vectors": int(sparse_stats["sparse_vectors"]),
+        "sparse_terms": int(sparse_stats["sparse_terms"]),
+        "avg_dense_dim": float(dense_stats["avg_dense_dim"]),
+        "avg_sparse_non_zero_count": float(sparse_stats["avg_sparse_non_zero_count"]),
+        "peak_rss_mb": max(float(dense_stats["peak_rss_mb"]), float(sparse_stats["peak_rss_mb"])),
+        "errors": int(dense_stats["errors"]) + int(sparse_stats["errors"]),
     }
 
 
