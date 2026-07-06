@@ -476,6 +476,9 @@ class KBMilestone1Tests(unittest.TestCase):
             )
 
             self.assertGreaterEqual(len(payload["selected_blocks"]), 1)
+            self.assertEqual(payload["retrieval_strategy_requested"], "auto")
+            self.assertEqual(payload["retrieval_strategy_used"], "basement")
+            self.assertFalse(payload["db_capabilities"]["has_semantic_groups"])
             paths = {trace["path"] for trace in payload["source_trace"]}
             self.assertIn("query -> block direct", paths)
             self.assertTrue(any(path.startswith("query -> node:") for path in paths))
@@ -483,6 +486,93 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertLessEqual(
                 sum(item["token_count_estimate"] for item in payload["selected_blocks"]),
                 200,
+            )
+
+    def test_context_pack_auto_uses_semantic_groups_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            chat_dir = root / "Projects" / "Project_17"
+            chat_dir.mkdir(parents=True)
+            (chat_dir / "chat.md").write_text(SAMPLE_CHAT, encoding="utf-8")
+            db = Path(tmp) / "chat_memory.db"
+
+            ingest_chats(root, db, limit=10)
+            embed_knowledge_blocks(
+                db_path=db,
+                provider="mock",
+                dense_provider="mock",
+                sparse_provider="mock",
+            )
+            with SQLiteStore(db) as store:
+                block_ids = [
+                    row["id"]
+                    for row in store.conn.execute(
+                        "SELECT id FROM knowledge_blocks ORDER BY id LIMIT 2"
+                    ).fetchall()
+                ]
+                dense_vector_id = store.upsert_dense_vector(
+                    owner_type="semantic_node",
+                    owner_id="node-semantic-group-1",
+                    model_name="mock-dense",
+                    model_version="v1",
+                    vector=MockDenseProvider().embed_texts(["memory routing"])[0],
+                )
+                store.replace_sparse_terms(
+                    owner_type="semantic_node",
+                    owner_id="node-semantic-group-1",
+                    model_name="mock-sparse",
+                    terms=MockSparseProvider().embed_texts(["memory routing"])[0],
+                )
+                store.upsert_semantic_node(
+                    node_id="node-semantic-group-1",
+                    node_type="semantic_group",
+                    project_id="Project_17",
+                    dense_vector_id=dense_vector_id,
+                    sparse_vector_id=None,
+                    title="memory routing group",
+                    summary=None,
+                    top_terms_json="[]",
+                    metadata_json="{}",
+                )
+                store.replace_semantic_node_members(
+                    node_id="node-semantic-group-1",
+                    members=[
+                        {
+                            "knowledge_block_id": block_id,
+                            "membership_weight": 1.0,
+                            "membership_reason": "dense_similarity",
+                            "metadata_json": "{}",
+                        }
+                        for block_id in block_ids
+                    ],
+                )
+                store.commit()
+
+            payload = build_context_pack(
+                db_path=db,
+                query="memory routing",
+                dense=MockDenseProvider(),
+                sparse=MockSparseProvider(),
+                dense_provider="mock",
+                sparse_provider="mock",
+                dense_model="",
+                sparse_model="",
+                sparse_top_k=10,
+                options=ContextPackOptions(
+                    budget_tokens=200,
+                    direct_limit=2,
+                    node_limit=2,
+                    node_member_limit=2,
+                    neighbor_limit=0,
+                    retrieval_strategy="auto",
+                ),
+            )
+
+            self.assertEqual(payload["retrieval_strategy_used"], "semantic_groups")
+            self.assertTrue(payload["db_capabilities"]["has_semantic_groups"])
+            self.assertTrue(payload["db_capabilities"]["has_group_embeddings"])
+            self.assertTrue(
+                any(trace["path"] == "query -> node:semantic_group -> member block" for trace in payload["source_trace"])
             )
 
     def test_mcp_server_exposes_only_context_pack_tool(self) -> None:
@@ -528,6 +618,8 @@ class KBMilestone1Tests(unittest.TestCase):
             payload = json.loads(response["result"]["content"][0]["text"])
             self.assertIn("context_text", payload)
             self.assertIn("source_references", payload)
+            self.assertEqual(payload["retrieval_strategy_used"], "basement")
+            self.assertIn("db_capabilities", payload)
             self.assertGreaterEqual(len(payload["selected_blocks"]), 1)
 
 
