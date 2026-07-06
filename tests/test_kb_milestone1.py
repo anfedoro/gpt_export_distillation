@@ -249,6 +249,37 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertEqual(stats["dense_vectors"], 3)
             self.assertEqual(stats["sparse_vectors"], 3)
 
+    def test_embed_separate_pass_mode_preserves_dense_and_sparse_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            chat_dir = root / "Projects" / "Project_17"
+            chat_dir.mkdir(parents=True)
+            (chat_dir / "chat.md").write_text(SAMPLE_CHAT, encoding="utf-8")
+            db = Path(tmp) / "chat_memory.db"
+
+            ingest_chats(root, db, limit=10)
+            stats = embed_knowledge_blocks(
+                db_path=db,
+                provider="mock",
+                dense_provider="mock",
+                sparse_provider="mock",
+                embedding_pass_mode="separate",
+                batch_size=5,
+                limit=3,
+            )
+
+            self.assertEqual(stats["embedding_pass_mode"], "separate")
+            self.assertEqual(stats["dense_vectors"], 3)
+            self.assertEqual(stats["sparse_vectors"], 3)
+            with SQLiteStore(db) as store:
+                linked = store.conn.execute(
+                    """
+                    SELECT COUNT(*) FROM knowledge_blocks
+                    WHERE dense_vector_id IS NOT NULL AND sparse_vector_id IS NOT NULL
+                    """
+                ).fetchone()[0]
+            self.assertEqual(linked, 3)
+
     def test_low_interest_content_is_skipped_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "export"
