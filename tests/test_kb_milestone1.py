@@ -12,7 +12,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from kb.cli import embed_knowledge_blocks, ingest_attachments, ingest_chats  # noqa: E402
+from kb.cli import build_nodes_command, embed_knowledge_blocks, ingest_attachments, ingest_chats  # noqa: E402
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.retrieval.hybrid_search import hybrid_query  # noqa: E402
@@ -90,6 +90,24 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertIn("How should memory", parsed.messages[0].raw_text)
             self.assertIn("code", {block.block_type for block in parsed.blocks})
             self.assertIn("mermaid", {block.block_type for block in parsed.blocks})
+
+    def test_parse_chat_ignores_numbered_content_headings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "chat.md"
+            path.write_text(
+                SAMPLE_CHAT
+                + "\n### 3. ASSISTANT\n"
+                + "- `message_id`: msg-assistant-2\n\n"
+                + "### 1. Architecture\n\n"
+                + "This is a content heading, not a message.\n",
+                encoding="utf-8",
+            )
+
+            parsed = parse_chat_file(path, source_document_id="src-1")
+
+            self.assertEqual(parsed.conversation.message_count, 3)
+            self.assertEqual(parsed.messages[-1].message_id, "msg-assistant-2")
+            self.assertIn("### 1. Architecture", parsed.messages[-1].raw_text)
 
     def test_init_and_ingest_chats_are_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -213,6 +231,40 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertIn("dense_score", top)
             self.assertIn("sparse_score", top)
             self.assertIn("preview", top)
+
+    def test_build_nodes_creates_deterministic_memberships(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            chat_dir = root / "Projects" / "Project_17"
+            chat_dir.mkdir(parents=True)
+            (chat_dir / "chat.md").write_text(SAMPLE_CHAT, encoding="utf-8")
+            db = Path(tmp) / "chat_memory.db"
+
+            ingest_chats(root, db, limit=10)
+            embed_knowledge_blocks(
+                db_path=db,
+                provider="mock",
+                dense_provider="mock",
+                sparse_provider="mock",
+            )
+            first = build_nodes_command(db_path=db, mode="deterministic", sparse_top_k=10)
+            second = build_nodes_command(db_path=db, mode="deterministic", sparse_top_k=10)
+
+            self.assertEqual(first["nodes_created"], 2)
+            self.assertEqual(second["nodes_created"], 2)
+            self.assertGreater(first["memberships_created"], 0)
+            with SQLiteStore(db) as store:
+                node_types = [
+                    row["node_type"]
+                    for row in store.conn.execute("SELECT node_type FROM semantic_nodes ORDER BY node_type").fetchall()
+                ]
+                member_count = store.conn.execute("SELECT COUNT(*) FROM semantic_node_members").fetchone()[0]
+                node_vector_count = store.conn.execute(
+                    "SELECT COUNT(*) FROM dense_vectors WHERE owner_type = 'semantic_node'"
+                ).fetchone()[0]
+            self.assertEqual(node_types, ["conversation", "project"])
+            self.assertEqual(member_count, first["memberships_created"])
+            self.assertEqual(node_vector_count, 2)
 
 
 if __name__ == "__main__":

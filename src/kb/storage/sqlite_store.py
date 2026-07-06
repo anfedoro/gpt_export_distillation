@@ -174,6 +174,8 @@ class SQLiteStore:
             "attachment_documents",
             "dense_vectors",
             "sparse_terms",
+            "semantic_nodes",
+            "semantic_node_members",
         ]
         result = {name: int(self.conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) for name in names}
         result["attachments_seen"] = int(
@@ -393,6 +395,109 @@ class SQLiteStore:
             if row["token_text"] is not None:
                 item["sparse_terms"][row["token_text"]] = float(row["weight"])
         return list(grouped.values())
+
+    def knowledge_blocks_for_nodes(self) -> list[dict[str, Any]]:
+        query = """
+            SELECT
+                kb.id AS knowledge_block_id,
+                kb.project_id,
+                kb.conversation_id,
+                kb.attachment_id,
+                c.title AS conversation_title,
+                ad.relative_path AS attachment_path,
+                dv.vector_json AS dense_vector_json,
+                st.token_text,
+                st.weight
+            FROM knowledge_blocks kb
+            LEFT JOIN conversations c ON c.id = kb.conversation_id
+            LEFT JOIN attachment_documents ad ON ad.id = kb.attachment_id
+            LEFT JOIN dense_vectors dv ON dv.id = kb.dense_vector_id
+            LEFT JOIN sparse_terms st
+              ON st.owner_type = 'knowledge_block'
+             AND st.owner_id = kb.id
+            ORDER BY kb.id
+        """
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in self.conn.execute(query).fetchall():
+            block_id = str(row["knowledge_block_id"])
+            item = grouped.setdefault(
+                block_id,
+                {
+                    "knowledge_block_id": block_id,
+                    "project_id": row["project_id"],
+                    "conversation_id": row["conversation_id"],
+                    "attachment_id": row["attachment_id"],
+                    "conversation_title": row["conversation_title"],
+                    "attachment_path": row["attachment_path"],
+                    "dense_vector": json.loads(row["dense_vector_json"]) if row["dense_vector_json"] else None,
+                    "sparse_terms": {},
+                },
+            )
+            if row["token_text"] is not None:
+                item["sparse_terms"][row["token_text"]] = float(row["weight"])
+        return list(grouped.values())
+
+    def upsert_semantic_node(
+        self,
+        *,
+        node_id: str,
+        node_type: str,
+        project_id: str | None,
+        dense_vector_id: str | None,
+        sparse_vector_id: str | None,
+        title: str,
+        summary: str | None,
+        top_terms_json: str,
+        metadata_json: str,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO semantic_nodes (
+                id, node_type, project_id, dense_vector_id, sparse_vector_id,
+                title, summary, top_terms_json, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                node_type=excluded.node_type,
+                project_id=excluded.project_id,
+                dense_vector_id=excluded.dense_vector_id,
+                sparse_vector_id=excluded.sparse_vector_id,
+                title=excluded.title,
+                summary=excluded.summary,
+                top_terms_json=excluded.top_terms_json,
+                metadata_json=excluded.metadata_json
+            """,
+            (
+                node_id,
+                node_type,
+                project_id,
+                dense_vector_id,
+                sparse_vector_id,
+                title,
+                summary,
+                top_terms_json,
+                metadata_json,
+            ),
+        )
+
+    def replace_semantic_node_members(self, *, node_id: str, members: list[dict[str, Any]]) -> None:
+        self.conn.execute("DELETE FROM semantic_node_members WHERE node_id = ?", (node_id,))
+        self.conn.executemany(
+            """
+            INSERT INTO semantic_node_members (
+                node_id, knowledge_block_id, membership_weight, membership_reason, metadata_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    node_id,
+                    member["knowledge_block_id"],
+                    member["membership_weight"],
+                    member["membership_reason"],
+                    member["metadata_json"],
+                )
+                for member in members
+            ],
+        )
 
     def _insert_conversation(self, conversation: Conversation) -> None:
         self.conn.execute(

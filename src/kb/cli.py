@@ -9,6 +9,7 @@ from kb.embeddings.sentence_transformer_provider import (
     SentenceTransformerDenseProvider,
     SentenceTransformerSparseProvider,
 )
+from kb.index.semantic_node_builder import build_deterministic_nodes
 from kb.ingest.attachment_parser import parse_attachment
 from kb.ingest.chat_md_parser import parse_chat_file, write_parsed_chat_json
 from kb.ingest.tree_walker import scan_tree, write_inventory_jsonl
@@ -53,6 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
     embed.add_argument("--limit", type=int)
     embed.add_argument("--batch-size", type=int, default=32)
     embed.add_argument("--force", action="store_true")
+
+    build_nodes = sub.add_parser("build-nodes", help="Build deterministic semantic nodes.")
+    build_nodes.add_argument("--db", required=True)
+    build_nodes.add_argument("--mode", choices=["deterministic"], default="deterministic")
+    build_nodes.add_argument("--sparse-top-k", type=int, default=50)
 
     stats = sub.add_parser("stats", help="Print DB table counts.")
     stats.add_argument("--db", required=True)
@@ -121,6 +127,15 @@ def main() -> None:
             limit=args.limit,
             batch_size=args.batch_size,
             force=args.force,
+        )
+        print(json.dumps(stats, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if args.command == "build-nodes":
+        stats = build_nodes_command(
+            db_path=Path(args.db).expanduser(),
+            mode=args.mode,
+            sparse_top_k=args.sparse_top_k,
         )
         print(json.dumps(stats, ensure_ascii=False, indent=2, sort_keys=True))
         return
@@ -332,6 +347,25 @@ def _build_sparse_provider(provider_name: str, sparse_model: str, sparse_top_k: 
             raise ValueError("--sparse-top-k must be positive.")
         return SentenceTransformerSparseProvider(sparse_model, top_k=sparse_top_k)
     raise ValueError(f"Unsupported sparse provider: {provider_name}")
+
+
+def build_nodes_command(*, db_path: Path, mode: str = "deterministic", sparse_top_k: int = 50) -> dict[str, int]:
+    if mode != "deterministic":
+        raise ValueError(f"Unsupported node build mode: {mode}")
+    if sparse_top_k <= 0:
+        raise ValueError("--sparse-top-k must be positive.")
+    init_db(db_path)
+    with SQLiteStore(db_path) as store:
+        stats = build_deterministic_nodes(store, sparse_top_k=sparse_top_k)
+        store.commit()
+        table_stats = store.stats()
+    return {
+        **table_stats,
+        "nodes_created": stats.nodes_created,
+        "memberships_created": stats.memberships_created,
+        "nodes_with_dense_vectors": stats.nodes_with_dense_vectors,
+        "nodes_with_sparse_terms": stats.nodes_with_sparse_terms,
+    }
 
 
 if __name__ == "__main__":
