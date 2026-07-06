@@ -57,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_cmd.add_argument("--dense-provider", choices=["sentence-transformers", "mock", "none"])
     import_cmd.add_argument("--sparse-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
     import_cmd.add_argument("--dense-model", default="sentence-transformers/all-MiniLM-L6-v2")
-    import_cmd.add_argument("--sparse-model", default="naver/splade-cocondenser-ensembledistil")
+    import_cmd.add_argument("--sparse-model", default="opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1")
     import_cmd.add_argument("--dense-device")
     import_cmd.add_argument("--sparse-device")
     import_cmd.add_argument("--dense-backend", choices=["torch", "onnx", "openvino"], default="torch")
@@ -68,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_cmd.add_argument("--sparse-torch-compile", action="store_true")
     import_cmd.add_argument("--sparse-top-k", type=int, default=128)
     import_cmd.add_argument("--batch-size", type=int, default=32)
-    import_cmd.add_argument("--embedding-pass-mode", choices=["joint", "separate"], default="joint")
+    import_cmd.add_argument("--embedding-pass-mode", choices=["joint", "separate"], default="separate")
     import_cmd.add_argument("--memory-report-every", type=int, default=0, help="Print process memory every N embedding batches.")
     import_cmd.add_argument("--force-embeddings", action="store_true")
     import_cmd.add_argument("--skip-low-interest-content", action=argparse.BooleanOptionalAction, default=True)
@@ -93,7 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     embed.add_argument("--dense-provider", choices=["sentence-transformers", "mock", "none"])
     embed.add_argument("--sparse-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
     embed.add_argument("--dense-model", default="sentence-transformers/all-MiniLM-L6-v2")
-    embed.add_argument("--sparse-model", default="naver/splade-cocondenser-ensembledistil")
+    embed.add_argument("--sparse-model", default="opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1")
     embed.add_argument("--dense-device")
     embed.add_argument("--sparse-device")
     embed.add_argument("--dense-backend", choices=["torch", "onnx", "openvino"], default="torch")
@@ -105,7 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
     embed.add_argument("--sparse-top-k", type=int, default=128)
     embed.add_argument("--limit", type=int)
     embed.add_argument("--batch-size", type=int, default=32)
-    embed.add_argument("--embedding-pass-mode", choices=["joint", "separate"], default="joint")
+    embed.add_argument("--embedding-pass-mode", choices=["joint", "separate"], default="separate")
     embed.add_argument("--memory-report-every", type=int, default=0, help="Print process memory every N batches.")
     embed.add_argument("--force", action="store_true")
     embed.add_argument("--skip-low-interest-content", action=argparse.BooleanOptionalAction, default=True)
@@ -371,7 +371,7 @@ def import_knowledge_base(
     dense_provider: str | None = None,
     sparse_provider: str = "sentence-transformers",
     dense_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-    sparse_model: str = "naver/splade-cocondenser-ensembledistil",
+    sparse_model: str = "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1",
     dense_device: str | None = None,
     sparse_device: str | None = None,
     dense_backend: str = "torch",
@@ -382,7 +382,7 @@ def import_knowledge_base(
     sparse_torch_compile: bool = False,
     sparse_top_k: int = 128,
     batch_size: int = 32,
-    embedding_pass_mode: str = "joint",
+    embedding_pass_mode: str = "separate",
     memory_report_every: int = 0,
     force_embeddings: bool = False,
     skip_low_interest_content: bool = True,
@@ -458,7 +458,7 @@ def embed_knowledge_blocks(
     dense_provider: str | None = None,
     sparse_provider: str = "sentence-transformers",
     dense_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-    sparse_model: str = "naver/splade-cocondenser-ensembledistil",
+    sparse_model: str = "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1",
     dense_device: str | None = None,
     sparse_device: str | None = None,
     dense_backend: str = "torch",
@@ -470,7 +470,7 @@ def embed_knowledge_blocks(
     sparse_top_k: int = 128,
     limit: int | None = None,
     batch_size: int = 32,
-    embedding_pass_mode: str = "joint",
+    embedding_pass_mode: str = "separate",
     memory_report_every: int = 0,
     force: bool = False,
     skip_low_interest_content: bool = True,
@@ -534,7 +534,7 @@ def _embed_knowledge_blocks_joint(
     dense_provider: str | None = None,
     sparse_provider: str = "sentence-transformers",
     dense_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-    sparse_model: str = "naver/splade-cocondenser-ensembledistil",
+    sparse_model: str = "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1",
     dense_device: str | None = None,
     sparse_device: str | None = None,
     dense_backend: str = "torch",

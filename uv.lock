@@ -146,7 +146,7 @@ wheels = [
 
 [[package]]
 name = "gpt-export-distillation"
-version = "0.2.8"
+version = "0.2.9"
 source = { editable = "." }
 dependencies = [
     { name = "sentence-transformers" },
