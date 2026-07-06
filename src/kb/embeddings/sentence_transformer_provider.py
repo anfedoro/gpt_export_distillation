@@ -38,12 +38,13 @@ class SentenceTransformerDenseProvider(DenseEmbeddingProvider):
         _compile_model(self._model, backend=backend, enabled=torch_compile)
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        vectors = self._model.encode(
-            texts,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
+        with _inference_mode():
+            vectors = self._model.encode(
+                texts,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
         return [vector.astype(float).tolist() for vector in vectors]
 
 
@@ -82,12 +83,26 @@ class SentenceTransformerSparseProvider(SparseEmbeddingProvider):
         _compile_model(self._model, backend=backend, enabled=torch_compile)
 
     def embed_texts(self, texts: list[str]) -> list[dict[str, float]]:
-        embeddings = self._model.encode_document(texts)
-        decoded = self._model.decode(embeddings, top_k=self.top_k)
-        return [
+        with _inference_mode():
+            embeddings = self._model.encode_document(texts)
+            decoded = self._model.decode(embeddings, top_k=self.top_k)
+        terms_by_text = [
             {token: float(weight) for token, weight in terms}
             for terms in decoded
         ]
+        del embeddings, decoded
+        return terms_by_text
+
+
+def _inference_mode():
+    try:
+        import torch
+
+        return torch.inference_mode()
+    except Exception:  # noqa: BLE001
+        from contextlib import nullcontext
+
+        return nullcontext()
 
 
 def _model_kwargs(*, backend: str, torch_dtype: str | None) -> dict | None:

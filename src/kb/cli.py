@@ -4,6 +4,9 @@ import argparse
 import gc
 import json
 import math
+import os
+import resource
+import subprocess
 import sys
 from pathlib import Path
 from typing import Iterable, TypeVar
@@ -65,6 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_cmd.add_argument("--sparse-torch-compile", action="store_true")
     import_cmd.add_argument("--sparse-top-k", type=int, default=128)
     import_cmd.add_argument("--batch-size", type=int, default=32)
+    import_cmd.add_argument("--memory-report-every", type=int, default=0, help="Print process memory every N embedding batches.")
     import_cmd.add_argument("--force-embeddings", action="store_true")
     import_cmd.add_argument("--skip-low-interest-content", action=argparse.BooleanOptionalAction, default=True)
     import_cmd.add_argument("--edge-scope", choices=["conversation", "project", "attachment"], default="project")
@@ -100,6 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
     embed.add_argument("--sparse-top-k", type=int, default=128)
     embed.add_argument("--limit", type=int)
     embed.add_argument("--batch-size", type=int, default=32)
+    embed.add_argument("--memory-report-every", type=int, default=0, help="Print process memory every N batches.")
     embed.add_argument("--force", action="store_true")
     embed.add_argument("--skip-low-interest-content", action=argparse.BooleanOptionalAction, default=True)
     embed.add_argument("--quiet", action="store_true", help="Disable progress output on stderr.")
@@ -178,6 +183,7 @@ def main() -> None:
             sparse_torch_compile=args.sparse_torch_compile,
             sparse_top_k=args.sparse_top_k,
             batch_size=args.batch_size,
+            memory_report_every=args.memory_report_every,
             force_embeddings=args.force_embeddings,
             skip_low_interest_content=args.skip_low_interest_content,
             edge_scope=args.edge_scope,
@@ -226,6 +232,7 @@ def main() -> None:
             sparse_top_k=args.sparse_top_k,
             limit=args.limit,
             batch_size=args.batch_size,
+            memory_report_every=args.memory_report_every,
             force=args.force,
             skip_low_interest_content=args.skip_low_interest_content,
             progress=not args.quiet,
@@ -371,6 +378,7 @@ def import_knowledge_base(
     sparse_torch_compile: bool = False,
     sparse_top_k: int = 128,
     batch_size: int = 32,
+    memory_report_every: int = 0,
     force_embeddings: bool = False,
     skip_low_interest_content: bool = True,
     edge_scope: str = "project",
@@ -409,6 +417,7 @@ def import_knowledge_base(
             sparse_torch_compile=sparse_torch_compile,
             sparse_top_k=sparse_top_k,
             batch_size=batch_size,
+            memory_report_every=memory_report_every,
             force=force_embeddings,
             skip_low_interest_content=skip_low_interest_content,
             progress=progress,
@@ -455,6 +464,7 @@ def embed_knowledge_blocks(
     sparse_top_k: int = 128,
     limit: int | None = None,
     batch_size: int = 32,
+    memory_report_every: int = 0,
     force: bool = False,
     skip_low_interest_content: bool = True,
     progress: bool = False,
@@ -481,6 +491,8 @@ def embed_knowledge_blocks(
         raise ValueError("At least one embedding provider must be enabled.")
     if batch_size <= 0:
         raise ValueError("--batch-size must be positive.")
+    if memory_report_every < 0:
+        raise ValueError("--memory-report-every must be non-negative.")
 
     init_db(db_path)
     dense_vectors = 0
@@ -508,7 +520,8 @@ def embed_knowledge_blocks(
         )
         after_id = None
         processed_candidates = 0
-        for _batch_index in batch_iter:
+        peak_rss_mb = _process_memory_mb().get("rss_mb") or _process_memory_mb().get("max_rss_mb") or 0.0
+        for batch_index in batch_iter:
             remaining = candidate_count - processed_candidates
             if remaining <= 0:
                 break
@@ -563,6 +576,14 @@ def embed_knowledge_blocks(
                     print(f"failed embedding knowledge_block {row['id']}: {exc}")
             del texts, dense_results, sparse_results, batch
             _release_batch_memory()
+            memory = _process_memory_mb()
+            peak_rss_mb = max(peak_rss_mb, memory.get("rss_mb") or memory.get("max_rss_mb") or 0.0)
+            if memory_report_every and ((batch_index + 1) % memory_report_every == 0 or processed_candidates >= candidate_count):
+                _progress_message(
+                    f"memory batch={batch_index + 1}/{total_batches} processed={processed_candidates}/{candidate_count} "
+                    f"rss_mb={memory.get('rss_mb', 0.0):.1f} max_rss_mb={memory.get('max_rss_mb', 0.0):.1f}",
+                    enabled=True,
+                )
         store.commit()
     return {
         "dense_model": dense.model_name if dense else None,
@@ -576,6 +597,7 @@ def embed_knowledge_blocks(
         "sparse_terms": sparse_terms,
         "avg_dense_dim": dense_dim_total / dense_vectors if dense_vectors else 0,
         "avg_sparse_non_zero_count": sparse_nnz_total / sparse_vectors if sparse_vectors else 0,
+        "peak_rss_mb": peak_rss_mb,
         "errors": errors,
     }
 
@@ -643,6 +665,32 @@ def _release_batch_memory() -> None:
             torch.cuda.empty_cache()
     except Exception:  # noqa: BLE001
         return
+
+
+def _process_memory_mb() -> dict[str, float]:
+    rss_mb = 0.0
+    try:
+        import psutil
+
+        rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+    except Exception:  # noqa: BLE001
+        rss_mb = _process_rss_mb_from_ps()
+    max_rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    # ru_maxrss is bytes on macOS and kilobytes on Linux.
+    max_rss_mb = max_rss / (1024 * 1024) if sys.platform == "darwin" else max_rss / 1024
+    return {"rss_mb": rss_mb, "max_rss_mb": max_rss_mb}
+
+
+def _process_rss_mb_from_ps() -> float:
+    try:
+        output = subprocess.check_output(
+            ["ps", "-o", "rss=", "-p", str(os.getpid())],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        return float(output) / 1024 if output else 0.0
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def _progress_message(message: str, *, enabled: bool) -> None:
