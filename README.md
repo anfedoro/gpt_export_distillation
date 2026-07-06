@@ -150,13 +150,18 @@ Build a query-ready DB in one command:
 uv run kb-index import \
   --input /path/to/distilled-export \
   --db chat_memory.db \
+  --dense-device mps \
+  --sparse-device mps \
+  --dense-torch-dtype float16 \
+  --sparse-torch-dtype float16 \
   --sparse-top-k 128
 ```
 
 This runs chat ingestion, attachment ingestion, embeddings, deterministic semantic nodes, and scoped semantic edges. It prints one JSON report with per-stage stats plus final table counts.
 Long-running import and embedding commands show progress on stderr by default; pass `--quiet` to keep only the final JSON on stdout.
+The default sparse model is `opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1`, and embedding runs default to separate dense and sparse passes to avoid the memory and throughput issues observed when both transformer models run interleaved in one loop.
 
-On Apple Silicon, a useful first speed experiment is torch on MPS with half precision:
+On Apple Silicon, a useful first speed experiment is torch on MPS with half precision. Start with `--batch-size 16` for the multilingual sparse model and raise it only after memory is stable:
 
 ```bash
 uv run kb-index import \
@@ -166,7 +171,8 @@ uv run kb-index import \
   --sparse-device mps \
   --dense-torch-dtype float16 \
   --sparse-torch-dtype float16 \
-  --batch-size 64
+  --batch-size 16 \
+  --memory-report-every 50
 ```
 
 For long one-shot runs, `torch.compile` can be tested as an additional opt-in. It may spend extra time on warm-up and is not guaranteed to help every model/backend:
@@ -181,10 +187,10 @@ uv run kb-index import \
   --sparse-torch-dtype float16 \
   --dense-torch-compile \
   --sparse-torch-compile \
-  --batch-size 64
+  --batch-size 16
 ```
 
-If the sparse model is slower or unstable on MPS/float16, test the dense and sparse paths separately:
+If the sparse model is slower or unstable on MPS/float16, test the dense and sparse paths explicitly:
 
 ```bash
 uv run kb-index embed \
@@ -199,8 +205,11 @@ uv run kb-index embed \
   --db chat_memory.db \
   --dense-provider none \
   --sparse-provider sentence-transformers \
+  --sparse-model opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1 \
   --sparse-device mps \
   --sparse-torch-dtype float16 \
+  --batch-size 16 \
+  --memory-report-every 50 \
   --force
 ```
 

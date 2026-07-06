@@ -1,6 +1,6 @@
 [project]
 name = "gpt-export-distillation"
-version = "0.2.8"
+version = "0.2.9"
 description = "Distill ChatGPT exports into Markdown-only reviewable folders"
 readme = "README.md"
 authors = [
