@@ -9,6 +9,7 @@ from kb.embeddings.sentence_transformer_provider import (
     SentenceTransformerDenseProvider,
     SentenceTransformerSparseProvider,
 )
+from kb.index.edge_builder import build_similarity_edges
 from kb.index.semantic_node_builder import build_deterministic_nodes
 from kb.ingest.attachment_parser import parse_attachment
 from kb.ingest.chat_md_parser import parse_chat_file, write_parsed_chat_json
@@ -59,6 +60,13 @@ def build_parser() -> argparse.ArgumentParser:
     build_nodes.add_argument("--db", required=True)
     build_nodes.add_argument("--mode", choices=["deterministic"], default="deterministic")
     build_nodes.add_argument("--sparse-top-k", type=int, default=50)
+
+    build_edges = sub.add_parser("build-edges", help="Build computed semantic edges.")
+    build_edges.add_argument("--db", required=True)
+    build_edges.add_argument("--scope", choices=["conversation", "project", "attachment"], default="project")
+    build_edges.add_argument("--top-k", type=int, default=10)
+    build_edges.add_argument("--no-dense", action="store_true")
+    build_edges.add_argument("--no-sparse", action="store_true")
 
     stats = sub.add_parser("stats", help="Print DB table counts.")
     stats.add_argument("--db", required=True)
@@ -136,6 +144,17 @@ def main() -> None:
             db_path=Path(args.db).expanduser(),
             mode=args.mode,
             sparse_top_k=args.sparse_top_k,
+        )
+        print(json.dumps(stats, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if args.command == "build-edges":
+        stats = build_edges_command(
+            db_path=Path(args.db).expanduser(),
+            scope=args.scope,
+            top_k=args.top_k,
+            include_dense=not args.no_dense,
+            include_sparse=not args.no_sparse,
         )
         print(json.dumps(stats, ensure_ascii=False, indent=2, sort_keys=True))
         return
@@ -365,6 +384,35 @@ def build_nodes_command(*, db_path: Path, mode: str = "deterministic", sparse_to
         "memberships_created": stats.memberships_created,
         "nodes_with_dense_vectors": stats.nodes_with_dense_vectors,
         "nodes_with_sparse_terms": stats.nodes_with_sparse_terms,
+    }
+
+
+def build_edges_command(
+    *,
+    db_path: Path,
+    scope: str = "project",
+    top_k: int = 10,
+    include_dense: bool = True,
+    include_sparse: bool = True,
+) -> dict[str, int]:
+    if not include_dense and not include_sparse:
+        raise ValueError("At least one of dense or sparse edges must be enabled.")
+    init_db(db_path)
+    with SQLiteStore(db_path) as store:
+        stats = build_similarity_edges(
+            store,
+            scope=scope,
+            top_k=top_k,
+            include_dense=include_dense,
+            include_sparse=include_sparse,
+        )
+        store.commit()
+        table_stats = store.stats()
+    return {
+        **table_stats,
+        "edges_created": stats.edges_created,
+        "groups_processed": stats.groups_processed,
+        "candidate_pairs": stats.candidate_pairs,
     }
 
 

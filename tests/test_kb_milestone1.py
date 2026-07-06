@@ -12,7 +12,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from kb.cli import build_nodes_command, embed_knowledge_blocks, ingest_attachments, ingest_chats  # noqa: E402
+from kb.cli import build_edges_command, build_nodes_command, embed_knowledge_blocks, ingest_attachments, ingest_chats  # noqa: E402
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.retrieval.hybrid_search import hybrid_query  # noqa: E402
@@ -265,6 +265,45 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertEqual(node_types, ["conversation", "project"])
             self.assertEqual(member_count, first["memberships_created"])
             self.assertEqual(node_vector_count, 2)
+
+    def test_build_edges_creates_idempotent_similarity_edges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            chat_dir = root / "Projects" / "Project_17"
+            chat_dir.mkdir(parents=True)
+            (chat_dir / "chat.md").write_text(SAMPLE_CHAT, encoding="utf-8")
+            db = Path(tmp) / "chat_memory.db"
+
+            ingest_chats(root, db, limit=10)
+            embed_knowledge_blocks(
+                db_path=db,
+                provider="mock",
+                dense_provider="mock",
+                sparse_provider="mock",
+            )
+            first = build_edges_command(db_path=db, scope="project", top_k=2)
+            second = build_edges_command(db_path=db, scope="project", top_k=2)
+
+            self.assertGreater(first["edges_created"], 0)
+            self.assertEqual(first["semantic_edges"], second["semantic_edges"])
+            with SQLiteStore(db) as store:
+                edge_kinds = [
+                    row["edge_kind"]
+                    for row in store.conn.execute("SELECT DISTINCT edge_kind FROM semantic_edges ORDER BY edge_kind").fetchall()
+                ]
+                policy_versions = [
+                    row["policy_version"]
+                    for row in store.conn.execute("SELECT DISTINCT policy_version FROM semantic_edges").fetchall()
+                ]
+                shared_terms_rows = store.conn.execute(
+                    "SELECT COUNT(*) FROM semantic_edges WHERE edge_kind = 'sparse_overlap' AND shared_terms_json IS NOT NULL"
+                ).fetchone()[0]
+            self.assertIn("temporal_neighbor", edge_kinds)
+            self.assertIn("dense_sim", edge_kinds)
+            self.assertIn("sparse_overlap", edge_kinds)
+            self.assertIn("hybrid_sim", edge_kinds)
+            self.assertEqual(policy_versions, ["similarity-edges-v0"])
+            self.assertGreater(shared_terms_rows, 0)
 
 
 if __name__ == "__main__":
