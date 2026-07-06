@@ -84,6 +84,7 @@ Notes:
 - `pinned_time` is a reliable signal for pinned chats in the observed export.
 - In the full ZIP inspected on 2026-06-13, project names were not found as a separate structured field in the top-level JSON files.
 - Practical implication: human-readable project names should be treated as external metadata and supplied via local config overrides when needed.
+- Project-related signals may also be absent from `conversations-*.json` and instead appear in library metadata. This repository therefore treats `conversations-*.json` as a chat payload source, not as the only project signal source.
 
 ### `export_manifest.json`
 
@@ -102,9 +103,81 @@ Notes:
 
 ### `library_files.json`
 
-- Type: `list`
-- Observed local sample: empty list.
-- Expectation: may contain file metadata for user library items in other exports.
+- Type: `list[library_file]`
+- Observed in the newer export inspected on 2026-06-29: 391 entries.
+- This file appears to carry much richer library/project metadata than `conversations-*.json`.
+
+Observed keys in the newer sample:
+
+- `app_id`
+- `client_sha256_digest`
+- `content_backing_kind`
+- `context_scopes`
+- `context_scopes_v2`
+- `created_at`
+- `current_version_number`
+- `deleted_at`
+- `deletion_origin`
+- `deletion_reason`
+- `directory_id`
+- `error_msg`
+- `etag`
+- `expires_at`
+- `file_extension`
+- `file_failure_time`
+- `file_id`
+- `file_name`
+- `file_processed_time`
+- `file_size_bytes`
+- `file_upload_time`
+- `gizmo_id`
+- `hide_from_file_search`
+- `id`
+- `image_gen_generation_id`
+- `initiating_conversation_id`
+- `is_project`
+- `is_visible`
+- `knowledge_store_id`
+- `library_artifact_type`
+- `library_file_category`
+- `metadata_updated_at`
+- `mime_type`
+- `normalized_name`
+- `object_version`
+- `origination_message_id`
+- `origination_thread_id`
+- `pinned_at`
+- `record_creation_time`
+- `request_read_version`
+- `root_directory_id`
+- `sha256_digest`
+- `source_version_number`
+- `state`
+- `thumbnail_sources`
+- `trash_original_directory_id`
+- `trashed_at`
+- `ttl`
+- `updated_at`
+- `uploading_account_user_id`
+- `version_created_at`
+- `version_provenance`
+
+Practical observations from the newer export:
+
+- `is_project` is present but may be unset for all entries in a given export.
+- `pinned_at` is present but may be unset for all entries in a given export.
+- `knowledge_store_id` can be present on only a subset of entries.
+- `directory_id` may be shared by all library entries in a given export.
+- `origination_thread_id` and `origination_message_id` can provide thread-level linkage back to conversation payloads.
+- `library_file_category`, `mime_type`, and `normalized_name` are useful for inspection and grouping.
+- `context_scopes` may be sparse or null, but it is still worth preserving as an inferred project/library signal.
+- `id` is a structured object in the observed sample, so parsers should not assume it is a plain string.
+
+Practical implication:
+
+- Treat `library_files.json` as the primary source for library/project hints when it is available.
+- Do not infer a project name as a fact from this file alone.
+- Use it only as a hint source for summaries, grouping assistance, and manual review.
 
 ### `message_feedback.json`
 
@@ -147,6 +220,8 @@ Notes:
   - `habitat_object_version`
   - `settings`
   - `user_id`
+- Observed settings flags in the newer export include project/UI-related hints such as `project_pins_backfilled`, `first_party_project_pins_unmigrated`, and `study_mode_project_pins_unmigrated`.
+- Practical role: auxiliary signal only, not a primary project source of truth.
 
 ## Parser guidance
 
@@ -155,3 +230,4 @@ Notes:
 - Preserve raw text order by sorting message rows on `message.create_time` and then `message.id`.
 - Assume filenames and project grouping conventions may change across exports.
 - Treat attachment and library metadata as optional.
+- Parsers should stay permissive if `library_files.json` is missing, empty, or partially populated.
