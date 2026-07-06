@@ -38,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     context.add_argument("--node-limit", type=int, default=5)
     context.add_argument("--node-member-limit", type=int, default=5)
     context.add_argument("--neighbor-limit", type=int, default=5)
+    context.add_argument("--retrieval-strategy", choices=["auto", "basement", "semantic_groups"], default="auto")
     context.add_argument("--dense-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
     context.add_argument("--sparse-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
     context.add_argument("--dense-model", default="sentence-transformers/all-MiniLM-L6-v2")
@@ -92,6 +93,7 @@ def main() -> None:
                 node_limit=args.node_limit,
                 node_member_limit=args.node_member_limit,
                 neighbor_limit=args.neighbor_limit,
+                retrieval_strategy=args.retrieval_strategy,
             ),
         )
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))

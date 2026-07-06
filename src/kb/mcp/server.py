@@ -122,6 +122,7 @@ def call_build_context_pack(config: ServerConfig, arguments: dict[str, Any]) -> 
     if project_filter is not None:
         project_filter = str(project_filter)
     include_low_interest = bool(arguments.get("include_low_interest", False))
+    retrieval_strategy = str(arguments.get("retrieval_strategy") or "auto")
     dense = _build_dense_provider(config.dense_provider, config.dense_model)
     sparse = _build_sparse_provider(config.sparse_provider, config.sparse_model, config.sparse_top_k)
     payload = build_context_pack(
@@ -142,6 +143,7 @@ def call_build_context_pack(config: ServerConfig, arguments: dict[str, Any]) -> 
             node_limit=int(arguments.get("node_limit") or 5),
             node_member_limit=int(arguments.get("node_member_limit") or 5),
             neighbor_limit=int(arguments.get("neighbor_limit") or 5),
+            retrieval_strategy=retrieval_strategy,
         ),
         ensure_schema=False,
         read_only=True,
@@ -201,6 +203,7 @@ def _tool_description() -> dict[str, Any]:
                 "token_budget": {"type": "integer", "default": 4000, "minimum": 1},
                 "project_filter": {"type": ["string", "null"], "default": None},
                 "include_low_interest": {"type": "boolean", "default": False},
+                "retrieval_strategy": {"type": "string", "enum": ["auto", "basement", "semantic_groups"], "default": "auto"},
                 "direct_limit": {"type": "integer", "default": 10, "minimum": 1},
                 "node_limit": {"type": "integer", "default": 5, "minimum": 0},
                 "node_member_limit": {"type": "integer", "default": 5, "minimum": 0},

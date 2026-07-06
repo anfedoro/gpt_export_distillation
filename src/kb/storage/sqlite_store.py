@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,26 @@ from kb.model.ids import stable_id
 
 
 SCHEMA_PATH = Path(__file__).with_name("sqlite_schema.sql")
+
+
+@dataclass(frozen=True)
+class DbCapabilities:
+    has_block_embeddings: bool
+    has_sparse_terms: bool
+    has_deterministic_nodes: bool
+    has_similarity_edges: bool
+    has_semantic_groups: bool
+    has_group_embeddings: bool
+
+    def as_dict(self) -> dict[str, bool]:
+        return {
+            "has_block_embeddings": self.has_block_embeddings,
+            "has_sparse_terms": self.has_sparse_terms,
+            "has_deterministic_nodes": self.has_deterministic_nodes,
+            "has_similarity_edges": self.has_similarity_edges,
+            "has_semantic_groups": self.has_semantic_groups,
+            "has_group_embeddings": self.has_group_embeddings,
+        }
 
 
 def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
@@ -61,6 +82,47 @@ class SQLiteStore:
 
     def __exit__(self, *args: object) -> None:
         self.close()
+
+    def capabilities(self) -> DbCapabilities:
+        block_embeddings = self.conn.execute(
+            "SELECT COUNT(*) FROM dense_vectors WHERE owner_type = 'knowledge_block'"
+        ).fetchone()[0]
+        sparse_terms = self.conn.execute(
+            "SELECT COUNT(*) FROM sparse_terms WHERE owner_type = 'knowledge_block'"
+        ).fetchone()[0]
+        deterministic_nodes = self.conn.execute(
+            "SELECT COUNT(*) FROM semantic_nodes WHERE node_type IN ('conversation', 'project', 'attachment')"
+        ).fetchone()[0]
+        similarity_edges = self.conn.execute(
+            "SELECT COUNT(*) FROM semantic_edges"
+        ).fetchone()[0]
+        semantic_groups = self.conn.execute(
+            "SELECT COUNT(*) FROM semantic_nodes WHERE node_type = 'semantic_group'"
+        ).fetchone()[0]
+        group_embeddings = self.conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM semantic_nodes sn
+            WHERE sn.node_type = 'semantic_group'
+              AND (
+                sn.dense_vector_id IS NOT NULL
+                OR EXISTS (
+                    SELECT 1
+                    FROM sparse_terms st
+                    WHERE st.owner_type = 'semantic_node'
+                      AND st.owner_id = sn.id
+                )
+              )
+            """
+        ).fetchone()[0]
+        return DbCapabilities(
+            has_block_embeddings=block_embeddings > 0,
+            has_sparse_terms=sparse_terms > 0,
+            has_deterministic_nodes=deterministic_nodes > 0,
+            has_similarity_edges=similarity_edges > 0,
+            has_semantic_groups=semantic_groups > 0,
+            has_group_embeddings=group_embeddings > 0,
+        )
 
     def upsert_source_document(self, input_root: Path, item: InventoryItem) -> str:
         source_id = stable_id(item.relative_path, item.sha256, prefix="src")
@@ -650,12 +712,17 @@ class SQLiteStore:
             for row in self.conn.execute(query, block_ids).fetchall()
         }
 
-    def semantic_nodes_for_search(self, *, project: str | None = None) -> list[dict[str, Any]]:
+    def semantic_nodes_for_search(self, *, project: str | None = None, node_types: list[str] | None = None) -> list[dict[str, Any]]:
         params: list[Any] = []
-        where = ""
+        where_parts: list[str] = []
         if project is not None:
-            where = "WHERE sn.project_id = ?"
+            where_parts.append("sn.project_id = ?")
             params.append(project)
+        if node_types:
+            placeholders = ", ".join("?" for _ in node_types)
+            where_parts.append(f"sn.node_type IN ({placeholders})")
+            params.extend(node_types)
+        where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
         query = f"""
             SELECT
                 sn.id AS node_id,

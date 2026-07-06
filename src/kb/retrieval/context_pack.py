@@ -15,6 +15,7 @@ class ContextPackOptions:
     node_limit: int = 5
     node_member_limit: int = 5
     neighbor_limit: int = 5
+    retrieval_strategy: str = "auto"
 
 
 def build_context_pack(
@@ -34,6 +35,8 @@ def build_context_pack(
     ensure_schema: bool = True,
     read_only: bool = False,
 ) -> dict[str, Any]:
+    if options.retrieval_strategy not in {"auto", "basement", "semantic_groups"}:
+        raise ValueError(f"Unsupported retrieval_strategy: {options.retrieval_strategy}")
     query_dense = dense.embed_texts([query])[0] if dense else None
     query_sparse = sparse.embed_texts([query])[0] if sparse else None
 
@@ -42,6 +45,8 @@ def build_context_pack(
     candidates: dict[str, dict[str, Any]] = {}
     traces: list[dict[str, Any]] = []
     with SQLiteStore(db_path, read_only=read_only) as store:
+        capabilities = store.capabilities()
+        strategy_used = _resolve_strategy(options.retrieval_strategy, capabilities)
         direct_hits = _score_blocks(
             store.searchable_knowledge_blocks(
                 dense_model_name=dense.model_name if dense else None,
@@ -61,8 +66,9 @@ def build_context_pack(
                 _add_candidate(candidates, block, item["score"], "query -> block direct")
                 traces.append({"path": "query -> block direct", "block_id": item["knowledge_block_id"], "score": item["score"]})
 
+        node_types = ["semantic_group"] if strategy_used == "semantic_groups" else None
         node_hits = _score_nodes(
-            store.semantic_nodes_for_search(project=project),
+            store.semantic_nodes_for_search(project=project, node_types=node_types),
             query_dense=query_dense,
             query_sparse=query_sparse,
             limit=options.node_limit,
@@ -103,14 +109,39 @@ def build_context_pack(
     return {
         "query": query,
         "budget_tokens": options.budget_tokens,
+        "retrieval_strategy_requested": options.retrieval_strategy,
+        "retrieval_strategy_used": strategy_used,
+        "db_capabilities": capabilities.as_dict(),
         "selected_blocks": selected,
         "source_trace": traces,
         "scores": [
             {"block_id": item["block_id"], "score": item["score"], "reason": item["reason"]}
             for item in selected
         ],
-        "explanation": "Direct block hits are kept, semantic node members are added, then graph neighbors are expanded and deduplicated within the token budget.",
+        "explanation": _explanation(strategy_used),
     }
+
+
+def _resolve_strategy(strategy: str, capabilities) -> str:
+    if strategy == "auto":
+        if capabilities.has_semantic_groups and capabilities.has_group_embeddings:
+            return "semantic_groups"
+        return "basement"
+    if strategy == "semantic_groups" and not (capabilities.has_semantic_groups and capabilities.has_group_embeddings):
+        return "basement"
+    return strategy
+
+
+def _explanation(strategy: str) -> str:
+    if strategy == "semantic_groups":
+        return (
+            "Semantic group nodes are searched, their members are expanded, direct block hits are kept as fallback, "
+            "then graph neighbors are expanded and deduplicated within the token budget."
+        )
+    return (
+        "Direct block hits are kept, deterministic semantic node members are added, then graph neighbors are expanded "
+        "and deduplicated within the token budget."
+    )
 
 
 def _score_blocks(
