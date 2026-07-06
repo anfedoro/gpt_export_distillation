@@ -172,12 +172,140 @@ class SQLiteStore:
             "blocks",
             "knowledge_blocks",
             "attachment_documents",
+            "dense_vectors",
+            "sparse_terms",
         ]
         result = {name: int(self.conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) for name in names}
         result["attachments_seen"] = int(
             self.conn.execute("SELECT COUNT(*) FROM source_documents WHERE source_kind = 'attachment'").fetchone()[0]
         )
         return result
+
+    def knowledge_blocks_for_embedding(
+        self,
+        *,
+        limit: int | None = None,
+        dense_model_name: str | None = None,
+        dense_model_version: str | None = None,
+        sparse_model_name: str | None = None,
+        force: bool = False,
+    ) -> list[sqlite3.Row]:
+        where: list[str] = []
+        params: list[Any] = []
+        if not force and dense_model_name is not None:
+            where.append(
+                """
+                NOT EXISTS (
+                    SELECT 1 FROM dense_vectors dv
+                    WHERE dv.owner_type = 'knowledge_block'
+                      AND dv.owner_id = knowledge_blocks.id
+                      AND dv.model_name = ?
+                      AND COALESCE(dv.model_version, '') = COALESCE(?, '')
+                )
+                """
+            )
+            params.extend([dense_model_name, dense_model_version])
+        if not force and sparse_model_name is not None:
+            where.append(
+                """
+                NOT EXISTS (
+                    SELECT 1 FROM sparse_terms st
+                    WHERE st.owner_type = 'knowledge_block'
+                      AND st.owner_id = knowledge_blocks.id
+                      AND st.model_name = ?
+                )
+                """
+            )
+            params.append(sparse_model_name)
+        query = "SELECT id, text_for_embedding FROM knowledge_blocks"
+        if where:
+            query += " WHERE " + " OR ".join(f"({clause})" for clause in where)
+        query += " ORDER BY id"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        return list(self.conn.execute(query, params).fetchall())
+
+    def upsert_dense_vector(
+        self,
+        *,
+        owner_type: str,
+        owner_id: str,
+        model_name: str,
+        model_version: str | None,
+        vector: list[float],
+    ) -> str:
+        vector_id = stable_id(owner_type, owner_id, model_name, model_version, "dense", prefix="vec")
+        self.conn.execute(
+            """
+            INSERT INTO dense_vectors (
+                id, owner_type, owner_id, model_name, model_version, dim, vector_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_type, owner_id, model_name, model_version) DO UPDATE SET
+                dim=excluded.dim,
+                vector_json=excluded.vector_json
+            """,
+            (
+                vector_id,
+                owner_type,
+                owner_id,
+                model_name,
+                model_version,
+                len(vector),
+                json.dumps(vector, separators=(",", ":")),
+            ),
+        )
+        return vector_id
+
+    def replace_sparse_terms(
+        self,
+        *,
+        owner_type: str,
+        owner_id: str,
+        model_name: str,
+        terms: dict[str, float],
+    ) -> str:
+        sparse_id = stable_id(owner_type, owner_id, model_name, "sparse", prefix="sparse")
+        self.conn.execute(
+            "DELETE FROM sparse_terms WHERE owner_type = ? AND owner_id = ? AND model_name = ?",
+            (owner_type, owner_id, model_name),
+        )
+        self.conn.executemany(
+            """
+            INSERT INTO sparse_terms (
+                owner_type, owner_id, token_id, token_text, weight, model_name
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    owner_type,
+                    owner_id,
+                    stable_id(model_name, token),
+                    token,
+                    float(weight),
+                    model_name,
+                )
+                for token, weight in terms.items()
+            ],
+        )
+        return sparse_id
+
+    def set_knowledge_block_vector_ids(
+        self,
+        *,
+        knowledge_block_id: str,
+        dense_vector_id: str | None,
+        sparse_vector_id: str | None,
+    ) -> None:
+        self.conn.execute(
+            """
+            UPDATE knowledge_blocks
+            SET dense_vector_id = COALESCE(?, dense_vector_id),
+                sparse_vector_id = COALESCE(?, sparse_vector_id)
+            WHERE id = ?
+            """,
+            (dense_vector_id, sparse_vector_id, knowledge_block_id),
+        )
 
     def _insert_conversation(self, conversation: Conversation) -> None:
         self.conn.execute(

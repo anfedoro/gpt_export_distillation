@@ -13,6 +13,9 @@ dependencies = []
 nlp = [
     "pymorphy3>=2.0.4",
 ]
+kb = [
+    "sentence-transformers>=5.0.0",
+]
 
 [project.scripts]
 gpt-export-distillation = "gpt_export_distillation:main"

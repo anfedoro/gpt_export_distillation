@@ -12,7 +12,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from kb.cli import ingest_attachments, ingest_chats  # noqa: E402
+from kb.cli import embed_knowledge_blocks, ingest_attachments, ingest_chats  # noqa: E402
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.storage.sqlite_store import SQLiteStore, init_db  # noqa: E402
@@ -141,6 +141,45 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertEqual([row["extraction_status"] for row in rows], ["unsupported", "extracted"])
             self.assertEqual(kb_rows[0]["block_type"], "text")
             self.assertIn("Attachment memory text", kb_rows[0]["text_for_display"])
+
+    def test_embed_mock_providers_are_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            chat_dir = root / "Projects" / "Project_17"
+            chat_dir.mkdir(parents=True)
+            (chat_dir / "chat.md").write_text(SAMPLE_CHAT, encoding="utf-8")
+            db = Path(tmp) / "chat_memory.db"
+
+            ingest_chats(root, db, limit=10)
+            first = embed_knowledge_blocks(
+                db_path=db,
+                provider="mock",
+                dense_provider="mock",
+                sparse_provider="mock",
+                batch_size=2,
+            )
+            second = embed_knowledge_blocks(
+                db_path=db,
+                provider="mock",
+                dense_provider="mock",
+                sparse_provider="mock",
+                batch_size=2,
+            )
+
+            self.assertGreater(first["dense_vectors"], 0)
+            self.assertGreater(first["sparse_vectors"], 0)
+            self.assertEqual(second["candidate_blocks"], 0)
+            with SQLiteStore(db) as store:
+                stats = store.stats()
+                linked = store.conn.execute(
+                    """
+                    SELECT COUNT(*) FROM knowledge_blocks
+                    WHERE dense_vector_id IS NOT NULL AND sparse_vector_id IS NOT NULL
+                    """
+                ).fetchone()[0]
+            self.assertEqual(stats["dense_vectors"], stats["knowledge_blocks"])
+            self.assertGreater(stats["sparse_terms"], 0)
+            self.assertEqual(linked, stats["knowledge_blocks"])
 
 
 if __name__ == "__main__":
