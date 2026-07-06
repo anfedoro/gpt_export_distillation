@@ -4,6 +4,11 @@ import argparse
 import json
 from pathlib import Path
 
+from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider
+from kb.embeddings.sentence_transformer_provider import (
+    SentenceTransformerDenseProvider,
+    SentenceTransformerSparseProvider,
+)
 from kb.ingest.attachment_parser import parse_attachment
 from kb.ingest.chat_md_parser import parse_chat_file, write_parsed_chat_json
 from kb.ingest.tree_walker import scan_tree, write_inventory_jsonl
@@ -36,6 +41,18 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_attachments_parser.add_argument("--db", required=True)
     ingest_attachments_parser.add_argument("--limit", type=int)
     ingest_attachments_parser.add_argument("--project")
+
+    embed = sub.add_parser("embed", help="Embed knowledge blocks with pluggable providers.")
+    embed.add_argument("--db", required=True)
+    embed.add_argument("--provider", choices=["sentence-transformers", "mock"], default="sentence-transformers")
+    embed.add_argument("--dense-provider", choices=["sentence-transformers", "mock", "none"])
+    embed.add_argument("--sparse-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
+    embed.add_argument("--dense-model", default="sentence-transformers/all-MiniLM-L6-v2")
+    embed.add_argument("--sparse-model", default="naver/splade-cocondenser-ensembledistil")
+    embed.add_argument("--sparse-top-k", type=int, default=128)
+    embed.add_argument("--limit", type=int)
+    embed.add_argument("--batch-size", type=int, default=32)
+    embed.add_argument("--force", action="store_true")
 
     stats = sub.add_parser("stats", help="Print DB table counts.")
     stats.add_argument("--db", required=True)
@@ -90,6 +107,22 @@ def main() -> None:
     if args.command == "stats":
         with SQLiteStore(Path(args.db).expanduser()) as store:
             print(json.dumps(store.stats(), ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if args.command == "embed":
+        stats = embed_knowledge_blocks(
+            db_path=Path(args.db).expanduser(),
+            provider=args.provider,
+            dense_provider=args.dense_provider,
+            sparse_provider=args.sparse_provider,
+            dense_model=args.dense_model,
+            sparse_model=args.sparse_model,
+            sparse_top_k=args.sparse_top_k,
+            limit=args.limit,
+            batch_size=args.batch_size,
+            force=args.force,
+        )
+        print(json.dumps(stats, ensure_ascii=False, indent=2, sort_keys=True))
         return
 
 
@@ -186,6 +219,119 @@ def ingest_attachments(input_dir: Path, db_path: Path, limit: int | None = None,
         "blocks_created": blocks_created,
         "skipped": skipped,
     }
+
+
+def embed_knowledge_blocks(
+    *,
+    db_path: Path,
+    provider: str = "sentence-transformers",
+    dense_provider: str | None = None,
+    sparse_provider: str = "sentence-transformers",
+    dense_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+    sparse_model: str = "naver/splade-cocondenser-ensembledistil",
+    sparse_top_k: int = 128,
+    limit: int | None = None,
+    batch_size: int = 32,
+    force: bool = False,
+) -> dict[str, int | float | str | None]:
+    dense_name = dense_provider or provider
+    dense = _build_dense_provider(dense_name, dense_model)
+    sparse = _build_sparse_provider(sparse_provider, sparse_model, sparse_top_k)
+    if dense is None and sparse is None:
+        raise ValueError("At least one embedding provider must be enabled.")
+    if batch_size <= 0:
+        raise ValueError("--batch-size must be positive.")
+
+    init_db(db_path)
+    dense_vectors = 0
+    sparse_vectors = 0
+    sparse_terms = 0
+    errors = 0
+    dense_dim_total = 0
+    sparse_nnz_total = 0
+    with SQLiteStore(db_path) as store:
+        rows = store.knowledge_blocks_for_embedding(
+            limit=limit,
+            dense_model_name=dense.model_name if dense else None,
+            dense_model_version=dense.model_version if dense else None,
+            sparse_model_name=sparse.model_name if sparse else None,
+            force=force,
+        )
+        for start in range(0, len(rows), batch_size):
+            batch = rows[start : start + batch_size]
+            texts = [str(row["text_for_embedding"]) for row in batch]
+            dense_results = dense.embed_texts(texts) if dense else [None] * len(batch)
+            sparse_results = sparse.embed_texts(texts) if sparse else [None] * len(batch)
+            for row, dense_vector, sparse_vector in zip(batch, dense_results, sparse_results, strict=True):
+                try:
+                    owner_id = str(row["id"])
+                    dense_vector_id = None
+                    sparse_vector_id = None
+                    if dense_vector is not None and dense is not None:
+                        dense_vector_id = store.upsert_dense_vector(
+                            owner_type="knowledge_block",
+                            owner_id=owner_id,
+                            model_name=dense.model_name,
+                            model_version=dense.model_version,
+                            vector=dense_vector,
+                        )
+                        dense_vectors += 1
+                        dense_dim_total += len(dense_vector)
+                    if sparse_vector is not None and sparse is not None:
+                        sparse_vector_id = store.replace_sparse_terms(
+                            owner_type="knowledge_block",
+                            owner_id=owner_id,
+                            model_name=sparse.model_name,
+                            terms=sparse_vector,
+                        )
+                        sparse_vectors += 1
+                        sparse_terms += len(sparse_vector)
+                        sparse_nnz_total += len(sparse_vector)
+                    store.set_knowledge_block_vector_ids(
+                        knowledge_block_id=owner_id,
+                        dense_vector_id=dense_vector_id,
+                        sparse_vector_id=sparse_vector_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errors += 1
+                    print(f"failed embedding knowledge_block {row['id']}: {exc}")
+        store.commit()
+    return {
+        "dense_model": dense.model_name if dense else None,
+        "dense_model_version": dense.model_version if dense else None,
+        "sparse_model": sparse.model_name if sparse else None,
+        "sparse_model_version": sparse.model_version if sparse else None,
+        "candidate_blocks": len(rows),
+        "blocks_embedded": max(dense_vectors, sparse_vectors),
+        "dense_vectors": dense_vectors,
+        "sparse_vectors": sparse_vectors,
+        "sparse_terms": sparse_terms,
+        "avg_dense_dim": dense_dim_total / dense_vectors if dense_vectors else 0,
+        "avg_sparse_non_zero_count": sparse_nnz_total / sparse_vectors if sparse_vectors else 0,
+        "errors": errors,
+    }
+
+
+def _build_dense_provider(provider_name: str, dense_model: str):
+    if provider_name == "none":
+        return None
+    if provider_name == "mock":
+        return MockDenseProvider()
+    if provider_name == "sentence-transformers":
+        return SentenceTransformerDenseProvider(dense_model)
+    raise ValueError(f"Unsupported dense provider: {provider_name}")
+
+
+def _build_sparse_provider(provider_name: str, sparse_model: str, sparse_top_k: int):
+    if provider_name == "none":
+        return None
+    if provider_name == "mock":
+        return MockSparseProvider()
+    if provider_name == "sentence-transformers":
+        if sparse_top_k <= 0:
+            raise ValueError("--sparse-top-k must be positive.")
+        return SentenceTransformerSparseProvider(sparse_model, top_k=sparse_top_k)
+    raise ValueError(f"Unsupported sparse provider: {provider_name}")
 
 
 if __name__ == "__main__":
