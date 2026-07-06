@@ -176,6 +176,7 @@ class SQLiteStore:
             "sparse_terms",
             "semantic_nodes",
             "semantic_node_members",
+            "semantic_edges",
         ]
         result = {name: int(self.conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) for name in names}
         result["attachments_seen"] = int(
@@ -496,6 +497,97 @@ class SQLiteStore:
                     member["metadata_json"],
                 )
                 for member in members
+            ],
+        )
+
+    def edge_candidate_groups(self, *, scope: str) -> dict[str, list[dict[str, Any]]]:
+        if scope == "conversation":
+            group_expr = "kb.conversation_id"
+            where = "kb.conversation_id IS NOT NULL"
+        elif scope == "project":
+            group_expr = "kb.project_id"
+            where = "kb.project_id IS NOT NULL"
+        elif scope == "attachment":
+            group_expr = "kb.attachment_id"
+            where = "kb.attachment_id IS NOT NULL"
+        else:
+            raise ValueError(f"Unsupported edge scope: {scope}")
+        query = f"""
+            SELECT
+                {group_expr} AS group_id,
+                kb.id AS knowledge_block_id,
+                kb.conversation_id,
+                m.ordinal AS message_ordinal,
+                b.ordinal AS block_ordinal,
+                dv.vector_json AS dense_vector_json,
+                st.token_text,
+                st.weight
+            FROM knowledge_blocks kb
+            LEFT JOIN messages m ON m.id = kb.message_id
+            LEFT JOIN blocks b ON b.id = kb.block_id
+            LEFT JOIN dense_vectors dv ON dv.id = kb.dense_vector_id
+            LEFT JOIN sparse_terms st
+              ON st.owner_type = 'knowledge_block'
+             AND st.owner_id = kb.id
+            WHERE {where}
+            ORDER BY group_id, kb.id
+        """
+        grouped_blocks: dict[str, dict[str, dict[str, Any]]] = {}
+        for row in self.conn.execute(query).fetchall():
+            group_id = str(row["group_id"])
+            block_id = str(row["knowledge_block_id"])
+            group = grouped_blocks.setdefault(group_id, {})
+            item = group.setdefault(
+                block_id,
+                {
+                    "knowledge_block_id": block_id,
+                    "conversation_id": row["conversation_id"],
+                    "message_ordinal": row["message_ordinal"],
+                    "block_ordinal": row["block_ordinal"],
+                    "dense_vector": json.loads(row["dense_vector_json"]) if row["dense_vector_json"] else None,
+                    "sparse_terms": {},
+                },
+            )
+            if row["token_text"] is not None:
+                item["sparse_terms"][row["token_text"]] = float(row["weight"])
+        return {
+            group_id: list(blocks.values())
+            for group_id, blocks in grouped_blocks.items()
+            if len(blocks) >= 2
+        }
+
+    def upsert_semantic_edges(self, edges: list[dict[str, Any]]) -> None:
+        self.conn.executemany(
+            """
+            INSERT INTO semantic_edges (
+                id, src_type, src_id, dst_type, dst_id, edge_kind, weight,
+                dense_similarity, sparse_similarity, shared_terms_json, metadata_json,
+                policy_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(src_type, src_id, dst_type, dst_id, edge_kind, policy_version)
+            DO UPDATE SET
+                weight=excluded.weight,
+                dense_similarity=excluded.dense_similarity,
+                sparse_similarity=excluded.sparse_similarity,
+                shared_terms_json=excluded.shared_terms_json,
+                metadata_json=excluded.metadata_json
+            """,
+            [
+                (
+                    edge["id"],
+                    edge["src_type"],
+                    edge["src_id"],
+                    edge["dst_type"],
+                    edge["dst_id"],
+                    edge["edge_kind"],
+                    edge["weight"],
+                    edge["dense_similarity"],
+                    edge["sparse_similarity"],
+                    edge["shared_terms_json"],
+                    edge["metadata_json"],
+                    edge["policy_version"],
+                )
+                for edge in edges
             ],
         )
 
