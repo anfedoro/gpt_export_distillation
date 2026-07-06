@@ -53,6 +53,14 @@ def build_parser() -> argparse.ArgumentParser:
     import_cmd.add_argument("--sparse-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
     import_cmd.add_argument("--dense-model", default="sentence-transformers/all-MiniLM-L6-v2")
     import_cmd.add_argument("--sparse-model", default="naver/splade-cocondenser-ensembledistil")
+    import_cmd.add_argument("--dense-device")
+    import_cmd.add_argument("--sparse-device")
+    import_cmd.add_argument("--dense-backend", choices=["torch", "onnx", "openvino"], default="torch")
+    import_cmd.add_argument("--sparse-backend", choices=["torch", "onnx", "openvino"], default="torch")
+    import_cmd.add_argument("--dense-torch-dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
+    import_cmd.add_argument("--sparse-torch-dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
+    import_cmd.add_argument("--dense-torch-compile", action="store_true")
+    import_cmd.add_argument("--sparse-torch-compile", action="store_true")
     import_cmd.add_argument("--sparse-top-k", type=int, default=128)
     import_cmd.add_argument("--batch-size", type=int, default=32)
     import_cmd.add_argument("--force-embeddings", action="store_true")
@@ -79,6 +87,14 @@ def build_parser() -> argparse.ArgumentParser:
     embed.add_argument("--sparse-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
     embed.add_argument("--dense-model", default="sentence-transformers/all-MiniLM-L6-v2")
     embed.add_argument("--sparse-model", default="naver/splade-cocondenser-ensembledistil")
+    embed.add_argument("--dense-device")
+    embed.add_argument("--sparse-device")
+    embed.add_argument("--dense-backend", choices=["torch", "onnx", "openvino"], default="torch")
+    embed.add_argument("--sparse-backend", choices=["torch", "onnx", "openvino"], default="torch")
+    embed.add_argument("--dense-torch-dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
+    embed.add_argument("--sparse-torch-dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
+    embed.add_argument("--dense-torch-compile", action="store_true")
+    embed.add_argument("--sparse-torch-compile", action="store_true")
     embed.add_argument("--sparse-top-k", type=int, default=128)
     embed.add_argument("--limit", type=int)
     embed.add_argument("--batch-size", type=int, default=32)
@@ -150,6 +166,14 @@ def main() -> None:
             sparse_provider=args.sparse_provider,
             dense_model=args.dense_model,
             sparse_model=args.sparse_model,
+            dense_device=args.dense_device,
+            sparse_device=args.sparse_device,
+            dense_backend=args.dense_backend,
+            sparse_backend=args.sparse_backend,
+            dense_torch_dtype=args.dense_torch_dtype,
+            sparse_torch_dtype=args.sparse_torch_dtype,
+            dense_torch_compile=args.dense_torch_compile,
+            sparse_torch_compile=args.sparse_torch_compile,
             sparse_top_k=args.sparse_top_k,
             batch_size=args.batch_size,
             force_embeddings=args.force_embeddings,
@@ -189,6 +213,14 @@ def main() -> None:
             sparse_provider=args.sparse_provider,
             dense_model=args.dense_model,
             sparse_model=args.sparse_model,
+            dense_device=args.dense_device,
+            sparse_device=args.sparse_device,
+            dense_backend=args.dense_backend,
+            sparse_backend=args.sparse_backend,
+            dense_torch_dtype=args.dense_torch_dtype,
+            sparse_torch_dtype=args.sparse_torch_dtype,
+            dense_torch_compile=args.dense_torch_compile,
+            sparse_torch_compile=args.sparse_torch_compile,
             sparse_top_k=args.sparse_top_k,
             limit=args.limit,
             batch_size=args.batch_size,
@@ -327,6 +359,14 @@ def import_knowledge_base(
     sparse_provider: str = "sentence-transformers",
     dense_model: str = "sentence-transformers/all-MiniLM-L6-v2",
     sparse_model: str = "naver/splade-cocondenser-ensembledistil",
+    dense_device: str | None = None,
+    sparse_device: str | None = None,
+    dense_backend: str = "torch",
+    sparse_backend: str = "torch",
+    dense_torch_dtype: str = "auto",
+    sparse_torch_dtype: str = "auto",
+    dense_torch_compile: bool = False,
+    sparse_torch_compile: bool = False,
     sparse_top_k: int = 128,
     batch_size: int = 32,
     force_embeddings: bool = False,
@@ -357,6 +397,14 @@ def import_knowledge_base(
             sparse_provider=sparse_provider,
             dense_model=dense_model,
             sparse_model=sparse_model,
+            dense_device=dense_device,
+            sparse_device=sparse_device,
+            dense_backend=dense_backend,
+            sparse_backend=sparse_backend,
+            dense_torch_dtype=dense_torch_dtype,
+            sparse_torch_dtype=sparse_torch_dtype,
+            dense_torch_compile=dense_torch_compile,
+            sparse_torch_compile=sparse_torch_compile,
             sparse_top_k=sparse_top_k,
             batch_size=batch_size,
             force=force_embeddings,
@@ -394,6 +442,14 @@ def embed_knowledge_blocks(
     sparse_provider: str = "sentence-transformers",
     dense_model: str = "sentence-transformers/all-MiniLM-L6-v2",
     sparse_model: str = "naver/splade-cocondenser-ensembledistil",
+    dense_device: str | None = None,
+    sparse_device: str | None = None,
+    dense_backend: str = "torch",
+    sparse_backend: str = "torch",
+    dense_torch_dtype: str = "auto",
+    sparse_torch_dtype: str = "auto",
+    dense_torch_compile: bool = False,
+    sparse_torch_compile: bool = False,
     sparse_top_k: int = 128,
     limit: int | None = None,
     batch_size: int = 32,
@@ -402,8 +458,23 @@ def embed_knowledge_blocks(
     progress: bool = False,
 ) -> dict[str, int | float | str | None]:
     dense_name = dense_provider or provider
-    dense = _build_dense_provider(dense_name, dense_model)
-    sparse = _build_sparse_provider(sparse_provider, sparse_model, sparse_top_k)
+    dense = _build_dense_provider(
+        dense_name,
+        dense_model,
+        device=dense_device,
+        backend=dense_backend,
+        torch_dtype=dense_torch_dtype,
+        torch_compile=dense_torch_compile,
+    )
+    sparse = _build_sparse_provider(
+        sparse_provider,
+        sparse_model,
+        sparse_top_k,
+        device=sparse_device,
+        backend=sparse_backend,
+        torch_dtype=sparse_torch_dtype,
+        torch_compile=sparse_torch_compile,
+    )
     if dense is None and sparse is None:
         raise ValueError("At least one embedding provider must be enabled.")
     if batch_size <= 0:
@@ -488,17 +559,40 @@ def embed_knowledge_blocks(
     }
 
 
-def _build_dense_provider(provider_name: str, dense_model: str):
+def _build_dense_provider(
+    provider_name: str,
+    dense_model: str,
+    *,
+    device: str | None = None,
+    backend: str = "torch",
+    torch_dtype: str = "auto",
+    torch_compile: bool = False,
+):
     if provider_name == "none":
         return None
     if provider_name == "mock":
         return MockDenseProvider()
     if provider_name == "sentence-transformers":
-        return SentenceTransformerDenseProvider(dense_model)
+        return SentenceTransformerDenseProvider(
+            dense_model,
+            device=device,
+            backend=backend,
+            torch_dtype=torch_dtype,
+            torch_compile=torch_compile,
+        )
     raise ValueError(f"Unsupported dense provider: {provider_name}")
 
 
-def _build_sparse_provider(provider_name: str, sparse_model: str, sparse_top_k: int):
+def _build_sparse_provider(
+    provider_name: str,
+    sparse_model: str,
+    sparse_top_k: int,
+    *,
+    device: str | None = None,
+    backend: str = "torch",
+    torch_dtype: str = "auto",
+    torch_compile: bool = False,
+):
     if provider_name == "none":
         return None
     if provider_name == "mock":
@@ -506,7 +600,14 @@ def _build_sparse_provider(provider_name: str, sparse_model: str, sparse_top_k: 
     if provider_name == "sentence-transformers":
         if sparse_top_k <= 0:
             raise ValueError("--sparse-top-k must be positive.")
-        return SentenceTransformerSparseProvider(sparse_model, top_k=sparse_top_k)
+        return SentenceTransformerSparseProvider(
+            sparse_model,
+            top_k=sparse_top_k,
+            device=device,
+            backend=backend,
+            torch_dtype=torch_dtype,
+            torch_compile=torch_compile,
+        )
     raise ValueError(f"Unsupported sparse provider: {provider_name}")
 
 

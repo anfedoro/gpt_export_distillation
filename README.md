@@ -156,6 +156,56 @@ uv run kb-index import \
 This runs chat ingestion, attachment ingestion, embeddings, deterministic semantic nodes, and scoped semantic edges. It prints one JSON report with per-stage stats plus final table counts.
 Long-running import and embedding commands show progress on stderr by default; pass `--quiet` to keep only the final JSON on stdout.
 
+On Apple Silicon, a useful first speed experiment is torch on MPS with half precision:
+
+```bash
+uv run kb-index import \
+  --input /path/to/distilled-export \
+  --db chat_memory.db \
+  --dense-device mps \
+  --sparse-device mps \
+  --dense-torch-dtype float16 \
+  --sparse-torch-dtype float16 \
+  --batch-size 64
+```
+
+For long one-shot runs, `torch.compile` can be tested as an additional opt-in. It may spend extra time on warm-up and is not guaranteed to help every model/backend:
+
+```bash
+uv run kb-index import \
+  --input /path/to/distilled-export \
+  --db chat_memory.db \
+  --dense-device mps \
+  --sparse-device mps \
+  --dense-torch-dtype float16 \
+  --sparse-torch-dtype float16 \
+  --dense-torch-compile \
+  --sparse-torch-compile \
+  --batch-size 64
+```
+
+If the sparse model is slower or unstable on MPS/float16, test the dense and sparse paths separately:
+
+```bash
+uv run kb-index embed \
+  --db chat_memory.db \
+  --dense-provider sentence-transformers \
+  --sparse-provider none \
+  --dense-device mps \
+  --dense-torch-dtype float16 \
+  --force
+
+uv run kb-index embed \
+  --db chat_memory.db \
+  --dense-provider none \
+  --sparse-provider sentence-transformers \
+  --sparse-device mps \
+  --sparse-torch-dtype float16 \
+  --force
+```
+
+The same CLI exposes `--dense-backend` and `--sparse-backend` with `torch`, `onnx`, or `openvino` for later backend experiments.
+
 The lower-level commands are useful for debugging or partial rebuilds:
 
 ```bash
