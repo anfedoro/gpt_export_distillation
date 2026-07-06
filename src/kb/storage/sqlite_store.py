@@ -14,8 +14,11 @@ from kb.model.ids import stable_id
 SCHEMA_PATH = Path(__file__).with_name("sqlite_schema.sql")
 
 
-def connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path))
+def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
+    if read_only:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    else:
+        conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -46,9 +49,9 @@ def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, de
 
 
 class SQLiteStore:
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, read_only: bool = False) -> None:
         self.db_path = db_path
-        self.conn = connect(db_path)
+        self.conn = connect(db_path, read_only=read_only)
 
     def close(self) -> None:
         self.conn.close()

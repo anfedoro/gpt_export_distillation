@@ -31,14 +31,17 @@ def build_context_pack(
     include_low_interest: bool = False,
     project: str | None = None,
     options: ContextPackOptions = ContextPackOptions(),
+    ensure_schema: bool = True,
+    read_only: bool = False,
 ) -> dict[str, Any]:
     query_dense = dense.embed_texts([query])[0] if dense else None
     query_sparse = sparse.embed_texts([query])[0] if sparse else None
 
-    init_db(db_path)
+    if ensure_schema:
+        init_db(db_path)
     candidates: dict[str, dict[str, Any]] = {}
     traces: list[dict[str, Any]] = []
-    with SQLiteStore(db_path) as store:
+    with SQLiteStore(db_path, read_only=read_only) as store:
         direct_hits = _score_blocks(
             store.searchable_knowledge_blocks(
                 dense_model_name=dense.model_name if dense else None,

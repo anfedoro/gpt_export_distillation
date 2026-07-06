@@ -145,6 +145,108 @@ gpt-export-distillation \
   --input /path/to/chatgpt-export.zip
 ```
 
+## Knowledge Base CLI
+
+The experimental knowledge-base layer works on the Markdown archive produced by this tool. It stores all state in one local SQLite file and keeps source references back to project folders, Markdown files, conversations, messages, and attachments.
+
+Build a fresh DB:
+
+```bash
+uv run kb-index ingest-chats \
+  --input /path/to/distilled-export \
+  --db chat_memory.db
+
+uv run kb-index ingest-attachments \
+  --input /path/to/distilled-export \
+  --db chat_memory.db
+```
+
+Create embeddings and graph structures:
+
+```bash
+uv run --extra kb kb-index embed \
+  --db chat_memory.db \
+  --sparse-top-k 128
+
+uv run kb-index build-nodes \
+  --db chat_memory.db \
+  --mode deterministic
+
+uv run kb-index build-edges \
+  --db chat_memory.db \
+  --scope project \
+  --top-k 10
+```
+
+By default, files under `Common/potential_trash` are assigned `interest_tier=low`. Embedding and retrieval skip `low` and `quarantine` content unless explicitly enabled:
+
+```bash
+uv run --extra kb kb-index embed \
+  --db chat_memory.db \
+  --no-skip-low-interest-content
+
+uv run --extra kb kb-search context \
+  "query text" \
+  --db chat_memory.db \
+  --include-low-interest
+```
+
+Manual retrieval:
+
+```bash
+uv run --extra kb kb-search query \
+  "memory routing" \
+  --db chat_memory.db \
+  --limit 10
+
+uv run --extra kb kb-search context \
+  "memory routing" \
+  --db chat_memory.db \
+  --budget-tokens 4000
+```
+
+`kb-search context` is the preferred interface. It returns a traceable context pack assembled from direct block hits, semantic node expansion, graph neighbor expansion, deduplication, and token-budget selection.
+
+## MCP Server
+
+The local MCP server exposes the knowledge base as a narrow stdio JSON-RPC tool surface. It is designed as an augmentation backend, not a database browser.
+
+Run it locally:
+
+```bash
+uv run --extra kb kb-mcp \
+  --db /absolute/path/to/chat_memory.db
+```
+
+The public MCP tool set is intentionally minimal:
+
+- `build_context_pack`
+
+Tool input:
+
+```json
+{
+  "query": "memory routing",
+  "token_budget": 4000,
+  "project_filter": null,
+  "include_low_interest": false,
+  "direct_limit": 10,
+  "node_limit": 5,
+  "node_member_limit": 5,
+  "neighbor_limit": 5
+}
+```
+
+Tool output includes:
+
+- `context_text`: compact augmentation text ready to pass to an LLM
+- `selected_blocks`: structured selected memory blocks
+- `source_references`: source path, conversation/message/block references
+- `source_trace`: retrieval path such as direct block, semantic node member, or graph neighbor
+- `scores`: score and reason per selected block
+
+Indexing and writes stay in `kb-index`; the MCP server opens the DB read-only and only serves retrieval context.
+
 ## What happens during processing
 
 When the tool runs, it performs these steps:
