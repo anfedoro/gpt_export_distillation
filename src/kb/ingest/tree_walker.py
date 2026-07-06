@@ -46,6 +46,12 @@ def detect_kind(path: Path, relative_path: Path) -> tuple[str, bool]:
     return "attachment", True
 
 
+def interest_tier_for_folder(folder_kind: str | None) -> str:
+    if folder_kind == "common_trash":
+        return "low"
+    return "normal"
+
+
 def scan_tree(input_dir: Path) -> Iterable[InventoryItem]:
     root = input_dir.expanduser().resolve()
     for path in sorted(root.rglob("*")):
@@ -64,6 +70,7 @@ def scan_tree(input_dir: Path) -> Iterable[InventoryItem]:
             folder_kind=folder_kind,
             project_path=project_path,
             is_attachment=is_attachment,
+            interest_tier=interest_tier_for_folder(folder_kind),
         )
 
 

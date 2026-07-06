@@ -26,6 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--dense-model", default="sentence-transformers/all-MiniLM-L6-v2")
     query.add_argument("--sparse-model", default="naver/splade-cocondenser-ensembledistil")
     query.add_argument("--sparse-top-k", type=int, default=128)
+    query.add_argument("--include-low-interest", action="store_true")
     query.add_argument("--json", action="store_true", dest="json_output")
 
     context = sub.add_parser("context", help="Build a traceable context pack.")
@@ -42,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     context.add_argument("--dense-model", default="sentence-transformers/all-MiniLM-L6-v2")
     context.add_argument("--sparse-model", default="naver/splade-cocondenser-ensembledistil")
     context.add_argument("--sparse-top-k", type=int, default=128)
+    context.add_argument("--include-low-interest", action="store_true")
 
     return parser
 
@@ -61,6 +63,7 @@ def main() -> None:
             dense_model=args.dense_model,
             sparse_model=args.sparse_model,
             sparse_top_k=args.sparse_top_k,
+            include_low_interest=args.include_low_interest,
         )
         if args.json_output:
             print(json.dumps(results, ensure_ascii=False, indent=2, sort_keys=True))
@@ -81,6 +84,7 @@ def main() -> None:
             dense_model=args.dense_model,
             sparse_model=args.sparse_model,
             sparse_top_k=args.sparse_top_k,
+            include_low_interest=args.include_low_interest,
             project=args.project,
             options=ContextPackOptions(
                 budget_tokens=args.budget_tokens,
@@ -106,6 +110,7 @@ def hybrid_query(
     dense_model: str = "sentence-transformers/all-MiniLM-L6-v2",
     sparse_model: str = "naver/splade-cocondenser-ensembledistil",
     sparse_top_k: int = 128,
+    include_low_interest: bool = False,
 ) -> dict[str, Any]:
     if limit <= 0:
         raise ValueError("--limit must be positive.")
@@ -124,6 +129,7 @@ def hybrid_query(
             dense_model_version=dense.model_version if dense else None,
             sparse_model_name=sparse.model_name if sparse else None,
             project=project,
+            include_low_interest=include_low_interest,
         )
 
     scored = []
@@ -137,6 +143,7 @@ def hybrid_query(
                 "source_path": row["source_path"],
                 "project": row["project_id"],
                 "folder_kind": row["folder_kind"],
+                "interest_tier": row["interest_tier"],
                 "conversation_id": row["conversation_id"],
                 "conversation_title": row["conversation_title"],
                 "message_id": row["message_id"],

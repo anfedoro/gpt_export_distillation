@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS source_documents (
     relative_path TEXT NOT NULL,
     source_kind TEXT NOT NULL,
     folder_kind TEXT,
+    interest_tier TEXT NOT NULL DEFAULT 'normal',
     project_id TEXT,
     project_name TEXT,
     file_name TEXT NOT NULL,
@@ -94,6 +95,7 @@ CREATE TABLE IF NOT EXISTS knowledge_blocks (
     attachment_id TEXT,
     project_id TEXT,
     folder_kind TEXT,
+    interest_tier TEXT NOT NULL DEFAULT 'normal',
     role TEXT,
     block_type TEXT NOT NULL,
     text_for_embedding TEXT NOT NULL,
@@ -181,6 +183,8 @@ CREATE TABLE IF NOT EXISTS retrieval_traces (
 );
 
 CREATE INDEX IF NOT EXISTS idx_source_documents_kind ON source_documents(source_kind, folder_kind, project_id);
+CREATE INDEX IF NOT EXISTS idx_source_documents_interest ON source_documents(interest_tier);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_blocks_conversation ON blocks(conversation_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_knowledge_blocks_project ON knowledge_blocks(project_id, folder_kind, block_type);
+CREATE INDEX IF NOT EXISTS idx_knowledge_blocks_interest ON knowledge_blocks(interest_tier);

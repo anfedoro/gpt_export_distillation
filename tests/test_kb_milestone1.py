@@ -74,6 +74,7 @@ class KBMilestone1Tests(unittest.TestCase):
 
             self.assertEqual(by_name["chat.md"].detected_kind, "chat_md")
             self.assertEqual(by_name["chat.md"].folder_kind, "common_useful")
+            self.assertEqual(by_name["chat.md"].interest_tier, "normal")
             self.assertEqual(by_name["INDEX.md"].detected_kind, "index_md")
             self.assertTrue(by_name["note.txt"].is_attachment)
             self.assertEqual(by_name["note.txt"].project_path, "Project_17")
@@ -201,6 +202,68 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertEqual(stats["dense_vectors"], stats["knowledge_blocks"])
             self.assertGreater(stats["sparse_terms"], 0)
             self.assertEqual(linked, stats["knowledge_blocks"])
+
+    def test_low_interest_content_is_skipped_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            low_dir = root / "Common" / "potential_trash"
+            useful_dir = root / "Common" / "useful"
+            low_dir.mkdir(parents=True)
+            useful_dir.mkdir(parents=True)
+            (low_dir / "low.md").write_text(SAMPLE_CHAT.replace("conv-1", "conv-low"), encoding="utf-8")
+            (useful_dir / "useful.md").write_text(SAMPLE_CHAT.replace("conv-1", "conv-useful"), encoding="utf-8")
+            db = Path(tmp) / "chat_memory.db"
+
+            ingest_chats(root, db)
+            with SQLiteStore(db) as store:
+                tiers = {
+                    row["relative_path"]: row["interest_tier"]
+                    for row in store.conn.execute(
+                        "SELECT relative_path, interest_tier FROM source_documents ORDER BY relative_path"
+                    ).fetchall()
+                }
+                kb_tiers = {
+                    row["interest_tier"]: row["count"]
+                    for row in store.conn.execute(
+                        "SELECT interest_tier, COUNT(*) AS count FROM knowledge_blocks GROUP BY interest_tier"
+                    ).fetchall()
+                }
+            self.assertEqual(tiers["Common/potential_trash/low.md"], "low")
+            self.assertEqual(tiers["Common/useful/useful.md"], "normal")
+            self.assertGreater(kb_tiers["low"], 0)
+            self.assertGreater(kb_tiers["normal"], 0)
+
+            embedded = embed_knowledge_blocks(
+                db_path=db,
+                provider="mock",
+                dense_provider="mock",
+                sparse_provider="mock",
+            )
+            self.assertEqual(embedded["dense_vectors"], kb_tiers["normal"])
+            embed_knowledge_blocks(
+                db_path=db,
+                provider="mock",
+                dense_provider="mock",
+                sparse_provider="mock",
+                skip_low_interest_content=False,
+            )
+            excluded = hybrid_query(
+                db_path=db,
+                query="memory routing",
+                dense_provider="mock",
+                sparse_provider="mock",
+                limit=20,
+            )
+            included = hybrid_query(
+                db_path=db,
+                query="memory routing",
+                dense_provider="mock",
+                sparse_provider="mock",
+                include_low_interest=True,
+                limit=20,
+            )
+            self.assertTrue(all(item["interest_tier"] == "normal" for item in excluded["results"]))
+            self.assertTrue(any(item["interest_tier"] == "low" for item in included["results"]))
 
     def test_hybrid_query_returns_traceable_results(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
