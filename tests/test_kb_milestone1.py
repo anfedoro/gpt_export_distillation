@@ -226,6 +226,29 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertGreater(stats["sparse_terms"], 0)
             self.assertEqual(linked, stats["knowledge_blocks"])
 
+    def test_embed_limit_does_not_round_up_to_full_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            chat_dir = root / "Projects" / "Project_17"
+            chat_dir.mkdir(parents=True)
+            (chat_dir / "chat.md").write_text(SAMPLE_CHAT, encoding="utf-8")
+            db = Path(tmp) / "chat_memory.db"
+
+            ingest_chats(root, db, limit=10)
+            stats = embed_knowledge_blocks(
+                db_path=db,
+                provider="mock",
+                dense_provider="mock",
+                sparse_provider="mock",
+                batch_size=5,
+                limit=3,
+            )
+
+            self.assertEqual(stats["candidate_blocks"], 3)
+            self.assertEqual(stats["blocks_embedded"], 3)
+            self.assertEqual(stats["dense_vectors"], 3)
+            self.assertEqual(stats["sparse_vectors"], 3)
+
     def test_low_interest_content_is_skipped_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "export"

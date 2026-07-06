@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Iterable, TypeVar
@@ -488,7 +490,7 @@ def embed_knowledge_blocks(
     dense_dim_total = 0
     sparse_nnz_total = 0
     with SQLiteStore(db_path) as store:
-        rows = store.knowledge_blocks_for_embedding(
+        candidate_count = store.count_knowledge_blocks_for_embedding(
             limit=limit,
             dense_model_name=dense.model_name if dense else None,
             dense_model_version=dense.model_version if dense else None,
@@ -496,16 +498,33 @@ def embed_knowledge_blocks(
             force=force,
             skip_low_interest_content=skip_low_interest_content,
         )
-        starts = range(0, len(rows), batch_size)
+        total_batches = math.ceil(candidate_count / batch_size) if candidate_count else 0
         batch_iter = _progress_iter(
-            starts,
+            range(total_batches),
             enabled=progress,
-            total=len(starts),
+            total=total_batches,
             description="embedding batches",
             unit="batch",
         )
-        for start in batch_iter:
-            batch = rows[start : start + batch_size]
+        after_id = None
+        processed_candidates = 0
+        for _batch_index in batch_iter:
+            remaining = candidate_count - processed_candidates
+            if remaining <= 0:
+                break
+            batch = store.knowledge_blocks_for_embedding_batch(
+                after_id=after_id,
+                batch_size=min(batch_size, remaining),
+                dense_model_name=dense.model_name if dense else None,
+                dense_model_version=dense.model_version if dense else None,
+                sparse_model_name=sparse.model_name if sparse else None,
+                force=force,
+                skip_low_interest_content=skip_low_interest_content,
+            )
+            if not batch:
+                break
+            processed_candidates += len(batch)
+            after_id = str(batch[-1]["id"])
             texts = [str(row["text_for_embedding"]) for row in batch]
             dense_results = dense.embed_texts(texts) if dense else [None] * len(batch)
             sparse_results = sparse.embed_texts(texts) if sparse else [None] * len(batch)
@@ -542,13 +561,15 @@ def embed_knowledge_blocks(
                 except Exception as exc:  # noqa: BLE001
                     errors += 1
                     print(f"failed embedding knowledge_block {row['id']}: {exc}")
+            del texts, dense_results, sparse_results, batch
+            _release_batch_memory()
         store.commit()
     return {
         "dense_model": dense.model_name if dense else None,
         "dense_model_version": dense.model_version if dense else None,
         "sparse_model": sparse.model_name if sparse else None,
         "sparse_model_version": sparse.model_version if sparse else None,
-        "candidate_blocks": len(rows),
+        "candidate_blocks": candidate_count,
         "blocks_embedded": max(dense_vectors, sparse_vectors),
         "dense_vectors": dense_vectors,
         "sparse_vectors": sparse_vectors,
@@ -609,6 +630,19 @@ def _build_sparse_provider(
             torch_compile=torch_compile,
         )
     raise ValueError(f"Unsupported sparse provider: {provider_name}")
+
+
+def _release_batch_memory() -> None:
+    gc.collect()
+    try:
+        import torch
+
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        return
 
 
 def _progress_message(message: str, *, enabled: bool) -> None:
