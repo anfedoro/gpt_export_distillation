@@ -9,7 +9,10 @@ from kb.model.entities import Block, Conversation, Message, ParsedChat
 from kb.model.ids import stable_id
 
 
-MESSAGE_HEADING_RE = re.compile(r"^###\s+(\d+)\.\s+([A-Za-z_ -]+)\s*$", flags=re.MULTILINE)
+MESSAGE_HEADING_RE = re.compile(
+    r"^###\s+(\d+)\.\s+(USER|ASSISTANT|SYSTEM|TOOL|UNKNOWN)\s*$",
+    flags=re.MULTILINE | re.IGNORECASE,
+)
 KV_RE = re.compile(r"^-\s+`?([A-Za-z0-9_ -]+)`?:\s*(.*)$")
 FENCE_RE = re.compile(r"^```([A-Za-z0-9_+.-]*)\s*$")
 ROLE_MAP = {
