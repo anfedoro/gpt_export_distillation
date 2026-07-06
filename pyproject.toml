@@ -1,20 +1,19 @@
 [project]
 name = "gpt-export-distillation"
-version = "0.2.1"
+version = "0.2.2"
 description = "Distill ChatGPT exports into Markdown-only reviewable folders"
 readme = "README.md"
 authors = [
     { name = "anfedoro", email = "anfedoro@gmail.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "sentence-transformers>=5.0.0",
+]
 
 [project.optional-dependencies]
 nlp = [
     "pymorphy3>=2.0.4",
-]
-kb = [
-    "sentence-transformers>=5.0.0",
 ]
 
 [project.scripts]

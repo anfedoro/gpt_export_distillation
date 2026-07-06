@@ -18,6 +18,7 @@ class EdgeBuildStats:
     edges_created: int
     groups_processed: int
     candidate_pairs: int
+    groups_skipped: int
 
 
 def build_similarity_edges(
@@ -27,33 +28,50 @@ def build_similarity_edges(
     top_k: int = 10,
     include_dense: bool = True,
     include_sparse: bool = True,
+    max_group_size: int = 1000,
 ) -> EdgeBuildStats:
     if scope not in {"conversation", "project", "attachment"}:
         raise ValueError(f"Unsupported edge scope: {scope}")
     if top_k <= 0:
         raise ValueError("top_k must be positive.")
+    if max_group_size <= 1:
+        raise ValueError("max_group_size must be greater than 1.")
     groups = store.edge_candidate_groups(scope=scope)
     edges: list[dict[str, Any]] = []
     candidate_pairs = 0
+    groups_skipped = 0
     for members in groups.values():
         ordered = sorted(members, key=lambda item: (item.get("conversation_id") or "", item.get("message_ordinal") or 0, item.get("block_ordinal") or 0, item["knowledge_block_id"]))
         edges.extend(_temporal_edges(ordered))
+        comparable = [member for member in ordered if _has_comparable_signal(member, include_dense=include_dense, include_sparse=include_sparse)]
+        if len(comparable) > max_group_size:
+            groups_skipped += 1
+            continue
         pair_scores = []
-        for left, right in combinations(ordered, 2):
+        for left, right in combinations(comparable, 2):
             candidate_pairs += 1
             dense_score = _cosine(left["dense_vector"], right["dense_vector"]) if include_dense else None
             sparse_score, shared_terms = _sparse_similarity(left["sparse_terms"], right["sparse_terms"]) if include_sparse else (None, [])
             hybrid_score = _hybrid_score(dense_score, sparse_score)
-            pair_scores.append((hybrid_score, dense_score, sparse_score, shared_terms, left, right))
+            if hybrid_score > 0:
+                pair_scores.append((hybrid_score, dense_score, sparse_score, shared_terms, left, right))
         pair_scores.sort(key=lambda item: item[0], reverse=True)
         for hybrid_score, dense_score, sparse_score, shared_terms, left, right in pair_scores[:top_k]:
-            if dense_score is not None:
+            if dense_score is not None and dense_score > 0:
                 edges.append(_edge(left["knowledge_block_id"], right["knowledge_block_id"], "dense_sim", dense_score, dense_score, None, []))
-            if sparse_score is not None:
+            if sparse_score is not None and sparse_score > 0:
                 edges.append(_edge(left["knowledge_block_id"], right["knowledge_block_id"], "sparse_overlap", sparse_score, None, sparse_score, shared_terms))
             edges.append(_edge(left["knowledge_block_id"], right["knowledge_block_id"], "hybrid_sim", hybrid_score, dense_score, sparse_score, shared_terms))
     store.upsert_semantic_edges(edges)
-    return EdgeBuildStats(edges_created=len(edges), groups_processed=len(groups), candidate_pairs=candidate_pairs)
+    return EdgeBuildStats(edges_created=len(edges), groups_processed=len(groups), candidate_pairs=candidate_pairs, groups_skipped=groups_skipped)
+
+
+def _has_comparable_signal(member: dict[str, Any], *, include_dense: bool, include_sparse: bool) -> bool:
+    if include_dense and member.get("dense_vector"):
+        return True
+    if include_sparse and member.get("sparse_terms"):
+        return True
+    return False
 
 
 def _temporal_edges(members: list[dict[str, Any]]) -> list[dict[str, Any]]:

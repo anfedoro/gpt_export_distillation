@@ -146,13 +146,13 @@ wheels = [
 
 [[package]]
 name = "gpt-export-distillation"
-version = "0.1.0"
+version = "0.2.2"
 source = { editable = "." }
-
-[package.optional-dependencies]
-kb = [
+dependencies = [
     { name = "sentence-transformers" },
 ]
+
+[package.optional-dependencies]
 nlp = [
     { name = "pymorphy3" },
 ]
@@ -160,9 +160,9 @@ nlp = [
 [package.metadata]
 requires-dist = [
     { name = "pymorphy3", marker = "extra == 'nlp'", specifier = ">=2.0.4" },
-    { name = "sentence-transformers", marker = "extra == 'kb'", specifier = ">=5.0.0" },
+    { name = "sentence-transformers", specifier = ">=5.0.0" },
 ]
-provides-extras = ["nlp", "kb"]
+provides-extras = ["nlp"]
 
 [[package]]
 name = "h11"
