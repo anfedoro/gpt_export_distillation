@@ -713,6 +713,7 @@ def _embed_knowledge_blocks_joint(
                     print(f"failed embedding knowledge_block {row['id']}: {exc}")
             store.commit()
             store.shrink_memory()
+            memory_before_cleanup = _process_memory_mb()
             del texts, dense_results, sparse_results, batch
             _release_batch_memory()
             memory = _process_memory_mb()
@@ -720,7 +721,9 @@ def _embed_knowledge_blocks_joint(
             if memory_report_every and ((batch_index + 1) % memory_report_every == 0 or processed_candidates >= candidate_count):
                 _progress_message(
                     f"memory batch={batch_index + 1}/{total_batches} processed={processed_candidates}/{candidate_count} "
+                    f"rss_before_cleanup_mb={memory_before_cleanup.get('rss_mb', 0.0):.1f} "
                     f"rss_mb={memory.get('rss_mb', 0.0):.1f} max_rss_mb={memory.get('max_rss_mb', 0.0):.1f} "
+                    f"rss_delta_after_gc_mb={memory.get('rss_mb', 0.0) - memory_before_cleanup.get('rss_mb', 0.0):.1f} "
                     f"mps_current_mb={memory.get('mps_current_mb', 0.0):.1f} "
                     f"mps_driver_mb={memory.get('mps_driver_mb', 0.0):.1f} "
                     f"cuda_allocated_mb={memory.get('cuda_allocated_mb', 0.0):.1f} "
