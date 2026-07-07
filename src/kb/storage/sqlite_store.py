@@ -42,6 +42,9 @@ def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
         conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    if not read_only:
+        # Keep long sparse-term ingestion runs from letting SQLite's page cache grow with the DB.
+        conn.execute("PRAGMA cache_size = -32768")
     return conn
 
 
@@ -245,6 +248,9 @@ class SQLiteStore:
 
     def commit(self) -> None:
         self.conn.commit()
+
+    def shrink_memory(self) -> None:
+        self.conn.execute("PRAGMA shrink_memory")
 
     def stats(self) -> dict[str, int]:
         names = [
