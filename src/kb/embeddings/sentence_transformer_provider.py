@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+import resource
+import subprocess
+import sys
 
 from kb.embeddings.base import DenseEmbeddingProvider, SparseEmbeddingProvider
 
@@ -108,18 +111,23 @@ class SentenceTransformerSparseProvider(SparseEmbeddingProvider):
         logger.info("loaded sparse sentence-transformers model name=%s", model_name)
 
     def embed_texts(self, texts: list[str]) -> list[dict[str, float]]:
-        logger.debug("sparse encode_document start batch_size=%d", len(texts))
+        _log_memory("sparse encode_document start", batch_size=len(texts))
         with _inference_mode():
             embeddings = self._model.encode_document(texts)
-            logger.debug("sparse encode_document done batch_size=%d embedding_type=%s", len(texts), type(embeddings).__name__)
+            _log_memory(
+                "sparse encode_document done",
+                batch_size=len(texts),
+                embedding_type=type(embeddings).__name__,
+            )
             decoded = self._model.decode(embeddings, top_k=self.top_k)
-            logger.debug("sparse decode done batch_size=%d top_k=%d", len(texts), self.top_k)
+            _log_memory("sparse decode done", batch_size=len(texts), top_k=self.top_k)
         terms_by_text = [
             {token: float(weight) for token, weight in terms}
             for terms in decoded
         ]
+        _log_memory("sparse terms materialized", batch_size=len(texts))
         del embeddings, decoded
-        logger.debug("sparse terms materialized batch_size=%d", len(texts))
+        _log_memory("sparse tensors deleted", batch_size=len(texts))
         return terms_by_text
 
 
@@ -180,3 +188,57 @@ def _model_version(
     if torch_compile:
         parts.append("compile=true")
     return ";".join(parts)
+
+
+def _log_memory(event: str, **fields: object) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    stats = _memory_stats()
+    payload = " ".join(
+        f"{key}={value}" for key, value in {**fields, **stats}.items() if value is not None
+    )
+    logger.debug("%s %s", event, payload)
+
+
+def _memory_stats() -> dict[str, float | None]:
+    rss_mb = None
+    try:
+        import psutil
+
+        rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+    except Exception:  # noqa: BLE001
+        rss_mb = _rss_mb_from_ps()
+    max_rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    max_rss_mb = max_rss / (1024 * 1024) if sys.platform == "darwin" else max_rss / 1024
+    stats: dict[str, float | None] = {
+        "rss_mb": round(rss_mb, 1) if rss_mb is not None else None,
+        "max_rss_mb": round(max_rss_mb, 1),
+        "mps_current_mb": None,
+        "mps_driver_mb": None,
+        "cuda_allocated_mb": None,
+        "cuda_reserved_mb": None,
+    }
+    try:
+        import torch
+
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            stats["mps_current_mb"] = round(torch.mps.current_allocated_memory() / (1024 * 1024), 1)
+            if hasattr(torch.mps, "driver_allocated_memory"):
+                stats["mps_driver_mb"] = round(torch.mps.driver_allocated_memory() / (1024 * 1024), 1)
+        if torch.cuda.is_available():
+            stats["cuda_allocated_mb"] = round(torch.cuda.memory_allocated() / (1024 * 1024), 1)
+            stats["cuda_reserved_mb"] = round(torch.cuda.memory_reserved() / (1024 * 1024), 1)
+    except Exception:  # noqa: BLE001
+        logger.debug("torch memory stats unavailable", exc_info=True)
+    return stats
+
+
+def _rss_mb_from_ps() -> float | None:
+    try:
+        output = subprocess.check_output(
+            ["ps", "-o", "rss=", "-p", str(os.getpid())],
+            text=True,
+        ).strip()
+        return float(output) / 1024
+    except Exception:  # noqa: BLE001
+        return None
