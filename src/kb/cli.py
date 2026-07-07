@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import logging
 import math
 import os
 import resource
@@ -70,6 +71,12 @@ def build_parser() -> argparse.ArgumentParser:
     import_cmd.add_argument("--batch-size", type=int, default=32)
     import_cmd.add_argument("--embedding-pass-mode", choices=["joint", "separate"], default="separate")
     import_cmd.add_argument("--memory-report-every", type=int, default=0, help="Print process memory every N embedding batches.")
+    import_cmd.add_argument(
+        "--dependency-log-level",
+        choices=["critical", "error", "warning", "info", "debug"],
+        default="warning",
+        help="Enable Python logging for model dependencies such as sentence-transformers, transformers, torch, and huggingface_hub.",
+    )
     import_cmd.add_argument("--force-embeddings", action="store_true")
     import_cmd.add_argument("--skip-low-interest-content", action=argparse.BooleanOptionalAction, default=True)
     import_cmd.add_argument("--edge-scope", choices=["conversation", "project", "attachment"], default="project")
@@ -107,6 +114,12 @@ def build_parser() -> argparse.ArgumentParser:
     embed.add_argument("--batch-size", type=int, default=32)
     embed.add_argument("--embedding-pass-mode", choices=["joint", "separate"], default="separate")
     embed.add_argument("--memory-report-every", type=int, default=0, help="Print process memory every N batches.")
+    embed.add_argument(
+        "--dependency-log-level",
+        choices=["critical", "error", "warning", "info", "debug"],
+        default="warning",
+        help="Enable Python logging for model dependencies such as sentence-transformers, transformers, torch, and huggingface_hub.",
+    )
     embed.add_argument("--force", action="store_true")
     embed.add_argument("--skip-low-interest-content", action=argparse.BooleanOptionalAction, default=True)
     embed.add_argument("--quiet", action="store_true", help="Disable progress output on stderr.")
@@ -165,6 +178,7 @@ def main() -> None:
         return
 
     if args.command == "import":
+        _configure_dependency_logging(args.dependency_log_level)
         stats = import_knowledge_base(
             input_dir=Path(args.input).expanduser(),
             db_path=Path(args.db).expanduser(),
@@ -217,6 +231,7 @@ def main() -> None:
         return
 
     if args.command == "embed":
+        _configure_dependency_logging(args.dependency_log_level)
         stats = embed_knowledge_blocks(
             db_path=Path(args.db).expanduser(),
             provider=args.provider,
@@ -264,6 +279,43 @@ def main() -> None:
         )
         print(json.dumps(stats, ensure_ascii=False, indent=2, sort_keys=True))
         return
+
+
+def _configure_dependency_logging(level_name: str) -> None:
+    level_name = level_name.upper()
+    level = getattr(logging, level_name)
+    logging.basicConfig(
+        level=level,
+        format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+    for logger_name in (
+        "kb",
+        "sentence_transformers",
+        "transformers",
+        "huggingface_hub",
+        "torch",
+        "urllib3",
+    ):
+        logging.getLogger(logger_name).setLevel(level)
+    os.environ["TRANSFORMERS_VERBOSITY"] = level_name.lower()
+    os.environ["HF_HUB_VERBOSITY"] = level_name.lower()
+    try:
+        from transformers.utils import logging as transformers_logging
+
+        transformers_logging.set_verbosity(level)
+        transformers_logging.enable_default_handler()
+        transformers_logging.enable_explicit_format()
+    except Exception:  # noqa: BLE001
+        logging.getLogger("kb").debug("transformers logging setup skipped", exc_info=True)
+    try:
+        import torch
+
+        if level <= logging.DEBUG and hasattr(torch, "_logging"):
+            # Torch exposes only selected component logs. If the API changes, keep CLI logging usable.
+            torch._logging.set_logs(all=logging.DEBUG)
+    except Exception:  # noqa: BLE001
+        logging.getLogger("kb").debug("torch logging setup skipped", exc_info=True)
 
 
 def ingest_chats(input_dir: Path, db_path: Path, limit: int | None = None, project: str | None = None) -> dict[str, int]:

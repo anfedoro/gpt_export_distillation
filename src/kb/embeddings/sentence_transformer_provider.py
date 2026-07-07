@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
 import os
 
 from kb.embeddings.base import DenseEmbeddingProvider, SparseEmbeddingProvider
+
+
+logger = logging.getLogger(__name__)
 
 
 class SentenceTransformerDenseProvider(DenseEmbeddingProvider):
@@ -34,10 +38,20 @@ class SentenceTransformerDenseProvider(DenseEmbeddingProvider):
             torch_dtype=torch_dtype,
             torch_compile=torch_compile,
         )
+        logger.info(
+            "loading dense sentence-transformers model name=%s device=%s backend=%s dtype=%s compile=%s",
+            model_name,
+            device,
+            backend,
+            torch_dtype or "auto",
+            torch_compile,
+        )
         self._model = SentenceTransformer(model_name, device=device, backend=backend, model_kwargs=model_kwargs)
         _compile_model(self._model, backend=backend, enabled=torch_compile)
+        logger.info("loaded dense sentence-transformers model name=%s", model_name)
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        logger.debug("dense encode start batch_size=%d", len(texts))
         with _inference_mode():
             vectors = self._model.encode(
                 texts,
@@ -45,6 +59,7 @@ class SentenceTransformerDenseProvider(DenseEmbeddingProvider):
                 normalize_embeddings=True,
                 show_progress_bar=False,
             )
+        logger.debug("dense encode done batch_size=%d", len(texts))
         return [vector.astype(float).tolist() for vector in vectors]
 
 
@@ -79,18 +94,32 @@ class SentenceTransformerSparseProvider(SparseEmbeddingProvider):
             torch_compile=torch_compile,
         )
         self.top_k = top_k
+        logger.info(
+            "loading sparse sentence-transformers model name=%s device=%s backend=%s dtype=%s compile=%s top_k=%d",
+            model_name,
+            device,
+            backend,
+            torch_dtype or "auto",
+            torch_compile,
+            top_k,
+        )
         self._model = SparseEncoder(model_name, device=device, backend=backend, model_kwargs=model_kwargs)
         _compile_model(self._model, backend=backend, enabled=torch_compile)
+        logger.info("loaded sparse sentence-transformers model name=%s", model_name)
 
     def embed_texts(self, texts: list[str]) -> list[dict[str, float]]:
+        logger.debug("sparse encode_document start batch_size=%d", len(texts))
         with _inference_mode():
             embeddings = self._model.encode_document(texts)
+            logger.debug("sparse encode_document done batch_size=%d embedding_type=%s", len(texts), type(embeddings).__name__)
             decoded = self._model.decode(embeddings, top_k=self.top_k)
+            logger.debug("sparse decode done batch_size=%d top_k=%d", len(texts), self.top_k)
         terms_by_text = [
             {token: float(weight) for token, weight in terms}
             for terms in decoded
         ]
         del embeddings, decoded
+        logger.debug("sparse terms materialized batch_size=%d", len(texts))
         return terms_by_text
 
 
