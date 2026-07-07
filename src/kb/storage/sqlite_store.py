@@ -441,7 +441,7 @@ class SQLiteStore:
                 owner_type, owner_id, token_id, token_text, weight, model_name
             ) VALUES (?, ?, ?, ?, ?, ?)
             """,
-            [
+            (
                 (
                     owner_type,
                     owner_id,
@@ -451,7 +451,7 @@ class SQLiteStore:
                     model_name,
                 )
                 for token, weight in terms.items()
-            ],
+            ),
         )
         return sparse_id
 
