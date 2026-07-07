@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import gc
 import os
 import resource
 import subprocess
@@ -113,7 +114,13 @@ class SentenceTransformerSparseProvider(SparseEmbeddingProvider):
     def embed_texts(self, texts: list[str]) -> list[dict[str, float]]:
         _log_memory("sparse encode_document start", batch_size=len(texts))
         with _inference_mode():
-            embeddings = self._model.encode_document(texts)
+            embeddings = self._model.encode_document(
+                texts,
+                batch_size=len(texts),
+                show_progress_bar=False,
+                convert_to_tensor=True,
+                convert_to_sparse_tensor=False,
+            )
             _log_memory(
                 "sparse encode_document done",
                 batch_size=len(texts),
@@ -127,6 +134,7 @@ class SentenceTransformerSparseProvider(SparseEmbeddingProvider):
         ]
         _log_memory("sparse terms materialized", batch_size=len(texts))
         del embeddings, decoded
+        _release_torch_memory()
         _log_memory("sparse tensors deleted", batch_size=len(texts))
         return terms_by_text
 
@@ -242,3 +250,16 @@ def _rss_mb_from_ps() -> float | None:
         return float(output) / 1024
     except Exception:  # noqa: BLE001
         return None
+
+
+def _release_torch_memory() -> None:
+    gc.collect()
+    try:
+        import torch
+
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        return
