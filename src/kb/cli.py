@@ -675,6 +675,8 @@ def _embed_knowledge_blocks_joint(
             texts = [str(row["text_for_embedding"]) for row in batch]
             dense_results = dense.embed_texts(texts) if dense else [None] * len(batch)
             sparse_results = sparse.embed_texts(texts) if sparse else [None] * len(batch)
+            batch_sparse_terms_count = sum(len(sparse_vector) for sparse_vector in sparse_results if sparse_vector)
+            pending_insert_rows_count = 0
             for row, dense_vector, sparse_vector in zip(batch, dense_results, sparse_results, strict=True):
                 try:
                     owner_id = str(row["id"])
@@ -691,6 +693,7 @@ def _embed_knowledge_blocks_joint(
                         dense_vectors += 1
                         dense_dim_total += len(dense_vector)
                     if sparse_vector is not None and sparse is not None:
+                        pending_insert_rows_count += len(sparse_vector)
                         sparse_vector_id = store.replace_sparse_terms(
                             owner_type="knowledge_block",
                             owner_id=owner_id,
@@ -708,6 +711,7 @@ def _embed_knowledge_blocks_joint(
                 except Exception as exc:  # noqa: BLE001
                     errors += 1
                     print(f"failed embedding knowledge_block {row['id']}: {exc}")
+            store.commit()
             del texts, dense_results, sparse_results, batch
             _release_batch_memory()
             memory = _process_memory_mb()
@@ -715,7 +719,9 @@ def _embed_knowledge_blocks_joint(
             if memory_report_every and ((batch_index + 1) % memory_report_every == 0 or processed_candidates >= candidate_count):
                 _progress_message(
                     f"memory batch={batch_index + 1}/{total_batches} processed={processed_candidates}/{candidate_count} "
-                    f"rss_mb={memory.get('rss_mb', 0.0):.1f} max_rss_mb={memory.get('max_rss_mb', 0.0):.1f}",
+                    f"rss_mb={memory.get('rss_mb', 0.0):.1f} max_rss_mb={memory.get('max_rss_mb', 0.0):.1f} "
+                    f"batch_sparse_terms_count={batch_sparse_terms_count} "
+                    f"pending_insert_rows_count={pending_insert_rows_count} retained_terms_buffer_count=0",
                     enabled=True,
                 )
         store.commit()
