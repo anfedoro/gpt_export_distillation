@@ -720,6 +720,10 @@ def _embed_knowledge_blocks_joint(
                 _progress_message(
                     f"memory batch={batch_index + 1}/{total_batches} processed={processed_candidates}/{candidate_count} "
                     f"rss_mb={memory.get('rss_mb', 0.0):.1f} max_rss_mb={memory.get('max_rss_mb', 0.0):.1f} "
+                    f"mps_current_mb={memory.get('mps_current_mb', 0.0):.1f} "
+                    f"mps_driver_mb={memory.get('mps_driver_mb', 0.0):.1f} "
+                    f"cuda_allocated_mb={memory.get('cuda_allocated_mb', 0.0):.1f} "
+                    f"cuda_reserved_mb={memory.get('cuda_reserved_mb', 0.0):.1f} "
                     f"batch_sparse_terms_count={batch_sparse_terms_count} "
                     f"pending_insert_rows_count={pending_insert_rows_count} retained_terms_buffer_count=0",
                     enabled=True,
@@ -936,7 +940,31 @@ def _process_memory_mb() -> dict[str, float]:
     max_rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     # ru_maxrss is bytes on macOS and kilobytes on Linux.
     max_rss_mb = max_rss / (1024 * 1024) if sys.platform == "darwin" else max_rss / 1024
-    return {"rss_mb": rss_mb, "max_rss_mb": max_rss_mb}
+    memory = {"rss_mb": rss_mb, "max_rss_mb": max_rss_mb}
+    memory.update(_torch_memory_mb())
+    return memory
+
+
+def _torch_memory_mb() -> dict[str, float]:
+    memory = {
+        "mps_current_mb": 0.0,
+        "mps_driver_mb": 0.0,
+        "cuda_allocated_mb": 0.0,
+        "cuda_reserved_mb": 0.0,
+    }
+    try:
+        import torch
+
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            memory["mps_current_mb"] = torch.mps.current_allocated_memory() / (1024 * 1024)
+            if hasattr(torch.mps, "driver_allocated_memory"):
+                memory["mps_driver_mb"] = torch.mps.driver_allocated_memory() / (1024 * 1024)
+        if torch.cuda.is_available():
+            memory["cuda_allocated_mb"] = torch.cuda.memory_allocated() / (1024 * 1024)
+            memory["cuda_reserved_mb"] = torch.cuda.memory_reserved() / (1024 * 1024)
+    except Exception:  # noqa: BLE001
+        return memory
+    return memory
 
 
 def _process_rss_mb_from_ps() -> float:
