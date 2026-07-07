@@ -712,6 +712,7 @@ def _embed_knowledge_blocks_joint(
                     errors += 1
                     print(f"failed embedding knowledge_block {row['id']}: {exc}")
             store.commit()
+            store.shrink_memory()
             del texts, dense_results, sparse_results, batch
             _release_batch_memory()
             memory = _process_memory_mb()
