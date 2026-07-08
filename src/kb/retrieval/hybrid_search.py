@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from kb.cli import _build_dense_provider, _build_sparse_provider
-from kb.storage.sqlite_store import SQLiteStore, init_db
+from kb.storage.sqlite_store import SQLiteStore
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,7 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--dense-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
     query.add_argument("--sparse-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
     query.add_argument("--dense-model", default="sentence-transformers/all-MiniLM-L6-v2")
-    query.add_argument("--sparse-model", default="naver/splade-cocondenser-ensembledistil")
+    query.add_argument("--sparse-model", default="opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1")
     query.add_argument("--sparse-top-k", type=int, default=128)
     query.add_argument("--include-low-interest", action="store_true")
     query.add_argument("--json", action="store_true", dest="json_output")
@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     context.add_argument("--dense-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
     context.add_argument("--sparse-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
     context.add_argument("--dense-model", default="sentence-transformers/all-MiniLM-L6-v2")
-    context.add_argument("--sparse-model", default="naver/splade-cocondenser-ensembledistil")
+    context.add_argument("--sparse-model", default="opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1")
     context.add_argument("--sparse-top-k", type=int, default=128)
     context.add_argument("--include-low-interest", action="store_true")
 
@@ -110,7 +110,7 @@ def hybrid_query(
     dense_provider: str = "sentence-transformers",
     sparse_provider: str = "sentence-transformers",
     dense_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-    sparse_model: str = "naver/splade-cocondenser-ensembledistil",
+    sparse_model: str = "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1",
     sparse_top_k: int = 128,
     include_low_interest: bool = False,
 ) -> dict[str, Any]:
@@ -124,8 +124,7 @@ def hybrid_query(
     query_dense = dense.embed_texts([query])[0] if dense else None
     query_sparse = sparse.embed_texts([query])[0] if sparse else None
 
-    init_db(db_path)
-    with SQLiteStore(db_path) as store:
+    with SQLiteStore(db_path, read_only=True) as store:
         rows = store.searchable_knowledge_blocks(
             dense_model_name=dense.model_name if dense else None,
             dense_model_version=dense.model_version if dense else None,

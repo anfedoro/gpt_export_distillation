@@ -18,7 +18,7 @@ from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider  # noqa: E402
 from kb.mcp.server import ServerConfig, handle_request  # noqa: E402
 from kb.retrieval.context_pack import ContextPackOptions, build_context_pack  # noqa: E402
-from kb.retrieval.hybrid_search import hybrid_query  # noqa: E402
+from kb.retrieval.hybrid_search import build_parser as build_search_parser, hybrid_query  # noqa: E402
 from kb.storage.sqlite_store import SQLiteStore, init_db  # noqa: E402
 
 
@@ -373,6 +373,21 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertIn("dense_score", top)
             self.assertIn("sparse_score", top)
             self.assertIn("preview", top)
+
+    def test_search_defaults_match_import_sparse_model(self) -> None:
+        parser = build_search_parser()
+
+        query_args = parser.parse_args(["query", "memory routing", "--db", "chat_memory.db"])
+        context_args = parser.parse_args(["context", "memory routing", "--db", "chat_memory.db"])
+
+        self.assertEqual(
+            query_args.sparse_model,
+            "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1",
+        )
+        self.assertEqual(
+            context_args.sparse_model,
+            "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1",
+        )
 
     def test_build_nodes_creates_deterministic_memberships(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
