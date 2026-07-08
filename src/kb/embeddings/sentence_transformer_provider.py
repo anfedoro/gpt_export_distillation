@@ -55,7 +55,10 @@ class SentenceTransformerDenseProvider(DenseEmbeddingProvider):
             torch_compile,
         )
         self._model = SentenceTransformer(model_name, device=device, backend=backend, model_kwargs=model_kwargs)
-        output_dim = self._model.get_sentence_embedding_dimension()
+        if hasattr(self._model, "get_embedding_dimension"):
+            output_dim = self._model.get_embedding_dimension()
+        else:
+            output_dim = self._model.get_sentence_embedding_dimension()
         if output_dim is not None:
             self.embedding_space_id = _dense_embedding_space_id(
                 model_name,
