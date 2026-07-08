@@ -113,6 +113,8 @@ CREATE TABLE IF NOT EXISTS dense_vectors (
     owner_id TEXT NOT NULL,
     model_name TEXT NOT NULL,
     model_version TEXT,
+    embedding_space_id TEXT,
+    runtime_metadata_json TEXT NOT NULL DEFAULT '{}',
     dim INTEGER NOT NULL,
     vector_json TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -126,6 +128,7 @@ CREATE TABLE IF NOT EXISTS sparse_terms (
     token_text TEXT NOT NULL,
     weight REAL NOT NULL,
     model_name TEXT NOT NULL,
+    embedding_space_id TEXT,
     PRIMARY KEY(owner_type, owner_id, token_id, model_name)
 );
 

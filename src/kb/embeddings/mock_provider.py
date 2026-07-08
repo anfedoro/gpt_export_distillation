@@ -13,21 +13,26 @@ TOKEN_RE = re.compile(r"[A-Za-z0-9А-Яа-яЁё_]{2,}")
 
 class MockDenseProvider(DenseEmbeddingProvider):
     model_name = "mock-dense"
-    model_version = "v1"
+    embedding_space_id = "mock-dense;dim=16;normalize=true;symmetric=true"
+    runtime_metadata: dict[str, object] = {"backend": "mock"}
 
     def __init__(self, dim: int = 16) -> None:
         self.dim = dim
 
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return [_mock_dense_vector(text, self.dim) for text in texts]
 
 
 class MockSparseProvider(SparseEmbeddingProvider):
     model_name = "mock-sparse"
-    model_version = "v1"
+    embedding_space_id = "mock-sparse;document=query;top_k=all"
+    runtime_metadata: dict[str, object] = {"backend": "mock"}
 
-    def embed_texts(self, texts: list[str]) -> list[dict[str, float]]:
+    def embed_documents(self, texts: list[str]) -> list[dict[str, float]]:
         return [_mock_sparse_terms(text) for text in texts]
+
+    def embed_query(self, query: str) -> dict[str, float]:
+        return _mock_sparse_terms(query)
 
 
 def _mock_dense_vector(text: str, dim: int) -> list[float]:

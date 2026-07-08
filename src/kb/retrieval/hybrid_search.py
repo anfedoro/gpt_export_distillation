@@ -27,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--sparse-model", default="opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1")
     query.add_argument("--sparse-top-k", type=int, default=128)
     query.add_argument("--include-low-interest", action="store_true")
+    query.add_argument("--diagnostics", action="store_true")
     query.add_argument("--json", action="store_true", dest="json_output")
 
     context = sub.add_parser("context", help="Build a traceable context pack.")
@@ -65,6 +66,7 @@ def main() -> None:
             sparse_model=args.sparse_model,
             sparse_top_k=args.sparse_top_k,
             include_low_interest=args.include_low_interest,
+            diagnostics=args.diagnostics,
         )
         if args.json_output:
             print(json.dumps(results, ensure_ascii=False, indent=2, sort_keys=True))
@@ -113,30 +115,55 @@ def hybrid_query(
     sparse_model: str = "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1",
     sparse_top_k: int = 128,
     include_low_interest: bool = False,
+    diagnostics: bool = False,
 ) -> dict[str, Any]:
     if limit <= 0:
         raise ValueError("--limit must be positive.")
-    dense = _build_dense_provider(dense_provider, dense_model)
-    sparse = _build_sparse_provider(sparse_provider, sparse_model, sparse_top_k)
+    dense = _build_dense_provider(dense_provider, dense_model) if dense_provider != "none" else None
+    sparse = _build_sparse_provider(sparse_provider, sparse_model, sparse_top_k) if sparse_provider != "none" else None
     if dense is None and sparse is None:
         raise ValueError("At least one retrieval provider must be enabled.")
 
-    query_dense = dense.embed_texts([query])[0] if dense else None
-    query_sparse = sparse.embed_texts([query])[0] if sparse else None
+    query_dense = dense.embed_query(query) if dense else None
+    query_sparse = sparse.embed_query(query) if sparse else None
 
     with SQLiteStore(db_path, read_only=True) as store:
         rows = store.searchable_knowledge_blocks(
             dense_model_name=dense.model_name if dense else None,
             dense_model_version=dense.model_version if dense else None,
             sparse_model_name=sparse.model_name if sparse else None,
+            sparse_embedding_space_id=sparse.embedding_space_id if sparse else None,
+            project=project,
+            include_low_interest=include_low_interest,
+        )
+        representation_counts = store.retrieval_representation_counts(
+            dense_model_name=dense.model_name if dense else None,
+            sparse_model_name=sparse.model_name if sparse else None,
             project=project,
             include_low_interest=include_low_interest,
         )
 
     scored = []
+    dense_scores: list[float] = []
+    sparse_scores: list[float] = []
+    dense_candidate_count = 0
+    sparse_candidate_count = 0
+    dense_dimension_mismatches = 0
     for row in rows:
-        dense_score = _cosine(query_dense, row["dense_vector"]) if query_dense is not None and row["dense_vector"] is not None else 0.0
-        sparse_score, overlapping_terms = _sparse_overlap(query_sparse, row["sparse_terms"]) if query_sparse is not None else (0.0, [])
+        dense_score = 0.0
+        if query_dense is not None and row["dense_vector"] is not None:
+            dense_candidate_count += 1
+            if len(query_dense) != len(row["dense_vector"]):
+                dense_dimension_mismatches += 1
+            else:
+                dense_score = _cosine(query_dense, row["dense_vector"])
+                dense_scores.append(dense_score)
+        sparse_score = 0.0
+        overlapping_terms: list[str] = []
+        if query_sparse is not None and row["sparse_terms"]:
+            sparse_candidate_count += 1
+            sparse_score, overlapping_terms = _sparse_overlap(query_sparse, row["sparse_terms"])
+            sparse_scores.append(sparse_score)
         final_score = alpha * dense_score + beta * sparse_score
         scored.append(
             {
@@ -163,9 +190,32 @@ def hybrid_query(
         "alpha": alpha,
         "beta": beta,
         "dense_model": dense.model_name if dense else None,
+        "dense_embedding_space_id": dense.embedding_space_id if dense else None,
         "sparse_model": sparse.model_name if sparse else None,
+        "sparse_embedding_space_id": sparse.embedding_space_id if sparse else None,
         "candidate_blocks": len(scored),
         "results": scored[:limit],
+        **(
+            {
+                "diagnostics": _diagnostics_payload(
+                    dense_enabled=dense is not None,
+                    sparse_enabled=sparse is not None,
+                    query_dense=query_dense,
+                    query_sparse=query_sparse,
+                    dense=dense,
+                    sparse=sparse,
+                    dense_candidate_count=dense_candidate_count,
+                    sparse_candidate_count=sparse_candidate_count,
+                    dense_dimension_mismatches=dense_dimension_mismatches,
+                    dense_model_row_count=representation_counts["dense_model_rows"],
+                    sparse_model_row_count=representation_counts["sparse_model_rows"],
+                    dense_scores=dense_scores,
+                    sparse_scores=sparse_scores,
+                )
+            }
+            if diagnostics
+            else {}
+        ),
     }
 
 
@@ -191,6 +241,71 @@ def _sparse_overlap(query_terms: dict[str, float] | None, doc_terms: dict[str, f
         score = score / (query_norm * doc_norm)
     ranked_terms = sorted(shared, key=lambda token: query_terms[token] * doc_terms[token], reverse=True)
     return score, ranked_terms
+
+
+def _diagnostics_payload(
+    *,
+    dense_enabled: bool,
+    sparse_enabled: bool,
+    query_dense: list[float] | None,
+    query_sparse: dict[str, float] | None,
+    dense,
+    sparse,
+    dense_candidate_count: int,
+    sparse_candidate_count: int,
+    dense_dimension_mismatches: int,
+    dense_model_row_count: int,
+    sparse_model_row_count: int,
+    dense_scores: list[float],
+    sparse_scores: list[float],
+) -> dict[str, Any]:
+    return {
+        "dense": {
+            "enabled": dense_enabled,
+            "query_embedding_created": query_dense is not None,
+            "embedding_space_id": dense.embedding_space_id if dense else None,
+            "query_dimension": len(query_dense) if query_dense is not None else 0,
+            "query_norm": _vector_norm(query_dense) if query_dense is not None else 0.0,
+            "candidate_blocks_with_vector": dense_candidate_count,
+            "dimension_mismatches": dense_dimension_mismatches,
+            "compatibility_mismatches": max(0, dense_model_row_count - dense_candidate_count),
+            "nonzero_score_count": sum(1 for score in dense_scores if abs(score) > 1e-12),
+            "min_score": min(dense_scores) if dense_scores else None,
+            "max_score": max(dense_scores) if dense_scores else None,
+            "status": _branch_status(dense_enabled, query_dense is not None, dense_candidate_count, dense_scores),
+        },
+        "sparse": {
+            "enabled": sparse_enabled,
+            "query_embedding_created": query_sparse is not None,
+            "embedding_space_id": sparse.embedding_space_id if sparse else None,
+            "model_name": sparse.model_name if sparse else None,
+            "query_term_count": len(query_sparse) if query_sparse is not None else 0,
+            "candidate_blocks_with_terms": sparse_candidate_count,
+            "compatibility_mismatches": max(0, sparse_model_row_count - sparse_candidate_count),
+            "nonzero_score_count": sum(1 for score in sparse_scores if abs(score) > 1e-12),
+            "min_score": min(sparse_scores) if sparse_scores else None,
+            "max_score": max(sparse_scores) if sparse_scores else None,
+            "status": _branch_status(sparse_enabled, query_sparse is not None, sparse_candidate_count, sparse_scores),
+        },
+    }
+
+
+def _branch_status(enabled: bool, query_created: bool, candidates: int, scores: list[float]) -> str:
+    if not enabled:
+        return "disabled"
+    if not query_created:
+        return "query_embedding_missing"
+    if candidates == 0:
+        return "no_compatible_document_representations"
+    if not any(abs(score) > 1e-12 for score in scores):
+        return "all_scores_zero"
+    return "active"
+
+
+def _vector_norm(vector: list[float] | None) -> float:
+    if not vector:
+        return 0.0
+    return math.sqrt(sum(value * value for value in vector))
 
 
 def _preview(text: str, limit: int = 320) -> str:
