@@ -42,10 +42,21 @@ def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
         conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.create_function("_legacy_dense_space_compatible", 2, _legacy_dense_space_compatible)
     if not read_only:
         # Keep long sparse-term ingestion runs from letting SQLite's page cache grow with the DB.
         conn.execute("PRAGMA cache_size = -32768")
     return conn
+
+
+def _legacy_dense_space_compatible(stored_version: str | None, requested_space_id: str | None) -> int:
+    if not stored_version or not requested_space_id:
+        return 0
+    if "sentence-transformers" not in stored_version:
+        return 0
+    if not requested_space_id.startswith("sentence-transformers-dense;"):
+        return 0
+    return 1
 
 
 def init_db(db_path: Path) -> None:
@@ -54,6 +65,7 @@ def init_db(db_path: Path) -> None:
     try:
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         _ensure_interest_tier_columns(conn)
+        _ensure_embedding_identity_columns(conn)
         conn.commit()
     finally:
         conn.close()
@@ -64,6 +76,14 @@ def _ensure_interest_tier_columns(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "knowledge_blocks", "interest_tier", "TEXT NOT NULL DEFAULT 'normal'")
     conn.execute("UPDATE source_documents SET interest_tier = 'low' WHERE folder_kind = 'common_trash'")
     conn.execute("UPDATE knowledge_blocks SET interest_tier = 'low' WHERE folder_kind = 'common_trash'")
+
+
+def _ensure_embedding_identity_columns(conn: sqlite3.Connection) -> None:
+    _add_column_if_missing(conn, "dense_vectors", "embedding_space_id", "TEXT")
+    _add_column_if_missing(conn, "dense_vectors", "runtime_metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+    _add_column_if_missing(conn, "sparse_terms", "embedding_space_id", "TEXT")
+    conn.execute("UPDATE dense_vectors SET embedding_space_id = model_version WHERE embedding_space_id IS NULL")
+    conn.execute("UPDATE sparse_terms SET embedding_space_id = model_name WHERE embedding_space_id IS NULL")
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -292,6 +312,9 @@ class SQLiteStore:
         )
         return list(self.conn.execute(query, params).fetchall())
 
+    def has_column(self, table: str, column: str) -> bool:
+        return column in {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
     def count_knowledge_blocks_for_embedding(
         self,
         *,
@@ -362,11 +385,14 @@ class SQLiteStore:
                     WHERE dv.owner_type = 'knowledge_block'
                       AND dv.owner_id = knowledge_blocks.id
                       AND dv.model_name = ?
-                      AND COALESCE(dv.model_version, '') = COALESCE(?, '')
+                      AND (
+                        COALESCE(dv.embedding_space_id, dv.model_version, '') = COALESCE(?, '')
+                        OR _legacy_dense_space_compatible(dv.model_version, ?) = 1
+                      )
                 )
                 """
             )
-            params.extend([dense_model_name, dense_model_version])
+            params.extend([dense_model_name, dense_model_version, dense_model_version])
         if not force and sparse_model_name is not None:
             pending.append(
                 """
@@ -404,15 +430,19 @@ class SQLiteStore:
         owner_id: str,
         model_name: str,
         model_version: str | None,
+        runtime_metadata_json: str = "{}",
         vector: list[float],
     ) -> str:
         vector_id = stable_id(owner_type, owner_id, model_name, model_version, "dense", prefix="vec")
         self.conn.execute(
             """
             INSERT INTO dense_vectors (
-                id, owner_type, owner_id, model_name, model_version, dim, vector_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                id, owner_type, owner_id, model_name, model_version, embedding_space_id,
+                runtime_metadata_json, dim, vector_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(owner_type, owner_id, model_name, model_version) DO UPDATE SET
+                embedding_space_id=excluded.embedding_space_id,
+                runtime_metadata_json=excluded.runtime_metadata_json,
                 dim=excluded.dim,
                 vector_json=excluded.vector_json
             """,
@@ -422,6 +452,8 @@ class SQLiteStore:
                 owner_id,
                 model_name,
                 model_version,
+                model_version,
+                runtime_metadata_json,
                 len(vector),
                 json.dumps(vector, separators=(",", ":")),
             ),
@@ -434,9 +466,11 @@ class SQLiteStore:
         owner_type: str,
         owner_id: str,
         model_name: str,
+        embedding_space_id: str | None = None,
         terms: dict[str, float],
     ) -> str:
-        sparse_id = stable_id(owner_type, owner_id, model_name, "sparse", prefix="sparse")
+        embedding_space_id = embedding_space_id or model_name
+        sparse_id = stable_id(owner_type, owner_id, embedding_space_id, "sparse", prefix="sparse")
         self.conn.execute(
             "DELETE FROM sparse_terms WHERE owner_type = ? AND owner_id = ? AND model_name = ?",
             (owner_type, owner_id, model_name),
@@ -444,8 +478,8 @@ class SQLiteStore:
         self.conn.executemany(
             """
             INSERT INTO sparse_terms (
-                owner_type, owner_id, token_id, token_text, weight, model_name
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                owner_type, owner_id, token_id, token_text, weight, model_name, embedding_space_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 (
@@ -455,6 +489,7 @@ class SQLiteStore:
                     token,
                     float(weight),
                     model_name,
+                    embedding_space_id,
                 )
                 for token, weight in terms.items()
             ),
@@ -484,35 +519,46 @@ class SQLiteStore:
         dense_model_name: str | None,
         dense_model_version: str | None,
         sparse_model_name: str | None,
+        sparse_embedding_space_id: str | None = None,
         project: str | None = None,
         include_low_interest: bool = False,
     ) -> list[dict[str, Any]]:
+        has_dense_space = self.has_column("dense_vectors", "embedding_space_id")
+        has_sparse_space = self.has_column("sparse_terms", "embedding_space_id")
+        dense_space_expr = "COALESCE(dv.embedding_space_id, dv.model_version, '')" if has_dense_space else "COALESCE(dv.model_version, '')"
+        dense_space_select = "COALESCE(dv.embedding_space_id, dv.model_version)" if has_dense_space else "dv.model_version"
+        sparse_space_select = "st.embedding_space_id" if has_sparse_space else "NULL AS embedding_space_id"
         params: list[Any] = []
         dense_join = ""
-        sparse_join = ""
         if dense_model_name is not None:
-            dense_join = """
+            dense_join = f"""
             LEFT JOIN dense_vectors dv
               ON dv.owner_type = 'knowledge_block'
              AND dv.owner_id = kb.id
              AND dv.model_name = ?
-             AND COALESCE(dv.model_version, '') = COALESCE(?, '')
+             AND (
+                {dense_space_expr} = COALESCE(?, '')
+                OR _legacy_dense_space_compatible(dv.model_version, ?) = 1
+             )
             """
-            params.extend([dense_model_name, dense_model_version])
-        if sparse_model_name is not None:
-            sparse_join = """
-            LEFT JOIN sparse_terms st
-              ON st.owner_type = 'knowledge_block'
-             AND st.owner_id = kb.id
-             AND st.model_name = ?
-            """
-            params.append(sparse_model_name)
+            params.extend([dense_model_name, dense_model_version, dense_model_version])
+        else:
+            dense_space_select = "NULL"
         where = []
         embedding_filters = []
         if dense_model_name is not None:
             embedding_filters.append("dv.id IS NOT NULL")
         if sparse_model_name is not None:
-            embedding_filters.append("st.owner_id IS NOT NULL")
+            sparse_exists = """
+                EXISTS (
+                    SELECT 1 FROM sparse_terms st_exists
+                    WHERE st_exists.owner_type = 'knowledge_block'
+                      AND st_exists.owner_id = kb.id
+                      AND st_exists.model_name = ?
+                )
+            """
+            embedding_filters.append(sparse_exists)
+            params.append(sparse_model_name)
         if embedding_filters:
             where.append("(" + " OR ".join(embedding_filters) + ")")
         if not include_low_interest:
@@ -534,42 +580,119 @@ class SQLiteStore:
                 kb.text_for_display,
                 sd.relative_path AS source_path,
                 c.title AS conversation_title,
-                dv.vector_json AS dense_vector_json,
-                st.token_text,
-                st.weight
+                {"dv.vector_json" if dense_model_name is not None else "NULL"} AS dense_vector_json,
+                {"dv.dim" if dense_model_name is not None else "NULL"} AS dense_dim,
+                {"dv.model_version" if dense_model_name is not None else "NULL"} AS dense_model_version,
+                {dense_space_select} AS dense_embedding_space_id,
+                NULL AS sparse_embedding_space_id
             FROM knowledge_blocks kb
             JOIN source_documents sd ON sd.id = kb.source_document_id
             LEFT JOIN conversations c ON c.id = kb.conversation_id
             {dense_join}
-            {sparse_join}
         """
         if where:
             query += " WHERE " + " AND ".join(where)
         query += " ORDER BY kb.id"
         grouped: dict[str, dict[str, Any]] = {}
-        for row in self.conn.execute(query, params).fetchall():
+        for row in self.conn.execute(query, params):
             block_id = str(row["knowledge_block_id"])
-            item = grouped.setdefault(
-                block_id,
-                {
-                    "knowledge_block_id": block_id,
-                    "project_id": row["project_id"],
-                    "folder_kind": row["folder_kind"],
-                    "interest_tier": row["interest_tier"],
-                    "conversation_id": row["conversation_id"],
-                    "message_id": row["message_id"],
-                    "role": row["role"],
-                    "block_type": row["block_type"],
-                    "text_for_display": row["text_for_display"],
-                    "source_path": row["source_path"],
-                    "conversation_title": row["conversation_title"],
-                    "dense_vector": json.loads(row["dense_vector_json"]) if row["dense_vector_json"] else None,
-                    "sparse_terms": {},
-                },
-            )
-            if row["token_text"] is not None:
+            grouped[block_id] = {
+                "knowledge_block_id": block_id,
+                "project_id": row["project_id"],
+                "folder_kind": row["folder_kind"],
+                "interest_tier": row["interest_tier"],
+                "conversation_id": row["conversation_id"],
+                "message_id": row["message_id"],
+                "role": row["role"],
+                "block_type": row["block_type"],
+                "text_for_display": row["text_for_display"],
+                "source_path": row["source_path"],
+                "conversation_title": row["conversation_title"],
+                "dense_vector": json.loads(row["dense_vector_json"]) if row["dense_vector_json"] else None,
+                "dense_dim": row["dense_dim"],
+                "dense_model_version": row["dense_model_version"],
+                "dense_embedding_space_id": row["dense_embedding_space_id"],
+                "sparse_embedding_space_id": None,
+                "sparse_terms": {},
+            }
+        if sparse_model_name is not None and grouped:
+            sparse_params: list[Any] = [sparse_model_name]
+            sparse_filter = ""
+            if has_sparse_space:
+                sparse_filter = """
+                  AND (
+                    ? IS NULL
+                    OR st.embedding_space_id IS NULL
+                    OR st.embedding_space_id = ?
+                    OR st.embedding_space_id = st.model_name
+                  )
+                """
+                sparse_params.extend([sparse_embedding_space_id, sparse_embedding_space_id])
+            sparse_query = f"""
+                SELECT st.owner_id, st.token_text, st.weight, {sparse_space_select}
+                FROM sparse_terms st
+                WHERE st.owner_type = 'knowledge_block'
+                  AND st.model_name = ?
+                  {sparse_filter}
+                ORDER BY st.owner_id
+            """
+            for row in self.conn.execute(sparse_query, sparse_params):
+                item = grouped.get(str(row["owner_id"]))
+                if item is None:
+                    continue
                 item["sparse_terms"][row["token_text"]] = float(row["weight"])
+                item["sparse_embedding_space_id"] = row["embedding_space_id"]
         return list(grouped.values())
+
+    def retrieval_representation_counts(
+        self,
+        *,
+        dense_model_name: str | None,
+        sparse_model_name: str | None,
+        project: str | None = None,
+        include_low_interest: bool = False,
+    ) -> dict[str, int]:
+        where = []
+        params: list[Any] = []
+        if not include_low_interest:
+            where.append("kb.interest_tier NOT IN ('low', 'quarantine')")
+        if project is not None:
+            where.append("kb.project_id = ?")
+            params.append(project)
+        where_sql = (" AND " + " AND ".join(where)) if where else ""
+        dense_count = 0
+        if dense_model_name is not None:
+            dense_count = int(
+                self.conn.execute(
+                    f"""
+                    SELECT COUNT(DISTINCT kb.id)
+                    FROM knowledge_blocks kb
+                    JOIN dense_vectors dv
+                      ON dv.owner_type = 'knowledge_block'
+                     AND dv.owner_id = kb.id
+                     AND dv.model_name = ?
+                    WHERE 1=1 {where_sql}
+                    """,
+                    [dense_model_name, *params],
+                ).fetchone()[0]
+            )
+        sparse_count = 0
+        if sparse_model_name is not None:
+            sparse_count = int(
+                self.conn.execute(
+                    f"""
+                    SELECT COUNT(DISTINCT kb.id)
+                    FROM knowledge_blocks kb
+                    JOIN sparse_terms st
+                      ON st.owner_type = 'knowledge_block'
+                     AND st.owner_id = kb.id
+                     AND st.model_name = ?
+                    WHERE 1=1 {where_sql}
+                    """,
+                    [sparse_model_name, *params],
+                ).fetchone()[0]
+            )
+        return {"dense_model_rows": dense_count, "sparse_model_rows": sparse_count}
 
     def knowledge_blocks_for_nodes(self) -> list[dict[str, Any]]:
         query = """

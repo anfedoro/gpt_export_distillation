@@ -35,8 +35,12 @@ class SentenceTransformerDenseProvider(DenseEmbeddingProvider):
             ) from exc
         model_kwargs = _model_kwargs(backend=backend, torch_dtype=torch_dtype)
         self.model_name = model_name
-        self.model_version = _model_version(
-            "sentence-transformers",
+        self.embedding_space_id = _dense_embedding_space_id(
+            model_name,
+            normalize_embeddings=True,
+            output_dim=None,
+        )
+        self.runtime_metadata = _runtime_metadata(
             backend=backend,
             device=device,
             torch_dtype=torch_dtype,
@@ -51,10 +55,17 @@ class SentenceTransformerDenseProvider(DenseEmbeddingProvider):
             torch_compile,
         )
         self._model = SentenceTransformer(model_name, device=device, backend=backend, model_kwargs=model_kwargs)
+        output_dim = self._model.get_sentence_embedding_dimension()
+        if output_dim is not None:
+            self.embedding_space_id = _dense_embedding_space_id(
+                model_name,
+                normalize_embeddings=True,
+                output_dim=int(output_dim),
+            )
         _compile_model(self._model, backend=backend, enabled=torch_compile)
         logger.info("loaded dense sentence-transformers model name=%s", model_name)
 
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
         logger.debug("dense encode start batch_size=%d", len(texts))
         with _inference_mode():
             vectors = self._model.encode(
@@ -64,7 +75,8 @@ class SentenceTransformerDenseProvider(DenseEmbeddingProvider):
                 show_progress_bar=False,
             )
         logger.debug("dense encode done batch_size=%d", len(texts))
-        return [vector.astype(float).tolist() for vector in vectors]
+        result = [vector.astype(float).tolist() for vector in vectors]
+        return result
 
 
 class SentenceTransformerSparseProvider(SparseEmbeddingProvider):
@@ -90,8 +102,13 @@ class SentenceTransformerSparseProvider(SparseEmbeddingProvider):
             ) from exc
         model_kwargs = _model_kwargs(backend=backend, torch_dtype=torch_dtype)
         self.model_name = model_name
-        self.model_version = _model_version(
-            "sentence-transformers-sparse",
+        self.embedding_space_id = _sparse_embedding_space_id(
+            model_name,
+            top_k=top_k,
+            document_encoder="encode_document",
+            query_encoder="encode_query",
+        )
+        self.runtime_metadata = _runtime_metadata(
             backend=backend,
             device=device,
             torch_dtype=torch_dtype,
@@ -111,7 +128,7 @@ class SentenceTransformerSparseProvider(SparseEmbeddingProvider):
         _compile_model(self._model, backend=backend, enabled=torch_compile)
         logger.info("loaded sparse sentence-transformers model name=%s", model_name)
 
-    def embed_texts(self, texts: list[str]) -> list[dict[str, float]]:
+    def embed_documents(self, texts: list[str]) -> list[dict[str, float]]:
         _log_memory("sparse encode_document start", batch_size=len(texts))
         with _inference_mode():
             embeddings = self._model.encode_document(
@@ -137,6 +154,23 @@ class SentenceTransformerSparseProvider(SparseEmbeddingProvider):
         _release_torch_memory()
         _log_memory("sparse tensors deleted", batch_size=len(texts))
         return terms_by_text
+
+    def embed_query(self, query: str) -> dict[str, float]:
+        logger.debug("sparse encode_query start")
+        with _inference_mode():
+            embeddings = self._model.encode_query(
+                [query],
+                batch_size=1,
+                show_progress_bar=False,
+                convert_to_tensor=True,
+                convert_to_sparse_tensor=False,
+            )
+            decoded = self._model.decode(embeddings, top_k=self.top_k)
+        terms = {token: float(weight) for token, weight in decoded[0]}
+        del embeddings, decoded
+        _release_torch_memory()
+        logger.debug("sparse encode_query done terms=%d", len(terms))
+        return terms
 
 
 def _inference_mode():
@@ -180,22 +214,55 @@ def _compile_model(model, *, backend: str, enabled: bool) -> None:
         raise RuntimeError("This sentence-transformers model does not expose torch compile support.") from exc
 
 
-def _model_version(
-    prefix: str,
+def _dense_embedding_space_id(
+    model_name: str,
+    *,
+    normalize_embeddings: bool,
+    output_dim: int | None,
+) -> str:
+    parts = [
+        "sentence-transformers-dense",
+        f"model={model_name}",
+        "pooling=model-default",
+        f"normalize={str(normalize_embeddings).lower()}",
+        "query_document=symmetric",
+    ]
+    if output_dim is not None:
+        parts.append(f"dim={output_dim}")
+    return ";".join(parts)
+
+
+def _sparse_embedding_space_id(
+    model_name: str,
+    *,
+    top_k: int,
+    document_encoder: str,
+    query_encoder: str,
+) -> str:
+    return ";".join(
+        [
+            "sentence-transformers-sparse",
+            f"model={model_name}",
+            f"document_encoder={document_encoder}",
+            f"query_encoder={query_encoder}",
+            f"top_k={top_k}",
+        ]
+    )
+
+
+def _runtime_metadata(
     *,
     backend: str,
     device: str | None,
     torch_dtype: str | None,
-    torch_compile: bool = False,
-) -> str:
-    parts = [prefix, f"backend={backend}"]
+    torch_compile: bool,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {"backend": backend, "torch_compile": torch_compile}
     if device:
-        parts.append(f"device={device}")
+        metadata["device"] = device
     if torch_dtype and torch_dtype != "auto":
-        parts.append(f"dtype={torch_dtype}")
-    if torch_compile:
-        parts.append("compile=true")
-    return ";".join(parts)
+        metadata["torch_dtype"] = torch_dtype
+    return metadata
 
 
 def _log_memory(event: str, **fields: object) -> None:

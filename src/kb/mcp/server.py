@@ -21,7 +21,7 @@ class ServerConfig:
     dense_provider: str = "sentence-transformers"
     sparse_provider: str = "sentence-transformers"
     dense_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    sparse_model: str = "naver/splade-cocondenser-ensembledistil"
+    sparse_model: str = "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1"
     sparse_top_k: int = 128
     max_block_chars: int = 4000
 
@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dense-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
     parser.add_argument("--sparse-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
     parser.add_argument("--dense-model", default="sentence-transformers/all-MiniLM-L6-v2")
-    parser.add_argument("--sparse-model", default="naver/splade-cocondenser-ensembledistil")
+    parser.add_argument("--sparse-model", default="opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1")
     parser.add_argument("--sparse-top-k", type=int, default=128)
     parser.add_argument("--max-block-chars", type=int, default=4000)
     return parser

@@ -37,8 +37,8 @@ def build_context_pack(
 ) -> dict[str, Any]:
     if options.retrieval_strategy not in {"auto", "basement", "semantic_groups"}:
         raise ValueError(f"Unsupported retrieval_strategy: {options.retrieval_strategy}")
-    query_dense = dense.embed_texts([query])[0] if dense else None
-    query_sparse = sparse.embed_texts([query])[0] if sparse else None
+    query_dense = dense.embed_query(query) if dense else None
+    query_sparse = sparse.embed_query(query) if sparse else None
 
     if ensure_schema:
         init_db(db_path)
@@ -52,6 +52,7 @@ def build_context_pack(
                 dense_model_name=dense.model_name if dense else None,
                 dense_model_version=dense.model_version if dense else None,
                 sparse_model_name=sparse.model_name if sparse else None,
+                sparse_embedding_space_id=sparse.embedding_space_id if sparse else None,
                 project=project,
                 include_low_interest=include_low_interest,
             ),

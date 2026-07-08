@@ -673,8 +673,8 @@ def _embed_knowledge_blocks_joint(
             processed_candidates += len(batch)
             after_id = str(batch[-1]["id"])
             texts = [str(row["text_for_embedding"]) for row in batch]
-            dense_results = dense.embed_texts(texts) if dense else [None] * len(batch)
-            sparse_results = sparse.embed_texts(texts) if sparse else [None] * len(batch)
+            dense_results = dense.embed_documents(texts) if dense else [None] * len(batch)
+            sparse_results = sparse.embed_documents(texts) if sparse else [None] * len(batch)
             batch_sparse_terms_count = sum(len(sparse_vector) for sparse_vector in sparse_results if sparse_vector)
             pending_insert_rows_count = 0
             for row, dense_vector, sparse_vector in zip(batch, dense_results, sparse_results, strict=True):
@@ -688,6 +688,7 @@ def _embed_knowledge_blocks_joint(
                             owner_id=owner_id,
                             model_name=dense.model_name,
                             model_version=dense.model_version,
+                            runtime_metadata_json=json.dumps(dense.runtime_metadata, sort_keys=True, separators=(",", ":")),
                             vector=dense_vector,
                         )
                         dense_vectors += 1
@@ -698,6 +699,7 @@ def _embed_knowledge_blocks_joint(
                             owner_type="knowledge_block",
                             owner_id=owner_id,
                             model_name=sparse.model_name,
+                            embedding_space_id=sparse.embedding_space_id,
                             terms=sparse_vector,
                         )
                         sparse_vectors += 1
@@ -736,8 +738,10 @@ def _embed_knowledge_blocks_joint(
     return {
         "dense_model": dense.model_name if dense else None,
         "dense_model_version": dense.model_version if dense else None,
+        "dense_embedding_space_id": dense.embedding_space_id if dense else None,
         "sparse_model": sparse.model_name if sparse else None,
         "sparse_model_version": sparse.model_version if sparse else None,
+        "sparse_embedding_space_id": sparse.embedding_space_id if sparse else None,
         "candidate_blocks": candidate_count,
         "blocks_embedded": max(dense_vectors, sparse_vectors),
         "dense_vectors": dense_vectors,
@@ -854,8 +858,10 @@ def _embed_knowledge_blocks_separate(
         "sparse_pass": sparse_stats,
         "dense_model": dense_stats["dense_model"],
         "dense_model_version": dense_stats["dense_model_version"],
+        "dense_embedding_space_id": dense_stats["dense_embedding_space_id"],
         "sparse_model": sparse_stats["sparse_model"],
         "sparse_model_version": sparse_stats["sparse_model_version"],
+        "sparse_embedding_space_id": sparse_stats["sparse_embedding_space_id"],
         "candidate_blocks": max(int(dense_stats["candidate_blocks"]), int(sparse_stats["candidate_blocks"])),
         "blocks_embedded": max(int(dense_stats["blocks_embedded"]), int(sparse_stats["blocks_embedded"])),
         "dense_vectors": int(dense_stats["dense_vectors"]),

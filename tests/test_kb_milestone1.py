@@ -5,6 +5,7 @@ import sys
 import tempfile
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,11 +13,11 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from kb.cli import build_edges_command, build_nodes_command, embed_knowledge_blocks, import_knowledge_base, ingest_attachments, ingest_chats  # noqa: E402
+from kb.cli import build_edges_command, build_nodes_command, build_parser as build_index_parser, embed_knowledge_blocks, import_knowledge_base, ingest_attachments, ingest_chats  # noqa: E402
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider  # noqa: E402
-from kb.mcp.server import ServerConfig, handle_request  # noqa: E402
+from kb.mcp.server import ServerConfig, build_parser as build_mcp_parser, handle_request  # noqa: E402
 from kb.retrieval.context_pack import ContextPackOptions, build_context_pack  # noqa: E402
 from kb.retrieval.hybrid_search import build_parser as build_search_parser, hybrid_query  # noqa: E402
 from kb.storage.sqlite_store import SQLiteStore, init_db  # noqa: E402
@@ -58,7 +59,150 @@ flowchart TD
 """
 
 
+class StaticDenseProvider:
+    model_name = "static-dense"
+    embedding_space_id = "static-dense;dim=2;normalize=false;symmetric=true"
+    runtime_metadata = {"backend": "test"}
+
+    @property
+    def model_version(self) -> str:
+        return self.embedding_space_id
+
+    def __init__(self) -> None:
+        self.document_calls = 0
+        self.query_calls = 0
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        self.document_calls += 1
+        return [_static_dense_vector(text) for text in texts]
+
+    def embed_query(self, query: str) -> list[float]:
+        self.query_calls += 1
+        return [1.0, 0.0]
+
+
+class RuntimeVariantDenseProvider(StaticDenseProvider):
+    runtime_metadata = {"backend": "test", "device": "cpu", "torch_dtype": "float32"}
+
+
+class IncompatibleDenseProvider(StaticDenseProvider):
+    embedding_space_id = "static-dense;dim=3;normalize=false;symmetric=true"
+
+    @property
+    def model_version(self) -> str:
+        return self.embedding_space_id
+
+    def embed_query(self, query: str) -> list[float]:
+        self.query_calls += 1
+        return [1.0, 0.0, 0.0]
+
+
+class StaticSparseProvider:
+    model_name = "static-sparse"
+    embedding_space_id = "static-sparse;document_encoder=documents;query_encoder=query;top_k=all"
+    runtime_metadata = {"backend": "test"}
+
+    @property
+    def model_version(self) -> str:
+        return self.embedding_space_id
+
+    def __init__(self) -> None:
+        self.document_calls = 0
+        self.query_calls = 0
+
+    def embed_documents(self, texts: list[str]) -> list[dict[str, float]]:
+        self.document_calls += 1
+        return [_static_sparse_terms(text) for text in texts]
+
+    def embed_query(self, query: str) -> dict[str, float]:
+        self.query_calls += 1
+        return {"sparse": 1.0}
+
+
+class SpySparseEncoder:
+    def __init__(self) -> None:
+        self.document_calls = 0
+        self.query_calls = 0
+
+    def encode_document(self, texts, **kwargs):
+        self.document_calls += 1
+        return [["document", text] for text in texts]
+
+    def encode_query(self, texts, **kwargs):
+        self.query_calls += 1
+        return [["query", text] for text in texts]
+
+    def decode(self, embeddings, *, top_k):
+        return [[(str(item[0]), 1.0)] for item in embeddings]
+
+
+def _static_dense_vector(text: str) -> list[float]:
+    if "dense-only" in text:
+        return [1.0, 0.0]
+    if "sparse-only" in text:
+        return [0.0, 1.0]
+    if "hybrid-both" in text:
+        return [0.8, 0.6]
+    return [0.0, 1.0]
+
+
+def _static_sparse_terms(text: str) -> dict[str, float]:
+    if "dense-only" in text:
+        return {"dense": 1.0}
+    if "sparse-only" in text:
+        return {"sparse": 1.0}
+    if "hybrid-both" in text:
+        return {"sparse": 0.8, "dense": 0.2}
+    return {"other": 1.0}
+
+
 class KBMilestone1Tests(unittest.TestCase):
+    def _static_retrieval_db(self, tmp: str) -> Path:
+        root = Path(tmp) / "export"
+        chat_dir = root / "Projects" / "Project_17"
+        chat_dir.mkdir(parents=True)
+        for idx, marker in enumerate(["dense-only", "sparse-only", "hybrid-both"], start=1):
+            chat = (
+                SAMPLE_CHAT.replace("conv-1", f"conv-static-{idx}")
+                .replace("msg-user-1", f"msg-static-user-{idx}")
+                .replace("msg-assistant-1", f"msg-static-assistant-{idx}")
+                .replace("Memory Routing", f"Static {idx}")
+                .replace("How should memory write routing work?", f"{marker} block")
+            )
+            (chat_dir / f"{marker}.md").write_text(chat, encoding="utf-8")
+        db = Path(tmp) / "chat_memory.db"
+        ingest_chats(root, db, limit=10)
+        dense = StaticDenseProvider()
+        sparse = StaticSparseProvider()
+        with SQLiteStore(db) as store:
+            rows = store.conn.execute(
+                "SELECT id, text_for_embedding FROM knowledge_blocks ORDER BY text_for_embedding"
+            ).fetchall()
+            for row in rows:
+                text = str(row["text_for_embedding"])
+                dense_vector_id = store.upsert_dense_vector(
+                    owner_type="knowledge_block",
+                    owner_id=str(row["id"]),
+                    model_name=dense.model_name,
+                    model_version=dense.model_version,
+                    runtime_metadata_json=json.dumps(dense.runtime_metadata, sort_keys=True),
+                    vector=dense.embed_documents([text])[0],
+                )
+                sparse_vector_id = store.replace_sparse_terms(
+                    owner_type="knowledge_block",
+                    owner_id=str(row["id"]),
+                    model_name=sparse.model_name,
+                    embedding_space_id=sparse.embedding_space_id,
+                    terms=sparse.embed_documents([text])[0],
+                )
+                store.set_knowledge_block_vector_ids(
+                    knowledge_block_id=str(row["id"]),
+                    dense_vector_id=dense_vector_id,
+                    sparse_vector_id=sparse_vector_id,
+                )
+            store.commit()
+        return db
+
     def test_scan_detects_export_tree_kinds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -376,9 +520,13 @@ class KBMilestone1Tests(unittest.TestCase):
 
     def test_search_defaults_match_import_sparse_model(self) -> None:
         parser = build_search_parser()
+        index_parser = build_index_parser()
+        mcp_parser = build_mcp_parser()
 
         query_args = parser.parse_args(["query", "memory routing", "--db", "chat_memory.db"])
         context_args = parser.parse_args(["context", "memory routing", "--db", "chat_memory.db"])
+        import_args = index_parser.parse_args(["import", "--input", "export", "--db", "chat_memory.db"])
+        mcp_args = mcp_parser.parse_args(["--db", "chat_memory.db"])
 
         self.assertEqual(
             query_args.sparse_model,
@@ -388,6 +536,182 @@ class KBMilestone1Tests(unittest.TestCase):
             context_args.sparse_model,
             "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1",
         )
+        self.assertEqual(query_args.sparse_model, import_args.sparse_model)
+        self.assertEqual(query_args.sparse_model, mcp_args.sparse_model)
+
+    def test_dense_runtime_metadata_mismatch_does_not_block_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+
+            provider = RuntimeVariantDenseProvider()
+            with patch("kb.retrieval.hybrid_search._build_dense_provider", return_value=provider):
+                payload = hybrid_query(
+                    db_path=db,
+                    query="memory routing",
+                    dense_provider="mock",
+                    sparse_provider="none",
+                    limit=3,
+                    diagnostics=True,
+                )
+
+            self.assertGreater(payload["candidate_blocks"], 0)
+            self.assertGreater(payload["diagnostics"]["dense"]["candidate_blocks_with_vector"], 0)
+            self.assertEqual(payload["diagnostics"]["dense"]["status"], "active")
+
+    def test_incompatible_dense_space_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+
+            provider = IncompatibleDenseProvider()
+            with patch("kb.retrieval.hybrid_search._build_dense_provider", return_value=provider):
+                payload = hybrid_query(
+                    db_path=db,
+                    query="memory routing",
+                    dense_provider="mock",
+                    sparse_provider="none",
+                    limit=3,
+                    diagnostics=True,
+                )
+
+            self.assertEqual(payload["diagnostics"]["dense"]["candidate_blocks_with_vector"], 0)
+            self.assertGreater(payload["diagnostics"]["dense"]["compatibility_mismatches"], 0)
+            self.assertEqual(payload["diagnostics"]["dense"]["status"], "no_compatible_document_representations")
+
+    def test_dense_only_retrieval_uses_dense_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+            dense = StaticDenseProvider()
+
+            with (
+                patch("kb.retrieval.hybrid_search._build_dense_provider", return_value=dense),
+                patch("kb.retrieval.hybrid_search._build_sparse_provider", side_effect=AssertionError("sparse should not be built")),
+            ):
+                payload = hybrid_query(
+                    db_path=db,
+                    query="memory routing",
+                    dense_provider="mock",
+                    sparse_provider="none",
+                    limit=5,
+                    diagnostics=True,
+                )
+
+            self.assertEqual(dense.query_calls, 1)
+            self.assertGreater(payload["diagnostics"]["dense"]["nonzero_score_count"], 0)
+            self.assertEqual(payload["diagnostics"]["sparse"]["status"], "disabled")
+            self.assertGreaterEqual(payload["results"][0]["dense_score"], payload["results"][-1]["dense_score"])
+            self.assertIn("dense-only", payload["results"][0]["preview"])
+
+    def test_sparse_only_retrieval_uses_sparse_query_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+            sparse = StaticSparseProvider()
+
+            with (
+                patch("kb.retrieval.hybrid_search._build_dense_provider", side_effect=AssertionError("dense should not be built")),
+                patch("kb.retrieval.hybrid_search._build_sparse_provider", return_value=sparse),
+            ):
+                payload = hybrid_query(
+                    db_path=db,
+                    query="memory routing",
+                    dense_provider="none",
+                    sparse_provider="mock",
+                    limit=5,
+                    diagnostics=True,
+                )
+
+            self.assertEqual(sparse.query_calls, 1)
+            self.assertGreater(payload["diagnostics"]["sparse"]["nonzero_score_count"], 0)
+            self.assertEqual(payload["diagnostics"]["dense"]["status"], "disabled")
+            self.assertGreaterEqual(payload["results"][0]["sparse_score"], payload["results"][-1]["sparse_score"])
+            self.assertIn("sparse-only", payload["results"][0]["preview"])
+
+    def test_hybrid_score_uses_dense_and_sparse_weights(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+            dense = StaticDenseProvider()
+            sparse = StaticSparseProvider()
+
+            with (
+                patch("kb.retrieval.hybrid_search._build_dense_provider", return_value=dense),
+                patch("kb.retrieval.hybrid_search._build_sparse_provider", return_value=sparse),
+            ):
+                payload = hybrid_query(
+                    db_path=db,
+                    query="memory routing",
+                    dense_provider="mock",
+                    sparse_provider="mock",
+                    limit=10,
+                    diagnostics=True,
+                )
+
+            for item in payload["results"]:
+                expected = 0.65 * item["dense_score"] + 0.35 * item["sparse_score"]
+                self.assertAlmostEqual(item["final_score"], expected)
+            self.assertEqual(payload["diagnostics"]["dense"]["status"], "active")
+            self.assertEqual(payload["diagnostics"]["sparse"]["status"], "active")
+
+    def test_query_and_context_direct_scores_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+            dense = StaticDenseProvider()
+            sparse = StaticSparseProvider()
+            with (
+                patch("kb.retrieval.hybrid_search._build_dense_provider", return_value=dense),
+                patch("kb.retrieval.hybrid_search._build_sparse_provider", return_value=sparse),
+            ):
+                query_payload = hybrid_query(
+                    db_path=db,
+                    query="memory routing",
+                    dense_provider="mock",
+                    sparse_provider="mock",
+                    limit=3,
+                )
+            context_payload = build_context_pack(
+                db_path=db,
+                query="memory routing",
+                dense=StaticDenseProvider(),
+                sparse=StaticSparseProvider(),
+                dense_provider="mock",
+                sparse_provider="mock",
+                dense_model="",
+                sparse_model="",
+                sparse_top_k=10,
+                options=ContextPackOptions(
+                    budget_tokens=1000,
+                    direct_limit=3,
+                    node_limit=0,
+                    node_member_limit=0,
+                    neighbor_limit=0,
+                ),
+            )
+
+            query_scores = {item["block_id"]: item["final_score"] for item in query_payload["results"]}
+            context_scores = {
+                trace["block_id"]: trace["score"]
+                for trace in context_payload["source_trace"]
+                if trace["path"] == "query -> block direct"
+            }
+            self.assertEqual(query_scores.keys(), context_scores.keys())
+            for block_id, score in query_scores.items():
+                self.assertAlmostEqual(score, context_scores[block_id])
+
+    def test_sentence_transformer_sparse_uses_document_and_query_methods(self) -> None:
+        from kb.embeddings.sentence_transformer_provider import SentenceTransformerSparseProvider
+
+        provider = object.__new__(SentenceTransformerSparseProvider)
+        provider.model_name = "spy-sparse"
+        provider.embedding_space_id = "spy-sparse-space"
+        provider.runtime_metadata = {"backend": "spy"}
+        provider.top_k = 10
+        provider._model = SpySparseEncoder()
+
+        document_terms = provider.embed_documents(["document text"])
+        query_terms = provider.embed_query("query text")
+
+        self.assertEqual(provider._model.document_calls, 1)
+        self.assertEqual(provider._model.query_calls, 1)
+        self.assertEqual(document_terms, [{"document": 1.0}])
+        self.assertEqual(query_terms, {"query": 1.0})
 
     def test_build_nodes_creates_deterministic_memberships(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
