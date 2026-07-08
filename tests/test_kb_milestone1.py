@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+from io import StringIO
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -19,7 +20,7 @@ from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider  # noqa: E402
 from kb.mcp.server import ServerConfig, build_parser as build_mcp_parser, handle_request  # noqa: E402
 from kb.retrieval.context_pack import ContextPackOptions, build_context_pack  # noqa: E402
-from kb.retrieval.hybrid_search import build_parser as build_search_parser, hybrid_query  # noqa: E402
+from kb.retrieval.hybrid_search import QUERY_RESULT_SCHEMA_VERSION, build_parser as build_search_parser, hybrid_query, main as kb_search_main  # noqa: E402
 from kb.storage.sqlite_store import SQLiteStore, init_db  # noqa: E402
 
 
@@ -517,6 +518,14 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertIn("dense_score", top)
             self.assertIn("sparse_score", top)
             self.assertIn("preview", top)
+            self.assertEqual(payload["schema_version"], QUERY_RESULT_SCHEMA_VERSION)
+            self.assertEqual(top["rank"], 1)
+            self.assertIn("latency_ms", payload)
+            self.assertIn("provider_load", payload["latency_ms"])
+            self.assertIn("query_encoding", payload["latency_ms"])
+            self.assertIn("db_candidate_load", payload["latency_ms"])
+            self.assertIn("scoring", payload["latency_ms"])
+            self.assertEqual(payload["run"]["retrieval_mode"], "query")
 
     def test_search_defaults_match_import_sparse_model(self) -> None:
         parser = build_search_parser()
@@ -647,8 +656,48 @@ class KBMilestone1Tests(unittest.TestCase):
             for item in payload["results"]:
                 expected = 0.65 * item["dense_score"] + 0.35 * item["sparse_score"]
                 self.assertAlmostEqual(item["final_score"], expected)
+                self.assertGreaterEqual(item["rank"], 1)
             self.assertEqual(payload["diagnostics"]["dense"]["status"], "active")
             self.assertEqual(payload["diagnostics"]["sparse"]["status"], "active")
+
+    def test_query_output_writes_full_json_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+            output = Path(tmp) / "retrieval-result.json"
+            dense = StaticDenseProvider()
+            sparse = StaticSparseProvider()
+            argv = [
+                "kb-search",
+                "query",
+                "memory routing",
+                "--db",
+                str(db),
+                "--dense-provider",
+                "mock",
+                "--sparse-provider",
+                "mock",
+                "--limit",
+                "3",
+                "--json",
+                "--diagnostics",
+                "--output",
+                str(output),
+            ]
+
+            with (
+                patch("kb.retrieval.hybrid_search._build_dense_provider", return_value=dense),
+                patch("kb.retrieval.hybrid_search._build_sparse_provider", return_value=sparse),
+                patch.object(sys, "argv", argv),
+                patch("sys.stdout", new_callable=StringIO),
+            ):
+                kb_search_main()
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema_version"], QUERY_RESULT_SCHEMA_VERSION)
+            self.assertEqual(len(payload["results"]), 3)
+            self.assertEqual([item["rank"] for item in payload["results"]], [1, 2, 3])
+            self.assertIn("latency_ms", payload)
+            self.assertIn("diagnostics", payload)
 
     def test_query_and_context_direct_scores_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

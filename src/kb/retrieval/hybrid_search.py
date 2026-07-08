@@ -3,11 +3,15 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import time
 from pathlib import Path
 from typing import Any
 
 from kb.cli import _build_dense_provider, _build_sparse_provider
 from kb.storage.sqlite_store import SQLiteStore
+
+
+QUERY_RESULT_SCHEMA_VERSION = "kb.query.result.v1"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--sparse-top-k", type=int, default=128)
     query.add_argument("--include-low-interest", action="store_true")
     query.add_argument("--diagnostics", action="store_true")
+    query.add_argument("--output", help="Write the full JSON retrieval result to this path.")
     query.add_argument("--json", action="store_true", dest="json_output")
 
     context = sub.add_parser("context", help="Build a traceable context pack.")
@@ -68,6 +73,10 @@ def main() -> None:
             include_low_interest=args.include_low_interest,
             diagnostics=args.diagnostics,
         )
+        if args.output:
+            output_path = Path(args.output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(json.dumps(results, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
         if args.json_output:
             print(json.dumps(results, ensure_ascii=False, indent=2, sort_keys=True))
         else:
@@ -117,16 +126,22 @@ def hybrid_query(
     include_low_interest: bool = False,
     diagnostics: bool = False,
 ) -> dict[str, Any]:
+    started = time.perf_counter()
     if limit <= 0:
         raise ValueError("--limit must be positive.")
+    provider_started = time.perf_counter()
     dense = _build_dense_provider(dense_provider, dense_model) if dense_provider != "none" else None
     sparse = _build_sparse_provider(sparse_provider, sparse_model, sparse_top_k) if sparse_provider != "none" else None
     if dense is None and sparse is None:
         raise ValueError("At least one retrieval provider must be enabled.")
+    providers_loaded = time.perf_counter()
 
+    query_encoding_started = time.perf_counter()
     query_dense = dense.embed_query(query) if dense else None
     query_sparse = sparse.embed_query(query) if sparse else None
+    query_encoded = time.perf_counter()
 
+    db_started = time.perf_counter()
     with SQLiteStore(db_path, read_only=True) as store:
         rows = store.searchable_knowledge_blocks(
             dense_model_name=dense.model_name if dense else None,
@@ -136,13 +151,16 @@ def hybrid_query(
             project=project,
             include_low_interest=include_low_interest,
         )
+        candidates_loaded = time.perf_counter()
         representation_counts = store.retrieval_representation_counts(
             dense_model_name=dense.model_name if dense else None,
             sparse_model_name=sparse.model_name if sparse else None,
             project=project,
             include_low_interest=include_low_interest,
         )
+    db_finished = time.perf_counter()
 
+    scoring_started = time.perf_counter()
     scored = []
     dense_scores: list[float] = []
     sparse_scores: list[float] = []
@@ -185,7 +203,24 @@ def hybrid_query(
             }
         )
     scored.sort(key=lambda item: item["final_score"], reverse=True)
+    for rank, item in enumerate(scored, start=1):
+        item["rank"] = rank
+    scoring_finished = time.perf_counter()
+    selected = scored[:limit]
+    finished = time.perf_counter()
     return {
+        "schema_version": QUERY_RESULT_SCHEMA_VERSION,
+        "run": {
+            "retrieval_mode": "query",
+            "db_path": str(db_path),
+            "limit": limit,
+            "project": project,
+            "include_low_interest": include_low_interest,
+            "dense_provider": dense_provider,
+            "sparse_provider": sparse_provider,
+            "sparse_top_k": sparse_top_k,
+            "diagnostics_requested": diagnostics,
+        },
         "query": query,
         "alpha": alpha,
         "beta": beta,
@@ -194,7 +229,16 @@ def hybrid_query(
         "sparse_model": sparse.model_name if sparse else None,
         "sparse_embedding_space_id": sparse.embedding_space_id if sparse else None,
         "candidate_blocks": len(scored),
-        "results": scored[:limit],
+        "latency_ms": {
+            "total": _elapsed_ms(started, finished),
+            "provider_load": _elapsed_ms(provider_started, providers_loaded),
+            "query_encoding": _elapsed_ms(query_encoding_started, query_encoded),
+            "db_candidate_load": _elapsed_ms(db_started, candidates_loaded),
+            "db_representation_counts": _elapsed_ms(candidates_loaded, db_finished),
+            "scoring": _elapsed_ms(scoring_started, scoring_finished),
+            "result_packaging": _elapsed_ms(scoring_finished, finished),
+        },
+        "results": selected,
         **(
             {
                 "diagnostics": _diagnostics_payload(
@@ -308,6 +352,10 @@ def _vector_norm(vector: list[float] | None) -> float:
     return math.sqrt(sum(value * value for value in vector))
 
 
+def _elapsed_ms(start: float, end: float) -> float:
+    return (end - start) * 1000.0
+
+
 def _preview(text: str, limit: int = 320) -> str:
     compact = " ".join(text.split())
     return compact if len(compact) <= limit else compact[: limit - 1] + "…"
@@ -319,7 +367,7 @@ def _print_results(payload: dict[str, Any]) -> None:
     for idx, item in enumerate(payload["results"], start=1):
         print()
         print(
-            f"{idx}. score={item['final_score']:.4f} dense={item['dense_score']:.4f} "
+            f"{item.get('rank', idx)}. score={item['final_score']:.4f} dense={item['dense_score']:.4f} "
             f"sparse={item['sparse_score']:.4f}"
         )
         print(f"   source={item['source_path']}")
