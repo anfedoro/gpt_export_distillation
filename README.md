@@ -144,6 +144,8 @@ gpt-export-distillation \
 
 The experimental knowledge-base layer works on the Markdown archive produced by this tool. It stores all state in one local SQLite file and keeps source references back to project folders, Markdown files, conversations, messages, and attachments.
 
+For the detailed database-build and retrieval call flows, see [Knowledge Base Workflow Architecture](docs/kb-workflow-architecture.md).
+
 Build a query-ready DB in one command:
 
 ```bash
