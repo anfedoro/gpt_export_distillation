@@ -55,6 +55,8 @@ class SentenceTransformerDenseProvider(DenseEmbeddingProvider):
             torch_compile,
         )
         self._model = SentenceTransformer(model_name, device=device, backend=backend, model_kwargs=model_kwargs)
+        self.effective_max_sequence_length = int(getattr(self._model, "max_seq_length", 256) or 256)
+        self._tokenizer = getattr(self._model, "tokenizer", None)
         if hasattr(self._model, "get_embedding_dimension"):
             output_dim = self._model.get_embedding_dimension()
         else:
@@ -64,6 +66,7 @@ class SentenceTransformerDenseProvider(DenseEmbeddingProvider):
                 model_name,
                 normalize_embeddings=True,
                 output_dim=int(output_dim),
+                max_seq_length=self.effective_max_sequence_length,
             )
         _compile_model(self._model, backend=backend, enabled=torch_compile)
         logger.info("loaded dense sentence-transformers model name=%s", model_name)
@@ -80,6 +83,12 @@ class SentenceTransformerDenseProvider(DenseEmbeddingProvider):
         logger.debug("dense encode done batch_size=%d", len(texts))
         result = [vector.astype(float).tolist() for vector in vectors]
         return result
+
+    def token_count(self, text: str) -> int:
+        if self._tokenizer is None:
+            raise RuntimeError(f"Dense provider {self.model_name} does not expose a tokenizer.")
+        encoded = self._tokenizer(text, add_special_tokens=True, truncation=False)
+        return len(encoded["input_ids"])
 
 
 class SentenceTransformerSparseProvider(SparseEmbeddingProvider):
@@ -128,6 +137,15 @@ class SentenceTransformerSparseProvider(SparseEmbeddingProvider):
             top_k,
         )
         self._model = SparseEncoder(model_name, device=device, backend=backend, model_kwargs=model_kwargs)
+        self.effective_max_sequence_length = int(getattr(self._model, "max_seq_length", 256) or 256)
+        self._tokenizer = getattr(self._model, "tokenizer", None)
+        self.embedding_space_id = _sparse_embedding_space_id(
+            model_name,
+            top_k=top_k,
+            document_encoder="encode_document",
+            query_encoder="encode_query",
+            max_seq_length=self.effective_max_sequence_length,
+        )
         _compile_model(self._model, backend=backend, enabled=torch_compile)
         logger.info("loaded sparse sentence-transformers model name=%s", model_name)
 
@@ -174,6 +192,12 @@ class SentenceTransformerSparseProvider(SparseEmbeddingProvider):
         _release_torch_memory()
         logger.debug("sparse encode_query done terms=%d", len(terms))
         return terms
+
+    def token_count(self, text: str) -> int:
+        if self._tokenizer is None:
+            raise RuntimeError(f"Sparse provider {self.model_name} does not expose a tokenizer.")
+        encoded = self._tokenizer(text, add_special_tokens=True, truncation=False)
+        return len(encoded["input_ids"])
 
 
 def _inference_mode():
@@ -222,6 +246,7 @@ def _dense_embedding_space_id(
     *,
     normalize_embeddings: bool,
     output_dim: int | None,
+    max_seq_length: int | None = None,
 ) -> str:
     parts = [
         "sentence-transformers-dense",
@@ -232,6 +257,8 @@ def _dense_embedding_space_id(
     ]
     if output_dim is not None:
         parts.append(f"dim={output_dim}")
+    if max_seq_length is not None:
+        parts.append(f"max_seq={max_seq_length}")
     return ";".join(parts)
 
 
@@ -241,16 +268,18 @@ def _sparse_embedding_space_id(
     top_k: int,
     document_encoder: str,
     query_encoder: str,
+    max_seq_length: int | None = None,
 ) -> str:
-    return ";".join(
-        [
+    parts = [
             "sentence-transformers-sparse",
             f"model={model_name}",
             f"document_encoder={document_encoder}",
             f"query_encoder={query_encoder}",
             f"top_k={top_k}",
-        ]
-    )
+    ]
+    if max_seq_length is not None:
+        parts.append(f"max_seq={max_seq_length}")
+    return ";".join(parts)
 
 
 def _runtime_metadata(

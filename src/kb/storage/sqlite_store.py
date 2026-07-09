@@ -8,6 +8,7 @@ from typing import Any
 
 from kb.ingest.tree_walker import InventoryItem
 from kb.ingest.attachment_parser import ParsedAttachment
+from kb.index.chunk_builder import ChunkPolicy, RetrievalChunk, audit_chunks, build_retrieval_chunks
 from kb.model.entities import Block, Conversation, Message, ParsedChat
 from kb.model.ids import stable_id
 
@@ -66,6 +67,7 @@ def init_db(db_path: Path) -> None:
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         _ensure_interest_tier_columns(conn)
         _ensure_embedding_identity_columns(conn)
+        _ensure_chunk_columns(conn)
         conn.commit()
     finally:
         conn.close()
@@ -84,6 +86,10 @@ def _ensure_embedding_identity_columns(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "sparse_terms", "embedding_space_id", "TEXT")
     conn.execute("UPDATE dense_vectors SET embedding_space_id = model_version WHERE embedding_space_id IS NULL")
     conn.execute("UPDATE sparse_terms SET embedding_space_id = model_name WHERE embedding_space_id IS NULL")
+
+
+def _ensure_chunk_columns(conn: sqlite3.Connection) -> None:
+    _add_column_if_missing(conn, "blocks", "parent_block_id", "TEXT REFERENCES blocks(id) ON DELETE CASCADE")
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -278,6 +284,7 @@ class SQLiteStore:
             "conversations",
             "messages",
             "blocks",
+            "retrieval_chunks",
             "knowledge_blocks",
             "attachment_documents",
             "dense_vectors",
@@ -291,6 +298,173 @@ class SQLiteStore:
             self.conn.execute("SELECT COUNT(*) FROM source_documents WHERE source_kind = 'attachment'").fetchone()[0]
         )
         return result
+
+    def rebuild_retrieval_chunks(
+        self,
+        *,
+        policy: ChunkPolicy,
+        tokenizer_provider: Any,
+        skip_low_interest_content: bool = True,
+    ) -> dict[str, Any]:
+        block_rows = self._indexable_block_rows(skip_low_interest_content=skip_low_interest_content)
+        chunks: list[RetrievalChunk] = []
+        for block in block_rows:
+            chunks.extend(
+                build_retrieval_chunks(
+                    block_id=str(block["id"]),
+                    block_text=str(block["raw_text"]),
+                    block_char_start=int(block["char_start"]),
+                    policy=policy,
+                    tokenizer_provider=tokenizer_provider,
+                )
+            )
+        self.conn.execute("DELETE FROM retrieval_chunks WHERE chunk_policy_id = ?", (policy.id,))
+        self.conn.executemany(
+            """
+            INSERT INTO retrieval_chunks (
+                id, block_id, ordinal, source_char_start, source_char_end,
+                token_count, text, chunk_policy_id, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}')
+            """,
+            (
+                (
+                    chunk.id,
+                    chunk.block_id,
+                    chunk.ordinal,
+                    chunk.source_char_start,
+                    chunk.source_char_end,
+                    chunk.token_count,
+                    chunk.text,
+                    chunk.chunk_policy_id,
+                )
+                for chunk in chunks
+            ),
+        )
+        return audit_chunks([dict(row) for row in block_rows], chunks, policy)
+
+    def _indexable_block_rows(self, *, skip_low_interest_content: bool) -> list[sqlite3.Row]:
+        where = ["b.raw_text <> ''"]
+        if skip_low_interest_content:
+            where.append("sd.interest_tier NOT IN ('low', 'quarantine')")
+        return list(
+            self.conn.execute(
+                f"""
+                SELECT b.id, b.raw_text, b.char_start, b.char_end
+                FROM blocks b
+                JOIN messages m ON m.id = b.message_id
+                JOIN conversations c ON c.id = m.conversation_id
+                JOIN source_documents sd ON sd.id = c.source_document_id
+                WHERE {" AND ".join(where)}
+                ORDER BY b.id
+                """
+            ).fetchall()
+        )
+
+    def count_retrieval_chunks_for_embedding(
+        self,
+        *,
+        chunk_policy_id: str,
+        limit: int | None = None,
+        dense_model_name: str | None = None,
+        dense_model_version: str | None = None,
+        sparse_model_name: str | None = None,
+        sparse_embedding_space_id: str | None = None,
+        force: bool = False,
+    ) -> int:
+        query, params = self._retrieval_chunks_for_embedding_query(
+            chunk_policy_id=chunk_policy_id,
+            limit=limit,
+            dense_model_name=dense_model_name,
+            dense_model_version=dense_model_version,
+            sparse_model_name=sparse_model_name,
+            sparse_embedding_space_id=sparse_embedding_space_id,
+            force=force,
+            count_only=True,
+        )
+        return int(self.conn.execute(query, params).fetchone()[0])
+
+    def retrieval_chunks_for_embedding_batch(
+        self,
+        *,
+        chunk_policy_id: str,
+        after_id: str | None,
+        batch_size: int,
+        dense_model_name: str | None = None,
+        dense_model_version: str | None = None,
+        sparse_model_name: str | None = None,
+        sparse_embedding_space_id: str | None = None,
+        force: bool = False,
+    ) -> list[sqlite3.Row]:
+        query, params = self._retrieval_chunks_for_embedding_query(
+            chunk_policy_id=chunk_policy_id,
+            limit=batch_size,
+            dense_model_name=dense_model_name,
+            dense_model_version=dense_model_version,
+            sparse_model_name=sparse_model_name,
+            sparse_embedding_space_id=sparse_embedding_space_id,
+            force=force,
+            after_id=after_id,
+        )
+        return list(self.conn.execute(query, params).fetchall())
+
+    def _retrieval_chunks_for_embedding_query(
+        self,
+        *,
+        chunk_policy_id: str,
+        limit: int | None,
+        dense_model_name: str | None,
+        dense_model_version: str | None,
+        sparse_model_name: str | None,
+        sparse_embedding_space_id: str | None,
+        force: bool,
+        after_id: str | None = None,
+        count_only: bool = False,
+    ) -> tuple[str, list[Any]]:
+        where = ["rc.chunk_policy_id = ?"]
+        params: list[Any] = [chunk_policy_id]
+        pending: list[str] = []
+        if not force and dense_model_name is not None:
+            pending.append(
+                """
+                NOT EXISTS (
+                    SELECT 1 FROM dense_vectors dv
+                    WHERE dv.owner_type = 'retrieval_chunk'
+                      AND dv.owner_id = rc.id
+                      AND dv.model_name = ?
+                      AND COALESCE(dv.embedding_space_id, dv.model_version, '') = COALESCE(?, '')
+                )
+                """
+            )
+            params.extend([dense_model_name, dense_model_version])
+        if not force and sparse_model_name is not None:
+            pending.append(
+                """
+                NOT EXISTS (
+                    SELECT 1 FROM sparse_terms st
+                    WHERE st.owner_type = 'retrieval_chunk'
+                      AND st.owner_id = rc.id
+                      AND st.model_name = ?
+                      AND COALESCE(st.embedding_space_id, st.model_name, '') = COALESCE(?, '')
+                )
+                """
+            )
+            params.extend([sparse_model_name, sparse_embedding_space_id or sparse_model_name])
+        if pending:
+            where.append("(" + " OR ".join(f"({clause})" for clause in pending) + ")")
+        if after_id is not None:
+            where.append("rc.id > ?")
+            params.append(after_id)
+        select = "SELECT COUNT(*) AS cnt" if count_only else "SELECT rc.id, rc.block_id, rc.text, rc.token_count"
+        query = f"{select} FROM retrieval_chunks rc WHERE " + " AND ".join(where)
+        if not count_only:
+            query += " ORDER BY rc.id"
+            if limit is not None:
+                query += " LIMIT ?"
+                params.append(limit)
+        elif limit is not None:
+            query = f"SELECT MIN(cnt, ?) FROM ({query})"
+            params = [limit, *params]
+        return query, params
 
     def knowledge_blocks_for_embedding(
         self,
@@ -644,6 +818,145 @@ class SQLiteStore:
                 item["sparse_embedding_space_id"] = row["embedding_space_id"]
         return list(grouped.values())
 
+    def searchable_retrieval_chunks(
+        self,
+        *,
+        chunk_policy_id: str,
+        dense_model_name: str | None,
+        dense_model_version: str | None,
+        sparse_model_name: str | None,
+        sparse_embedding_space_id: str | None = None,
+        project: str | None = None,
+        include_low_interest: bool = False,
+    ) -> list[dict[str, Any]]:
+        join_params: list[Any] = []
+        where_params: list[Any] = [chunk_policy_id]
+        dense_join = ""
+        dense_space_select = "NULL"
+        if dense_model_name is not None:
+            dense_join = """
+            LEFT JOIN dense_vectors dv
+              ON dv.owner_type = 'retrieval_chunk'
+             AND dv.owner_id = rc.id
+             AND dv.model_name = ?
+             AND COALESCE(dv.embedding_space_id, dv.model_version, '') = COALESCE(?, '')
+            """
+            join_params.extend([dense_model_name, dense_model_version])
+            dense_space_select = "COALESCE(dv.embedding_space_id, dv.model_version)"
+
+        where = ["rc.chunk_policy_id = ?"]
+        embedding_filters = []
+        if dense_model_name is not None:
+            embedding_filters.append("dv.id IS NOT NULL")
+        if sparse_model_name is not None:
+            embedding_filters.append(
+                """
+                EXISTS (
+                    SELECT 1 FROM sparse_terms st_exists
+                    WHERE st_exists.owner_type = 'retrieval_chunk'
+                      AND st_exists.owner_id = rc.id
+                      AND st_exists.model_name = ?
+                      AND COALESCE(st_exists.embedding_space_id, st_exists.model_name, '') = COALESCE(?, '')
+                )
+                """
+            )
+            where_params.extend([sparse_model_name, sparse_embedding_space_id or sparse_model_name])
+        if embedding_filters:
+            where.append("(" + " OR ".join(embedding_filters) + ")")
+        if not include_low_interest:
+            where.append("sd.interest_tier NOT IN ('low', 'quarantine')")
+        if project is not None:
+            where.append("c.project_id = ?")
+            where_params.append(project)
+
+        query = f"""
+            SELECT
+                rc.id AS chunk_id,
+                rc.block_id,
+                rc.ordinal AS chunk_ordinal,
+                rc.source_char_start,
+                rc.source_char_end,
+                rc.token_count,
+                rc.text AS chunk_text,
+                b.block_type,
+                b.language,
+                b.char_start AS block_char_start,
+                b.char_end AS block_char_end,
+                m.id AS message_id,
+                m.role,
+                m.message_id AS source_message_id,
+                c.id AS conversation_id,
+                c.conversation_id AS source_conversation_id,
+                c.title AS conversation_title,
+                c.project_id,
+                c.folder_kind,
+                sd.interest_tier,
+                sd.relative_path AS source_path,
+                {"dv.vector_json" if dense_model_name is not None else "NULL"} AS dense_vector_json,
+                {"dv.dim" if dense_model_name is not None else "NULL"} AS dense_dim,
+                {"dv.model_version" if dense_model_name is not None else "NULL"} AS dense_model_version,
+                {dense_space_select} AS dense_embedding_space_id
+            FROM retrieval_chunks rc
+            JOIN blocks b ON b.id = rc.block_id
+            JOIN messages m ON m.id = b.message_id
+            JOIN conversations c ON c.id = m.conversation_id
+            JOIN source_documents sd ON sd.id = c.source_document_id
+            {dense_join}
+            WHERE {" AND ".join(where)}
+            ORDER BY rc.id
+        """
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in self.conn.execute(query, [*join_params, *where_params]):
+            chunk_id = str(row["chunk_id"])
+            grouped[chunk_id] = {
+                "chunk_id": chunk_id,
+                "knowledge_block_id": chunk_id,
+                "block_id": row["block_id"],
+                "project_id": row["project_id"],
+                "folder_kind": row["folder_kind"],
+                "interest_tier": row["interest_tier"],
+                "conversation_id": row["conversation_id"],
+                "source_conversation_id": row["source_conversation_id"],
+                "message_id": row["message_id"],
+                "source_message_id": row["source_message_id"],
+                "role": row["role"],
+                "block_type": row["block_type"],
+                "language": row["language"],
+                "source_char_start": row["source_char_start"],
+                "source_char_end": row["source_char_end"],
+                "token_count": row["token_count"],
+                "text_for_display": row["chunk_text"],
+                "source_path": row["source_path"],
+                "conversation_title": row["conversation_title"],
+                "dense_vector": json.loads(row["dense_vector_json"]) if row["dense_vector_json"] else None,
+                "dense_dim": row["dense_dim"],
+                "dense_model_version": row["dense_model_version"],
+                "dense_embedding_space_id": row["dense_embedding_space_id"],
+                "sparse_embedding_space_id": None,
+                "sparse_terms": {},
+            }
+        if sparse_model_name is not None and grouped:
+            sparse_query = """
+                SELECT st.owner_id, st.token_text, st.weight, st.embedding_space_id
+                FROM sparse_terms st
+                WHERE st.owner_type = 'retrieval_chunk'
+                  AND st.model_name = ?
+                  AND COALESCE(st.embedding_space_id, st.model_name, '') = COALESCE(?, '')
+                ORDER BY st.owner_id
+            """
+            for row in self.conn.execute(sparse_query, [sparse_model_name, sparse_embedding_space_id or sparse_model_name]):
+                item = grouped.get(str(row["owner_id"]))
+                if item is None:
+                    continue
+                item["sparse_terms"][row["token_text"]] = float(row["weight"])
+                item["sparse_embedding_space_id"] = row["embedding_space_id"]
+        return list(grouped.values())
+
+    def legacy_block_level_embedding_count(self) -> int:
+        dense = self.conn.execute("SELECT COUNT(*) FROM dense_vectors WHERE owner_type = 'knowledge_block'").fetchone()[0]
+        sparse = self.conn.execute("SELECT COUNT(*) FROM sparse_terms WHERE owner_type = 'knowledge_block'").fetchone()[0]
+        return int(dense) + int(sparse)
+
     def retrieval_representation_counts(
         self,
         *,
@@ -655,9 +968,9 @@ class SQLiteStore:
         where = []
         params: list[Any] = []
         if not include_low_interest:
-            where.append("kb.interest_tier NOT IN ('low', 'quarantine')")
+            where.append("sd.interest_tier NOT IN ('low', 'quarantine')")
         if project is not None:
-            where.append("kb.project_id = ?")
+            where.append("c.project_id = ?")
             params.append(project)
         where_sql = (" AND " + " AND ".join(where)) if where else ""
         dense_count = 0
@@ -665,11 +978,15 @@ class SQLiteStore:
             dense_count = int(
                 self.conn.execute(
                     f"""
-                    SELECT COUNT(DISTINCT kb.id)
-                    FROM knowledge_blocks kb
+                    SELECT COUNT(DISTINCT rc.id)
+                    FROM retrieval_chunks rc
+                    JOIN blocks b ON b.id = rc.block_id
+                    JOIN messages m ON m.id = b.message_id
+                    JOIN conversations c ON c.id = m.conversation_id
+                    JOIN source_documents sd ON sd.id = c.source_document_id
                     JOIN dense_vectors dv
-                      ON dv.owner_type = 'knowledge_block'
-                     AND dv.owner_id = kb.id
+                      ON dv.owner_type = 'retrieval_chunk'
+                     AND dv.owner_id = rc.id
                      AND dv.model_name = ?
                     WHERE 1=1 {where_sql}
                     """,
@@ -681,11 +998,15 @@ class SQLiteStore:
             sparse_count = int(
                 self.conn.execute(
                     f"""
-                    SELECT COUNT(DISTINCT kb.id)
-                    FROM knowledge_blocks kb
+                    SELECT COUNT(DISTINCT rc.id)
+                    FROM retrieval_chunks rc
+                    JOIN blocks b ON b.id = rc.block_id
+                    JOIN messages m ON m.id = b.message_id
+                    JOIN conversations c ON c.id = m.conversation_id
+                    JOIN source_documents sd ON sd.id = c.source_document_id
                     JOIN sparse_terms st
-                      ON st.owner_type = 'knowledge_block'
-                     AND st.owner_id = kb.id
+                      ON st.owner_type = 'retrieval_chunk'
+                     AND st.owner_id = rc.id
                      AND st.model_name = ?
                     WHERE 1=1 {where_sql}
                     """,

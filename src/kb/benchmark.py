@@ -16,7 +16,8 @@ from typing import Any
 
 import numpy as np
 
-from kb.cli import _build_dense_provider, _build_sparse_provider
+from kb.cli import _build_dense_provider, _build_sparse_provider, _chunked_embedding_space_id
+from kb.index.chunk_builder import build_chunk_policy
 from kb.retrieval.hybrid_search import _preview, _sparse_overlap
 from kb.storage.sqlite_store import SQLiteStore
 
@@ -138,6 +139,7 @@ class RankingConfig:
 
 @dataclass(frozen=True)
 class CorpusBlock:
+    chunk_id: str
     block_id: str
     source_path: str
     project: str | None
@@ -183,6 +185,13 @@ class DirectRetrievalSession:
         self.sparse_provider = sparse_provider
         self.project = project
         self.include_low_interest = include_low_interest
+        self.policy = build_chunk_policy([item for item in (dense_provider, sparse_provider) if item is not None])
+        self.dense_embedding_space_id = (
+            _chunked_embedding_space_id(dense_provider.embedding_space_id, self.policy.id) if dense_provider else None
+        )
+        self.sparse_embedding_space_id = (
+            _chunked_embedding_space_id(sparse_provider.embedding_space_id, self.policy.id) if sparse_provider else None
+        )
         self.blocks: list[CorpusBlock] = []
         self.block_index: dict[str, int] = {}
         self.dense_matrix: np.ndarray | None = None
@@ -200,11 +209,12 @@ class DirectRetrievalSession:
     def load_corpus(self) -> None:
         started = time.perf_counter()
         with SQLiteStore(self.db_path, read_only=True) as store:
-            rows = store.searchable_knowledge_blocks(
+            rows = store.searchable_retrieval_chunks(
+                chunk_policy_id=self.policy.id,
                 dense_model_name=self.dense_provider.model_name if self.dense_provider else None,
-                dense_model_version=self.dense_provider.model_version if self.dense_provider else None,
+                dense_model_version=self.dense_embedding_space_id if self.dense_provider else None,
                 sparse_model_name=self.sparse_provider.model_name if self.sparse_provider else None,
-                sparse_embedding_space_id=self.sparse_provider.embedding_space_id if self.sparse_provider else None,
+                sparse_embedding_space_id=self.sparse_embedding_space_id if self.sparse_provider else None,
                 project=self.project,
                 include_low_interest=self.include_low_interest,
             )
@@ -226,7 +236,8 @@ class DirectRetrievalSession:
                     )
             dense_vectors.append(vector)
             block = CorpusBlock(
-                block_id=row["knowledge_block_id"],
+                chunk_id=row["chunk_id"],
+                block_id=row["block_id"],
                 source_path=row["source_path"],
                 project=row["project_id"],
                 folder_kind=row["folder_kind"],
@@ -243,7 +254,7 @@ class DirectRetrievalSession:
             blocks.append(block)
 
         self.blocks = blocks
-        self.block_index = {block.block_id: idx for idx, block in enumerate(blocks)}
+        self.block_index = {block.chunk_id: idx for idx, block in enumerate(blocks)}
         self.dense_compatible_count = sum(1 for vector in dense_vectors if vector is not None)
         self.sparse_compatible_count = sum(1 for block in blocks if block.sparse_terms)
 
@@ -311,8 +322,8 @@ class DirectRetrievalSession:
     def rank(self, scores: QueryScores, config: RankingConfig, *, top_k: int) -> tuple[list[dict[str, Any]], dict[str, int], float]:
         started = time.perf_counter()
         final_scores = config.alpha * scores.dense_scores + config.beta * scores.sparse_scores
-        ordered = sorted(range(len(self.blocks)), key=lambda idx: (-float(final_scores[idx]), self.blocks[idx].block_id))
-        ranks = {self.blocks[idx].block_id: rank for rank, idx in enumerate(ordered, start=1)}
+        ordered = sorted(range(len(self.blocks)), key=lambda idx: (-float(final_scores[idx]), self.blocks[idx].chunk_id))
+        ranks = {self.blocks[idx].chunk_id: rank for rank, idx in enumerate(ordered, start=1)}
         results = [
             self._result_item(
                 idx,
@@ -339,6 +350,7 @@ class DirectRetrievalSession:
         block = self.blocks[idx]
         return {
             "rank": rank,
+            "chunk_id": block.chunk_id,
             "block_id": block.block_id,
             "source_path": block.source_path,
             "conversation_id": block.conversation_id,
@@ -567,10 +579,11 @@ def run_direct_retrieval_benchmark(
         manifest["database"]["candidate_blocks"] = session.candidate_blocks
         manifest["providers"] = {
             "dense_model": dense.model_name if dense else None,
-            "dense_embedding_space_id": dense.embedding_space_id if dense else None,
+            "dense_embedding_space_id": session.dense_embedding_space_id if dense else None,
             "sparse_model": sparse.model_name if sparse else None,
-            "sparse_embedding_space_id": sparse.embedding_space_id if sparse else None,
+            "sparse_embedding_space_id": session.sparse_embedding_space_id if sparse else None,
             "sparse_top_k": sparse_top_k,
+            "chunk_policy_id": session.policy.id,
         }
         manifest["timing_ms"]["provider_load"] = _elapsed_ms(provider_started, providers_loaded)
         manifest["timing_ms"]["corpus_load"] = session.corpus_load_ms
@@ -1682,13 +1695,16 @@ def _validate_expected_blocks(db_path: Path, records: list[dict[str, Any]]) -> l
         rows = conn.execute(
             f"""
             SELECT
-                kb.id AS block_id,
+                rc.id AS block_id,
                 sd.relative_path AS source_path,
-                kb.conversation_id,
-                kb.message_id
-            FROM knowledge_blocks kb
-            JOIN source_documents sd ON sd.id = kb.source_document_id
-            WHERE kb.id IN ({placeholders})
+                c.id AS conversation_id,
+                m.id AS message_id
+            FROM retrieval_chunks rc
+            JOIN blocks b ON b.id = rc.block_id
+            JOIN messages m ON m.id = b.message_id
+            JOIN conversations c ON c.id = m.conversation_id
+            JOIN source_documents sd ON sd.id = c.source_document_id
+            WHERE rc.id IN ({placeholders})
             """,
             block_ids,
         ).fetchall()

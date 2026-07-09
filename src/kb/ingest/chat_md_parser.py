@@ -228,10 +228,10 @@ def _parse_blocks(message: Message) -> list[Block]:
 
     blocks: list[Block] = []
     for ordinal, (block_type, language, start, end) in enumerate(spans, start=1):
-        raw = text[start:end].strip("\n")
+        raw, adjusted_start, adjusted_end = _trim_newlines_with_offsets(text, start, end)
         blocks.append(
             Block(
-                id=stable_id(message.id, ordinal, start, end, prefix="block"),
+                id=stable_id(message.id, ordinal, adjusted_start, adjusted_end, prefix="block"),
                 message_id=message.id,
                 conversation_id=message.conversation_id,
                 ordinal=ordinal,
@@ -239,12 +239,21 @@ def _parse_blocks(message: Message) -> list[Block]:
                 language=language,
                 raw_text=raw,
                 normalized_text=_normalize_block(raw, block_type),
-                char_start=start,
-                char_end=end,
+                char_start=adjusted_start,
+                char_end=adjusted_end,
                 metadata_json={},
             )
         )
     return blocks
+
+
+def _trim_newlines_with_offsets(text: str, start: int, end: int) -> tuple[str, int, int]:
+    raw = text[start:end]
+    leading = len(raw) - len(raw.lstrip("\n"))
+    trailing_len = len(raw.rstrip("\n"))
+    adjusted_start = start + leading
+    adjusted_end = start + trailing_len
+    return text[adjusted_start:adjusted_end], adjusted_start, adjusted_end
 
 
 def _classify_non_code(raw: str) -> str:

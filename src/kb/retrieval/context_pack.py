@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from kb.retrieval.hybrid_search import _cosine, _sparse_overlap
+from kb.cli import _chunked_embedding_space_id
+from kb.index.chunk_builder import build_chunk_policy
 from kb.storage.sqlite_store import SQLiteStore, init_db
 
 
@@ -39,6 +41,10 @@ def build_context_pack(
         raise ValueError(f"Unsupported retrieval_strategy: {options.retrieval_strategy}")
     query_dense = dense.embed_query(query) if dense else None
     query_sparse = sparse.embed_query(query) if sparse else None
+    active_providers = [item for item in (dense, sparse) if item is not None]
+    policy = build_chunk_policy(active_providers)
+    dense_space_id = _chunked_embedding_space_id(dense.embedding_space_id, policy.id) if dense else None
+    sparse_space_id = _chunked_embedding_space_id(sparse.embedding_space_id, policy.id) if sparse else None
 
     if ensure_schema:
         init_db(db_path)
@@ -48,11 +54,12 @@ def build_context_pack(
         capabilities = store.capabilities()
         strategy_used = _resolve_strategy(options.retrieval_strategy, capabilities)
         direct_hits = _score_blocks(
-            store.searchable_knowledge_blocks(
+            store.searchable_retrieval_chunks(
+                chunk_policy_id=policy.id,
                 dense_model_name=dense.model_name if dense else None,
-                dense_model_version=dense.model_version if dense else None,
+                dense_model_version=dense_space_id if dense else None,
                 sparse_model_name=sparse.model_name if sparse else None,
-                sparse_embedding_space_id=sparse.embedding_space_id if sparse else None,
+                sparse_embedding_space_id=sparse_space_id if sparse else None,
                 project=project,
                 include_low_interest=include_low_interest,
             ),
@@ -60,7 +67,22 @@ def build_context_pack(
             query_sparse=query_sparse,
             limit=options.direct_limit,
         )
-        block_rows = store.blocks_by_ids([item["knowledge_block_id"] for item in direct_hits])
+        block_rows = {
+            item["knowledge_block_id"]: {
+                "knowledge_block_id": item["knowledge_block_id"],
+                "source_path": item["source_path"],
+                "project_id": item["project_id"],
+                "conversation_id": item["conversation_id"],
+                "conversation_title": item["conversation_title"],
+                "message_id": item["message_id"],
+                "role": item["role"],
+                "block_type": item["block_type"],
+                "interest_tier": item["interest_tier"],
+                "token_count_estimate": item.get("token_count") or item.get("chunk_token_count") or 1,
+                "text_for_display": item["text_for_display"],
+            }
+            for item in direct_hits
+        }
         for item in direct_hits:
             block = block_rows.get(item["knowledge_block_id"])
             if block:
