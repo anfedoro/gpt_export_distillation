@@ -69,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_cmd.add_argument("--dense-torch-compile", action="store_true")
     import_cmd.add_argument("--sparse-torch-compile", action="store_true")
     import_cmd.add_argument("--dense-effective-max-seq-length", type=int)
+    import_cmd.add_argument("--chunk-policy", choices=["canonical_token_chunks:v2"], default="canonical_token_chunks:v2")
     import_cmd.add_argument("--chunk-content-budget", type=int)
     import_cmd.add_argument("--sparse-top-k", type=int, default=128)
     import_cmd.add_argument("--batch-size", type=int, default=32)
@@ -113,6 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     embed.add_argument("--dense-torch-compile", action="store_true")
     embed.add_argument("--sparse-torch-compile", action="store_true")
     embed.add_argument("--dense-effective-max-seq-length", type=int)
+    embed.add_argument("--chunk-policy", choices=["canonical_token_chunks:v2"], default="canonical_token_chunks:v2")
     embed.add_argument("--chunk-content-budget", type=int)
     embed.add_argument("--sparse-top-k", type=int, default=128)
     embed.add_argument("--limit", type=int)
@@ -203,6 +205,7 @@ def main() -> None:
             dense_torch_compile=args.dense_torch_compile,
             sparse_torch_compile=args.sparse_torch_compile,
             dense_effective_max_seq_length=args.dense_effective_max_seq_length,
+            chunk_policy_version=_chunk_policy_version(args.chunk_policy),
             chunk_content_budget=args.chunk_content_budget,
             sparse_top_k=args.sparse_top_k,
             batch_size=args.batch_size,
@@ -254,6 +257,7 @@ def main() -> None:
             sparse_torch_dtype=args.sparse_torch_dtype,
             dense_torch_compile=args.dense_torch_compile,
             sparse_torch_compile=args.sparse_torch_compile,
+            chunk_policy_version=_chunk_policy_version(args.chunk_policy),
             sparse_top_k=args.sparse_top_k,
             limit=args.limit,
             batch_size=args.batch_size,
@@ -440,6 +444,7 @@ def import_knowledge_base(
     dense_torch_compile: bool = False,
     sparse_torch_compile: bool = False,
     dense_effective_max_seq_length: int | None = None,
+    chunk_policy_version: str = "v2",
     chunk_content_budget: int | None = None,
     sparse_top_k: int = 128,
     batch_size: int = 32,
@@ -482,6 +487,7 @@ def import_knowledge_base(
             dense_torch_compile=dense_torch_compile,
             sparse_torch_compile=sparse_torch_compile,
             dense_effective_max_seq_length=dense_effective_max_seq_length,
+            chunk_policy_version=chunk_policy_version,
             chunk_content_budget=chunk_content_budget,
             sparse_top_k=sparse_top_k,
             batch_size=batch_size,
@@ -531,6 +537,7 @@ def embed_knowledge_blocks(
     dense_torch_compile: bool = False,
     sparse_torch_compile: bool = False,
     dense_effective_max_seq_length: int | None = None,
+    chunk_policy_version: str = "v2",
     chunk_content_budget: int | None = None,
     sparse_top_k: int = 128,
     limit: int | None = None,
@@ -585,6 +592,7 @@ def embed_knowledge_blocks(
         dense_torch_compile=dense_torch_compile,
         sparse_torch_compile=sparse_torch_compile,
         dense_effective_max_seq_length=dense_effective_max_seq_length,
+        chunk_policy_version=chunk_policy_version,
         chunk_content_budget=chunk_content_budget,
         sparse_top_k=sparse_top_k,
         limit=limit,
@@ -613,6 +621,7 @@ def _embed_knowledge_blocks_joint(
     dense_torch_compile: bool = False,
     sparse_torch_compile: bool = False,
     dense_effective_max_seq_length: int | None = None,
+    chunk_policy_version: str = "v2",
     chunk_content_budget: int | None = None,
     sparse_top_k: int = 128,
     limit: int | None = None,
@@ -658,7 +667,11 @@ def _embed_knowledge_blocks_joint(
     sparse_nnz_total = 0
     with SQLiteStore(db_path) as store:
         active_providers = [item for item in (dense, sparse) if item is not None]
-        policy = chunk_policy or build_chunk_policy(active_providers, content_budget_override=chunk_content_budget)
+        policy = chunk_policy or build_chunk_policy(
+            active_providers,
+            version=chunk_policy_version,
+            content_budget_override=chunk_content_budget,
+        )
         tokenizer_provider = min(active_providers, key=lambda item: int(item.effective_max_sequence_length or 0))
         audit = store.rebuild_retrieval_chunks(
             policy=policy,
@@ -819,6 +832,7 @@ def _embed_knowledge_blocks_separate(
     dense_torch_compile: bool,
     sparse_torch_compile: bool,
     dense_effective_max_seq_length: int | None = None,
+    chunk_policy_version: str = "v2",
     chunk_content_budget: int | None = None,
     sparse_top_k: int,
     limit: int | None,
@@ -846,6 +860,7 @@ def _embed_knowledge_blocks_separate(
             dense_torch_compile=dense_torch_compile,
             sparse_torch_compile=sparse_torch_compile,
             dense_effective_max_seq_length=dense_effective_max_seq_length,
+            chunk_policy_version=chunk_policy_version,
             chunk_content_budget=chunk_content_budget,
             sparse_top_k=sparse_top_k,
             limit=limit,
@@ -872,6 +887,7 @@ def _embed_knowledge_blocks_separate(
         dense_torch_compile=dense_torch_compile,
         sparse_torch_compile=sparse_torch_compile,
         dense_effective_max_seq_length=dense_effective_max_seq_length,
+        chunk_policy_version=chunk_policy_version,
         chunk_content_budget=chunk_content_budget,
         sparse_top_k=sparse_top_k,
         limit=limit,
@@ -900,6 +916,7 @@ def _embed_knowledge_blocks_separate(
         dense_torch_compile=dense_torch_compile,
         sparse_torch_compile=sparse_torch_compile,
         dense_effective_max_seq_length=dense_effective_max_seq_length,
+        chunk_policy_version=chunk_policy_version,
         chunk_content_budget=chunk_content_budget,
         sparse_top_k=sparse_top_k,
         limit=limit,
@@ -956,6 +973,13 @@ def _chunk_policy_from_audit(audit: object) -> ChunkPolicy | None:
         safety_reserve=int(safety_reserve),
         version=str(version),
     )
+
+
+def _chunk_policy_version(policy: str) -> str:
+    """Convert the public policy identifier into the internal version token."""
+    if policy != "canonical_token_chunks:v2":
+        raise ValueError(f"Unsupported chunk policy: {policy}")
+    return "v2"
 
 
 def _build_dense_provider(
