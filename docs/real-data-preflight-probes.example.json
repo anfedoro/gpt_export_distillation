@@ -1,0 +1,14 @@
+{
+  "schema_version": "kb.real_data_preflight.probes.v1",
+  "probes": [
+    {
+      "probe_id": "example-tail",
+      "query": "A local private query goes here",
+      "query_language": "en",
+      "expected_conversation_id": "source-conversation-id",
+      "expected_message_id": "source-message-id",
+      "probe_type": "long-message-tail",
+      "notes": "Private local fixture; do not commit corpus text."
+    }
+  ]
+}
