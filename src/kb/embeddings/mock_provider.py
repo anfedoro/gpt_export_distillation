@@ -5,7 +5,7 @@ import math
 import re
 from collections import Counter
 
-from kb.embeddings.base import DenseEmbeddingProvider, SparseEmbeddingProvider
+from kb.embeddings.base import DenseEmbeddingProvider, EmbeddingProviderContract, SparseEmbeddingProvider
 
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9А-Яа-яЁё_]{2,}")
@@ -21,6 +21,21 @@ class MockDenseProvider(DenseEmbeddingProvider):
         self.dim = dim
         self.effective_max_sequence_length = max_sequence_length
         self.embedding_space_id = f"mock-dense;dim={dim};normalize=true;symmetric=true;max_seq={max_sequence_length}"
+        self.provider_contract = EmbeddingProviderContract(
+            model_name=self.model_name,
+            model_revision=None,
+            embedding_dimension=dim,
+            tokenizer_name="mock-tokenizer",
+            tokenizer_model_max_length=max_sequence_length,
+            backbone_max_position_embeddings=max_sequence_length,
+            sentence_transformer_max_seq_length=max_sequence_length,
+            configured_effective_max_seq_length=max_sequence_length,
+            document_prefix="",
+            query_prefix="",
+            special_token_overhead=0,
+            configured_safety_reserve=4,
+            computed_content_budget=max_sequence_length - 4,
+        )
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return [_mock_dense_vector(text, self.dim) for text in texts]
@@ -38,6 +53,21 @@ class MockSparseProvider(SparseEmbeddingProvider):
     def __init__(self, max_sequence_length: int = 64) -> None:
         self.effective_max_sequence_length = max_sequence_length
         self.embedding_space_id = f"mock-sparse;document=query;top_k=all;max_seq={max_sequence_length}"
+        self.provider_contract = EmbeddingProviderContract(
+            model_name=self.model_name,
+            model_revision=None,
+            embedding_dimension=None,
+            tokenizer_name="mock-tokenizer",
+            tokenizer_model_max_length=max_sequence_length,
+            backbone_max_position_embeddings=max_sequence_length,
+            sentence_transformer_max_seq_length=max_sequence_length,
+            configured_effective_max_seq_length=max_sequence_length,
+            document_prefix="",
+            query_prefix="",
+            special_token_overhead=0,
+            configured_safety_reserve=4,
+            computed_content_budget=max_sequence_length - 4,
+        )
 
     def embed_documents(self, texts: list[str]) -> list[dict[str, float]]:
         return [_mock_sparse_terms(text) for text in texts]

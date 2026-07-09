@@ -17,7 +17,7 @@ from kb.embeddings.sentence_transformer_provider import (
     SentenceTransformerDenseProvider,
     SentenceTransformerSparseProvider,
 )
-from kb.index.chunk_builder import build_chunk_policy
+from kb.index.chunk_builder import ChunkPolicy, build_chunk_policy
 from kb.index.edge_builder import build_similarity_edges
 from kb.index.semantic_node_builder import build_deterministic_nodes
 from kb.ingest.attachment_parser import parse_attachment
@@ -68,6 +68,8 @@ def build_parser() -> argparse.ArgumentParser:
     import_cmd.add_argument("--sparse-torch-dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
     import_cmd.add_argument("--dense-torch-compile", action="store_true")
     import_cmd.add_argument("--sparse-torch-compile", action="store_true")
+    import_cmd.add_argument("--dense-effective-max-seq-length", type=int)
+    import_cmd.add_argument("--chunk-content-budget", type=int)
     import_cmd.add_argument("--sparse-top-k", type=int, default=128)
     import_cmd.add_argument("--batch-size", type=int, default=32)
     import_cmd.add_argument("--embedding-pass-mode", choices=["joint", "separate"], default="separate")
@@ -110,6 +112,8 @@ def build_parser() -> argparse.ArgumentParser:
     embed.add_argument("--sparse-torch-dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
     embed.add_argument("--dense-torch-compile", action="store_true")
     embed.add_argument("--sparse-torch-compile", action="store_true")
+    embed.add_argument("--dense-effective-max-seq-length", type=int)
+    embed.add_argument("--chunk-content-budget", type=int)
     embed.add_argument("--sparse-top-k", type=int, default=128)
     embed.add_argument("--limit", type=int)
     embed.add_argument("--batch-size", type=int, default=32)
@@ -198,6 +202,8 @@ def main() -> None:
             sparse_torch_dtype=args.sparse_torch_dtype,
             dense_torch_compile=args.dense_torch_compile,
             sparse_torch_compile=args.sparse_torch_compile,
+            dense_effective_max_seq_length=args.dense_effective_max_seq_length,
+            chunk_content_budget=args.chunk_content_budget,
             sparse_top_k=args.sparse_top_k,
             batch_size=args.batch_size,
             embedding_pass_mode=args.embedding_pass_mode,
@@ -433,6 +439,8 @@ def import_knowledge_base(
     sparse_torch_dtype: str = "auto",
     dense_torch_compile: bool = False,
     sparse_torch_compile: bool = False,
+    dense_effective_max_seq_length: int | None = None,
+    chunk_content_budget: int | None = None,
     sparse_top_k: int = 128,
     batch_size: int = 32,
     embedding_pass_mode: str = "separate",
@@ -473,6 +481,8 @@ def import_knowledge_base(
             sparse_torch_dtype=sparse_torch_dtype,
             dense_torch_compile=dense_torch_compile,
             sparse_torch_compile=sparse_torch_compile,
+            dense_effective_max_seq_length=dense_effective_max_seq_length,
+            chunk_content_budget=chunk_content_budget,
             sparse_top_k=sparse_top_k,
             batch_size=batch_size,
             embedding_pass_mode=embedding_pass_mode,
@@ -520,6 +530,8 @@ def embed_knowledge_blocks(
     sparse_torch_dtype: str = "auto",
     dense_torch_compile: bool = False,
     sparse_torch_compile: bool = False,
+    dense_effective_max_seq_length: int | None = None,
+    chunk_content_budget: int | None = None,
     sparse_top_k: int = 128,
     limit: int | None = None,
     batch_size: int = 32,
@@ -545,6 +557,8 @@ def embed_knowledge_blocks(
             sparse_torch_dtype=sparse_torch_dtype,
             dense_torch_compile=dense_torch_compile,
             sparse_torch_compile=sparse_torch_compile,
+            dense_effective_max_seq_length=dense_effective_max_seq_length,
+            chunk_content_budget=chunk_content_budget,
             sparse_top_k=sparse_top_k,
             limit=limit,
             batch_size=batch_size,
@@ -570,6 +584,8 @@ def embed_knowledge_blocks(
         sparse_torch_dtype=sparse_torch_dtype,
         dense_torch_compile=dense_torch_compile,
         sparse_torch_compile=sparse_torch_compile,
+        dense_effective_max_seq_length=dense_effective_max_seq_length,
+        chunk_content_budget=chunk_content_budget,
         sparse_top_k=sparse_top_k,
         limit=limit,
         batch_size=batch_size,
@@ -596,6 +612,8 @@ def _embed_knowledge_blocks_joint(
     sparse_torch_dtype: str = "auto",
     dense_torch_compile: bool = False,
     sparse_torch_compile: bool = False,
+    dense_effective_max_seq_length: int | None = None,
+    chunk_content_budget: int | None = None,
     sparse_top_k: int = 128,
     limit: int | None = None,
     batch_size: int = 32,
@@ -603,6 +621,7 @@ def _embed_knowledge_blocks_joint(
     force: bool = False,
     skip_low_interest_content: bool = True,
     progress: bool = False,
+    chunk_policy: ChunkPolicy | None = None,
 ) -> dict[str, int | float | str | None]:
     dense_name = dense_provider or provider
     dense = _build_dense_provider(
@@ -612,6 +631,7 @@ def _embed_knowledge_blocks_joint(
         backend=dense_backend,
         torch_dtype=dense_torch_dtype,
         torch_compile=dense_torch_compile,
+        effective_max_seq_length=dense_effective_max_seq_length,
     )
     sparse = _build_sparse_provider(
         sparse_provider,
@@ -638,7 +658,7 @@ def _embed_knowledge_blocks_joint(
     sparse_nnz_total = 0
     with SQLiteStore(db_path) as store:
         active_providers = [item for item in (dense, sparse) if item is not None]
-        policy = build_chunk_policy(active_providers)
+        policy = chunk_policy or build_chunk_policy(active_providers, content_budget_override=chunk_content_budget)
         tokenizer_provider = min(active_providers, key=lambda item: int(item.effective_max_sequence_length or 0))
         audit = store.rebuild_retrieval_chunks(
             policy=policy,
@@ -798,6 +818,8 @@ def _embed_knowledge_blocks_separate(
     sparse_torch_dtype: str,
     dense_torch_compile: bool,
     sparse_torch_compile: bool,
+    dense_effective_max_seq_length: int | None = None,
+    chunk_content_budget: int | None = None,
     sparse_top_k: int,
     limit: int | None,
     batch_size: int,
@@ -823,6 +845,8 @@ def _embed_knowledge_blocks_separate(
             sparse_torch_dtype=sparse_torch_dtype,
             dense_torch_compile=dense_torch_compile,
             sparse_torch_compile=sparse_torch_compile,
+            dense_effective_max_seq_length=dense_effective_max_seq_length,
+            chunk_content_budget=chunk_content_budget,
             sparse_top_k=sparse_top_k,
             limit=limit,
             batch_size=batch_size,
@@ -847,6 +871,8 @@ def _embed_knowledge_blocks_separate(
         sparse_torch_dtype=sparse_torch_dtype,
         dense_torch_compile=dense_torch_compile,
         sparse_torch_compile=sparse_torch_compile,
+        dense_effective_max_seq_length=dense_effective_max_seq_length,
+        chunk_content_budget=chunk_content_budget,
         sparse_top_k=sparse_top_k,
         limit=limit,
         batch_size=batch_size,
@@ -855,6 +881,7 @@ def _embed_knowledge_blocks_separate(
         skip_low_interest_content=skip_low_interest_content,
         progress=progress,
     )
+    shared_policy = _chunk_policy_from_audit(dense_stats.get("indexing_audit"))
     _release_batch_memory()
     _progress_message("embedding pass 2/2 sparse", enabled=progress)
     sparse_stats = _embed_knowledge_blocks_joint(
@@ -872,6 +899,8 @@ def _embed_knowledge_blocks_separate(
         sparse_torch_dtype=sparse_torch_dtype,
         dense_torch_compile=dense_torch_compile,
         sparse_torch_compile=sparse_torch_compile,
+        dense_effective_max_seq_length=dense_effective_max_seq_length,
+        chunk_content_budget=chunk_content_budget,
         sparse_top_k=sparse_top_k,
         limit=limit,
         batch_size=batch_size,
@@ -879,6 +908,7 @@ def _embed_knowledge_blocks_separate(
         force=force,
         skip_low_interest_content=skip_low_interest_content,
         progress=progress,
+        chunk_policy=shared_policy,
     )
     return {
         "embedding_pass_mode": "separate",
@@ -895,11 +925,37 @@ def _embed_knowledge_blocks_separate(
         "dense_vectors": int(dense_stats["dense_vectors"]),
         "sparse_vectors": int(sparse_stats["sparse_vectors"]),
         "sparse_terms": int(sparse_stats["sparse_terms"]),
+        "chunk_policy_id": dense_stats["chunk_policy_id"],
+        "indexing_audit": dense_stats["indexing_audit"],
         "avg_dense_dim": float(dense_stats["avg_dense_dim"]),
         "avg_sparse_non_zero_count": float(sparse_stats["avg_sparse_non_zero_count"]),
         "peak_rss_mb": max(float(dense_stats["peak_rss_mb"]), float(sparse_stats["peak_rss_mb"])),
         "errors": int(dense_stats["errors"]) + int(sparse_stats["errors"]),
     }
+
+
+def _chunk_policy_from_audit(audit: object) -> ChunkPolicy | None:
+    if not isinstance(audit, dict):
+        return None
+    policy_id = audit.get("chunk_policy_id")
+    max_input_tokens = audit.get("chunk_policy_max_input_tokens")
+    content_budget = audit.get("chunk_policy_content_token_budget")
+    overlap_tokens = audit.get("chunk_policy_overlap_tokens")
+    safety_reserve = audit.get("chunk_policy_safety_reserve")
+    version = audit.get("chunk_policy_version")
+    if not all(
+        value is not None
+        for value in (policy_id, max_input_tokens, content_budget, overlap_tokens, safety_reserve, version)
+    ):
+        return None
+    return ChunkPolicy(
+        id=str(policy_id),
+        max_input_tokens=int(max_input_tokens),
+        content_token_budget=int(content_budget),
+        overlap_tokens=int(overlap_tokens),
+        safety_reserve=int(safety_reserve),
+        version=str(version),
+    )
 
 
 def _build_dense_provider(
@@ -910,6 +966,7 @@ def _build_dense_provider(
     backend: str = "torch",
     torch_dtype: str = "auto",
     torch_compile: bool = False,
+    effective_max_seq_length: int | None = None,
 ):
     if provider_name == "none":
         return None
@@ -922,6 +979,7 @@ def _build_dense_provider(
             backend=backend,
             torch_dtype=torch_dtype,
             torch_compile=torch_compile,
+            effective_max_seq_length=effective_max_seq_length,
         )
     raise ValueError(f"Unsupported dense provider: {provider_name}")
 

@@ -7,7 +7,7 @@ import resource
 import subprocess
 import sys
 
-from kb.embeddings.base import DenseEmbeddingProvider, SparseEmbeddingProvider
+from kb.embeddings.base import DenseEmbeddingProvider, EmbeddingProviderContract, SparseEmbeddingProvider
 
 
 logger = logging.getLogger(__name__)
@@ -22,6 +22,7 @@ class SentenceTransformerDenseProvider(DenseEmbeddingProvider):
         backend: str = "torch",
         torch_dtype: str | None = None,
         torch_compile: bool = False,
+        effective_max_seq_length: int | None = None,
     ) -> None:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         # Avoid a non-daemon Transformers safetensors auto-conversion thread that can block CLI shutdown.
@@ -55,8 +56,9 @@ class SentenceTransformerDenseProvider(DenseEmbeddingProvider):
             torch_compile,
         )
         self._model = SentenceTransformer(model_name, device=device, backend=backend, model_kwargs=model_kwargs)
-        self.effective_max_sequence_length = int(getattr(self._model, "max_seq_length", 256) or 256)
         self._tokenizer = getattr(self._model, "tokenizer", None)
+        st_max_seq_length = int(getattr(self._model, "max_seq_length", 256) or 256)
+        self.effective_max_sequence_length = int(effective_max_seq_length or st_max_seq_length)
         if hasattr(self._model, "get_embedding_dimension"):
             output_dim = self._model.get_embedding_dimension()
         else:
@@ -67,7 +69,20 @@ class SentenceTransformerDenseProvider(DenseEmbeddingProvider):
                 normalize_embeddings=True,
                 output_dim=int(output_dim),
                 max_seq_length=self.effective_max_sequence_length,
+                max_seq_override=effective_max_seq_length,
             )
+        self.provider_contract = _provider_contract(
+            model_name=model_name,
+            model=self._model,
+            tokenizer=self._tokenizer,
+            embedding_dimension=int(output_dim) if output_dim is not None else None,
+            effective_max_seq_length=self.effective_max_sequence_length,
+            max_seq_length_override=effective_max_seq_length,
+            document_prefix=self.document_prefix,
+            query_prefix=self.query_prefix,
+            safety_reserve=4,
+            token_counter=self.token_count,
+        )
         _compile_model(self._model, backend=backend, enabled=torch_compile)
         logger.info("loaded dense sentence-transformers model name=%s", model_name)
 
@@ -101,6 +116,7 @@ class SentenceTransformerSparseProvider(SparseEmbeddingProvider):
         backend: str = "torch",
         torch_dtype: str | None = None,
         torch_compile: bool = False,
+        effective_max_seq_length: int | None = None,
     ) -> None:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         # Avoid a non-daemon Transformers safetensors auto-conversion thread that can block CLI shutdown.
@@ -137,14 +153,28 @@ class SentenceTransformerSparseProvider(SparseEmbeddingProvider):
             top_k,
         )
         self._model = SparseEncoder(model_name, device=device, backend=backend, model_kwargs=model_kwargs)
-        self.effective_max_sequence_length = int(getattr(self._model, "max_seq_length", 256) or 256)
         self._tokenizer = getattr(self._model, "tokenizer", None)
+        st_max_seq_length = int(getattr(self._model, "max_seq_length", 256) or 256)
+        self.effective_max_sequence_length = int(effective_max_seq_length or st_max_seq_length)
         self.embedding_space_id = _sparse_embedding_space_id(
             model_name,
             top_k=top_k,
             document_encoder="encode_document",
             query_encoder="encode_query",
             max_seq_length=self.effective_max_sequence_length,
+            max_seq_override=effective_max_seq_length,
+        )
+        self.provider_contract = _provider_contract(
+            model_name=model_name,
+            model=self._model,
+            tokenizer=self._tokenizer,
+            embedding_dimension=None,
+            effective_max_seq_length=self.effective_max_sequence_length,
+            max_seq_length_override=effective_max_seq_length,
+            document_prefix=self.document_prefix,
+            query_prefix=self.query_prefix,
+            safety_reserve=4,
+            token_counter=self.token_count,
         )
         _compile_model(self._model, backend=backend, enabled=torch_compile)
         logger.info("loaded sparse sentence-transformers model name=%s", model_name)
@@ -247,6 +277,7 @@ def _dense_embedding_space_id(
     normalize_embeddings: bool,
     output_dim: int | None,
     max_seq_length: int | None = None,
+    max_seq_override: int | None = None,
 ) -> str:
     parts = [
         "sentence-transformers-dense",
@@ -259,6 +290,8 @@ def _dense_embedding_space_id(
         parts.append(f"dim={output_dim}")
     if max_seq_length is not None:
         parts.append(f"max_seq={max_seq_length}")
+    if max_seq_override is not None:
+        parts.append(f"max_seq_override={max_seq_override}")
     return ";".join(parts)
 
 
@@ -269,6 +302,7 @@ def _sparse_embedding_space_id(
     document_encoder: str,
     query_encoder: str,
     max_seq_length: int | None = None,
+    max_seq_override: int | None = None,
 ) -> str:
     parts = [
             "sentence-transformers-sparse",
@@ -279,7 +313,65 @@ def _sparse_embedding_space_id(
     ]
     if max_seq_length is not None:
         parts.append(f"max_seq={max_seq_length}")
+    if max_seq_override is not None:
+        parts.append(f"max_seq_override={max_seq_override}")
     return ";".join(parts)
+
+
+def _provider_contract(
+    *,
+    model_name: str,
+    model,
+    tokenizer,
+    embedding_dimension: int | None,
+    effective_max_seq_length: int,
+    max_seq_length_override: int | None,
+    document_prefix: str,
+    query_prefix: str,
+    safety_reserve: int,
+    token_counter,
+) -> EmbeddingProviderContract:
+    tokenizer_name = getattr(tokenizer, "name_or_path", None) if tokenizer is not None else None
+    tokenizer_limit = getattr(tokenizer, "model_max_length", None) if tokenizer is not None else None
+    if isinstance(tokenizer_limit, int) and tokenizer_limit > 1_000_000_000:
+        tokenizer_limit = None
+    st_limit = int(getattr(model, "max_seq_length", effective_max_seq_length) or effective_max_seq_length)
+    backbone_limit = _backbone_max_position_embeddings(model)
+    special_token_overhead = int(token_counter(""))
+    return EmbeddingProviderContract(
+        model_name=model_name,
+        model_revision=None,
+        embedding_dimension=embedding_dimension,
+        tokenizer_name=str(tokenizer_name) if tokenizer_name else None,
+        tokenizer_model_max_length=int(tokenizer_limit) if isinstance(tokenizer_limit, int) else None,
+        backbone_max_position_embeddings=backbone_limit,
+        sentence_transformer_max_seq_length=st_limit,
+        configured_effective_max_seq_length=effective_max_seq_length,
+        document_prefix=document_prefix,
+        query_prefix=query_prefix,
+        special_token_overhead=special_token_overhead,
+        configured_safety_reserve=safety_reserve,
+        computed_content_budget=max(0, effective_max_seq_length - special_token_overhead - safety_reserve),
+        max_seq_length_override=max_seq_length_override,
+    )
+
+
+def _backbone_max_position_embeddings(model) -> int | None:
+    candidates = []
+    for attr in ("_first_module",):
+        try:
+            module = getattr(model, attr)()
+            candidates.append(module)
+        except Exception:  # noqa: BLE001
+            pass
+    candidates.extend(getattr(model, "_modules", {}).values() if hasattr(model, "_modules") else [])
+    for candidate in candidates:
+        auto_model = getattr(candidate, "auto_model", None)
+        config = getattr(auto_model, "config", None)
+        value = getattr(config, "max_position_embeddings", None)
+        if isinstance(value, int):
+            return value
+    return None
 
 
 def _runtime_metadata(
