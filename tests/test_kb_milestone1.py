@@ -17,9 +17,11 @@ if str(SRC) not in sys.path:
 
 from kb.cli import _chunked_embedding_space_id, build_edges_command, build_nodes_command, build_parser as build_index_parser, embed_knowledge_blocks, import_knowledge_base, ingest_attachments, ingest_chats  # noqa: E402
 from kb.benchmark import DirectRetrievalSession, RankingConfig, analyze_direct_retrieval_evaluation, build_breakdowns, build_pairwise_queries, calculate_query_metrics, default_ranking_configs, evaluate_direct_retrieval_run, run_direct_retrieval_benchmark, validate_direct_retrieval_dataset  # noqa: E402
+from kb.canary.multilingual_dense import run_canary  # noqa: E402
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider  # noqa: E402
+from kb.embeddings.sentence_transformer_provider import _dense_embedding_space_id  # noqa: E402
 from kb.index.chunk_builder import build_chunk_policy, build_retrieval_chunks  # noqa: E402
 from kb.mcp.server import ServerConfig, build_parser as build_mcp_parser, handle_request  # noqa: E402
 from kb.retrieval.context_pack import ContextPackOptions, build_context_pack  # noqa: E402
@@ -191,7 +193,7 @@ def _static_sparse_terms(text: str) -> dict[str, float]:
 class KBMilestone1Tests(unittest.TestCase):
     def test_long_prose_is_split_into_tokenizer_aware_chunks_with_full_coverage(self) -> None:
         provider = MockDenseProvider(max_sequence_length=16)
-        policy = build_chunk_policy([provider])
+        policy = build_chunk_policy([provider], version="v1")
         text = " ".join(f"token{i}" for i in range(80))
         chunks = build_retrieval_chunks(
             block_id="block-long",
@@ -209,6 +211,126 @@ class KBMilestone1Tests(unittest.TestCase):
             covered.update(range(start, end))
         self.assertEqual(covered, set(range(10, 10 + len(text))))
         self.assertLess(chunks[1].source_char_start, chunks[0].source_char_end)
+
+    def test_chunk_policy_v2_natural_boundary_does_not_overlap(self) -> None:
+        provider = MockDenseProvider(max_sequence_length=16)
+        policy = build_chunk_policy([provider], version="v2")
+        text = " ".join(f"token{i}" for i in range(80))
+        chunks = build_retrieval_chunks(
+            block_id="block-v2-natural",
+            block_text=text,
+            block_char_start=0,
+            policy=policy,
+            tokenizer_provider=provider,
+        )
+
+        self.assertGreater(len(chunks), 1)
+        self.assertNotEqual(build_chunk_policy([provider], version="v1").id, policy.id)
+        self.assertEqual(sum(chunk.overlap_token_count for chunk in chunks), 0)
+        self.assertTrue(all(chunk.split_reason in {"natural_boundary", "complete"} for chunk in chunks))
+
+    def test_chunk_policy_v2_token_window_fallback_uses_small_overlap(self) -> None:
+        class CharTokenProvider(MockDenseProvider):
+            def token_count(self, text: str) -> int:
+                return len(text)
+
+        provider = CharTokenProvider(max_sequence_length=20)
+        policy = build_chunk_policy([provider], version="v2")
+        text = "x" * 500
+        chunks = build_retrieval_chunks(
+            block_id="block-v2-fallback",
+            block_text=text,
+            block_char_start=0,
+            policy=policy,
+            tokenizer_provider=provider,
+        )
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(any(chunk.split_reason == "token_window_fallback" for chunk in chunks))
+        self.assertTrue(any(chunk.overlap_token_count > 0 for chunk in chunks))
+        self.assertEqual(policy.overlap_tokens, max(1, policy.content_token_budget // 16))
+
+    def test_provider_contract_exposes_distinct_limits(self) -> None:
+        provider = MockDenseProvider(max_sequence_length=32)
+
+        contract = provider.contract_dict()
+
+        self.assertEqual(contract["tokenizer_model_max_length"], 32)
+        self.assertEqual(contract["backbone_max_position_embeddings"], 32)
+        self.assertEqual(contract["sentence_transformer_max_seq_length"], 32)
+        self.assertEqual(contract["configured_effective_max_seq_length"], 32)
+        self.assertEqual(contract["computed_content_budget"], 28)
+
+    def test_max_sequence_override_is_explicit_in_embedding_space_identity(self) -> None:
+        default_id = _dense_embedding_space_id(
+            "example/model",
+            normalize_embeddings=True,
+            output_dim=384,
+            max_seq_length=128,
+        )
+        override_id = _dense_embedding_space_id(
+            "example/model",
+            normalize_embeddings=True,
+            output_dim=384,
+            max_seq_length=256,
+            max_seq_override=256,
+        )
+
+        self.assertNotIn("max_seq_override", default_id)
+        self.assertIn("max_seq_override=256", override_id)
+        self.assertNotEqual(default_id, override_id)
+
+    def test_mock_canary_report_is_created_and_counts_cross_language_breakdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = run_canary(
+                input_dir=None,
+                work_dir=Path(tmp),
+                models=["mock"],
+                dense_device=None,
+                sparse_device=None,
+                batch_size=8,
+                output_report=None,
+                effective_max_seq_length=None,
+                chunk_content_budget=None,
+                sparse_provider="mock",
+                sparse_model="mock-sparse",
+                sparse_top_k=16,
+                keep_databases=False,
+                dense_provider="mock",
+            )
+
+            self.assertEqual(report["status"], "completed")
+            self.assertTrue(Path(report["report_json"]).exists())
+            self.assertTrue(Path(report["report_md"]).exists())
+            model = report["models"][0]
+            self.assertEqual(model["status"], "completed")
+            self.assertGreater(model["retrieval_chunks"], 0)
+            self.assertIn("RU->EN", model["metrics"]["hybrid"]["breakdown"])
+            self.assertIn("EN->RU", model["metrics"]["hybrid"]["breakdown"])
+
+    def test_canary_mps_provider_failure_is_not_reported_as_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("kb.canary.multilingual_dense._build_dense_provider", side_effect=RuntimeError("mps unavailable")):
+                report = run_canary(
+                    input_dir=None,
+                    work_dir=Path(tmp),
+                    models=["mock"],
+                    dense_device="mps",
+                    sparse_device=None,
+                    batch_size=8,
+                    output_report=None,
+                    effective_max_seq_length=None,
+                    chunk_content_budget=None,
+                    sparse_provider="none",
+                    sparse_model="mock-sparse",
+                    sparse_top_k=16,
+                    keep_databases=False,
+                    dense_provider="mock",
+                )
+
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["models"][0]["status"], "failed_provider_load")
+        self.assertEqual(report["models"][0]["mps_status"], "failed")
 
     def test_chunk_offsets_preserve_cyrillic_emoji_and_mixed_text(self) -> None:
         provider = MockDenseProvider(max_sequence_length=12)

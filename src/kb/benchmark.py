@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 
 from kb.cli import _build_dense_provider, _build_sparse_provider, _chunked_embedding_space_id
-from kb.index.chunk_builder import build_chunk_policy
+from kb.index.chunk_builder import ChunkPolicy, build_chunk_policy
 from kb.retrieval.hybrid_search import _preview, _sparse_overlap
 from kb.storage.sqlite_store import SQLiteStore
 
@@ -177,6 +177,7 @@ class DirectRetrievalSession:
         sparse_provider: Any,
         project: str | None = None,
         include_low_interest: bool = False,
+        chunk_policy: ChunkPolicy | None = None,
     ) -> None:
         if dense_provider is None and sparse_provider is None:
             raise ValueError("At least one retrieval provider must be enabled.")
@@ -185,7 +186,7 @@ class DirectRetrievalSession:
         self.sparse_provider = sparse_provider
         self.project = project
         self.include_low_interest = include_low_interest
-        self.policy = build_chunk_policy([item for item in (dense_provider, sparse_provider) if item is not None])
+        self.policy = chunk_policy or build_chunk_policy([item for item in (dense_provider, sparse_provider) if item is not None])
         self.dense_embedding_space_id = (
             _chunked_embedding_space_id(dense_provider.embedding_space_id, self.policy.id) if dense_provider else None
         )

@@ -324,7 +324,7 @@ class SQLiteStore:
             INSERT INTO retrieval_chunks (
                 id, block_id, ordinal, source_char_start, source_char_end,
                 token_count, text, chunk_policy_id, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}')
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 (
@@ -336,6 +336,12 @@ class SQLiteStore:
                     chunk.token_count,
                     chunk.text,
                     chunk.chunk_policy_id,
+                    _json(
+                        {
+                            "split_reason": chunk.split_reason,
+                            "overlap_token_count": chunk.overlap_token_count,
+                        }
+                    ),
                 )
                 for chunk in chunks
             ),

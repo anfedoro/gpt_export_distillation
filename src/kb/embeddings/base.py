@@ -1,6 +1,28 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import asdict, dataclass
+
+
+@dataclass(frozen=True)
+class EmbeddingProviderContract:
+    model_name: str
+    model_revision: str | None
+    embedding_dimension: int | None
+    tokenizer_name: str | None
+    tokenizer_model_max_length: int | None
+    backbone_max_position_embeddings: int | None
+    sentence_transformer_max_seq_length: int | None
+    configured_effective_max_seq_length: int | None
+    document_prefix: str
+    query_prefix: str
+    special_token_overhead: int
+    configured_safety_reserve: int
+    computed_content_budget: int | None
+    max_seq_length_override: int | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
 
 
 class DenseEmbeddingProvider(ABC):
@@ -8,7 +30,9 @@ class DenseEmbeddingProvider(ABC):
     embedding_space_id: str
     runtime_metadata: dict[str, object]
     document_prefix: str = ""
+    query_prefix: str = ""
     effective_max_sequence_length: int | None = None
+    provider_contract: EmbeddingProviderContract | None = None
 
     @property
     def model_version(self) -> str:
@@ -26,6 +50,14 @@ class DenseEmbeddingProvider(ABC):
 
     def embedding_input(self, text: str) -> str:
         return f"{self.document_prefix}{text}"
+
+    def query_input(self, text: str) -> str:
+        return f"{self.query_prefix}{text}"
+
+    def contract_dict(self) -> dict[str, object]:
+        if self.provider_contract is None:
+            return {}
+        return self.provider_contract.as_dict()
 
     def token_count(self, text: str) -> int:
         raise RuntimeError(f"Provider {self.model_name} does not expose a reliable tokenizer.")
@@ -48,7 +80,9 @@ class SparseEmbeddingProvider(ABC):
     embedding_space_id: str
     runtime_metadata: dict[str, object]
     document_prefix: str = ""
+    query_prefix: str = ""
     effective_max_sequence_length: int | None = None
+    provider_contract: EmbeddingProviderContract | None = None
 
     @property
     def model_version(self) -> str:
@@ -67,6 +101,14 @@ class SparseEmbeddingProvider(ABC):
 
     def embedding_input(self, text: str) -> str:
         return f"{self.document_prefix}{text}"
+
+    def query_input(self, text: str) -> str:
+        return f"{self.query_prefix}{text}"
+
+    def contract_dict(self) -> dict[str, object]:
+        if self.provider_contract is None:
+            return {}
+        return self.provider_contract.as_dict()
 
     def token_count(self, text: str) -> int:
         raise RuntimeError(f"Provider {self.model_name} does not expose a reliable tokenizer.")
