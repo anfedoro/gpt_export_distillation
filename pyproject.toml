@@ -23,6 +23,7 @@ kb-search = "kb.retrieval.hybrid_search:main"
 kb-mcp = "kb.mcp.server:main"
 kb-benchmark = "kb.benchmark:main"
 kb-model-canary = "kb.canary.multilingual_dense:main"
+kb-real-data-preflight = "kb.canary.real_data:main"
 
 [build-system]
 requires = ["uv_build>=0.11.19,<0.12.0"]

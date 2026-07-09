@@ -18,6 +18,7 @@ if str(SRC) not in sys.path:
 from kb.cli import _chunked_embedding_space_id, build_edges_command, build_nodes_command, build_parser as build_index_parser, embed_knowledge_blocks, import_knowledge_base, ingest_attachments, ingest_chats  # noqa: E402
 from kb.benchmark import DirectRetrievalSession, RankingConfig, analyze_direct_retrieval_evaluation, build_breakdowns, build_pairwise_queries, calculate_query_metrics, default_ranking_configs, evaluate_direct_retrieval_run, run_direct_retrieval_benchmark, validate_direct_retrieval_dataset  # noqa: E402
 from kb.canary.multilingual_dense import run_canary  # noqa: E402
+from kb.canary.real_data import _probe_metrics, _reject_unsafe_output_path, _validate_content_budget, load_or_create_manifest, validate_source_offsets  # noqa: E402
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider  # noqa: E402
@@ -191,6 +192,64 @@ def _static_sparse_terms(text: str) -> dict[str, float]:
 
 
 class KBMilestone1Tests(unittest.TestCase):
+    def test_real_preflight_manifest_selection_is_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            chat_dir = root / "Projects" / "Preflight"
+            chat_dir.mkdir(parents=True)
+            for index in range(12):
+                chat = SAMPLE_CHAT.replace("conv-1", f"conv-{index}").replace("msg-user-1", f"msg-user-{index}")
+                chat = chat.replace("How should memory write routing work?", "русский English mixed text " + "tail " * 300)
+                (chat_dir / f"chat-{index:02d}.md").write_text(chat, encoding="utf-8")
+            first = load_or_create_manifest(root, Path(tmp) / "first.json", max_conversations=16)
+            second = load_or_create_manifest(root, Path(tmp) / "second.json", max_conversations=16)
+            self.assertEqual(first, second)
+            self.assertEqual(len(first), 12)
+
+    def test_real_preflight_rejects_production_and_legacy_output_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            root.mkdir()
+            with self.assertRaisesRegex(ValueError, "distinct path"):
+                _reject_unsafe_output_path(root, root / "chat_memory.db")
+            with self.assertRaisesRegex(ValueError, "distinct path"):
+                _reject_unsafe_output_path(root, root / "chat_memory_v2_bge_m3.db")
+
+    def test_real_preflight_checks_budget_against_every_provider_contract(self) -> None:
+        class Provider:
+            model_name = "strict-provider"
+            effective_max_sequence_length = 512
+
+            def contract_dict(self):
+                return {"computed_content_budget": 506}
+
+        with self.assertRaisesRegex(ValueError, "requested=512, safe_content_budget=506"):
+            _validate_content_budget(512, [Provider()])
+        _validate_content_budget(506, [Provider()])
+
+    def test_real_preflight_offset_validation_detects_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            chat_dir = root / "Projects" / "Project"
+            chat_dir.mkdir(parents=True)
+            (chat_dir / "chat.md").write_text(SAMPLE_CHAT, encoding="utf-8")
+            db = Path(tmp) / "preflight.db"
+            ingest_chats(root, db)
+            embed_knowledge_blocks(db_path=db, provider="mock", dense_provider="mock", sparse_provider="mock", batch_size=4)
+            self.assertTrue(validate_source_offsets(db, sample_size=30)["passed"])
+            with SQLiteStore(db) as store:
+                store.conn.execute("UPDATE retrieval_chunks SET text='offset mismatch' WHERE id=(SELECT id FROM retrieval_chunks LIMIT 1)")
+                store.commit()
+            self.assertFalse(validate_source_offsets(db, sample_size=30)["passed"])
+
+    def test_real_preflight_probe_metrics_cover_chunk_message_and_conversation(self) -> None:
+        metrics = _probe_metrics([
+            {"probe_type": "tail", "query_language": "en", "chunk_rank": 2, "message_rank": 2, "conversation_rank": 1},
+            {"probe_type": "code", "query_language": "ru", "chunk_rank": None, "message_rank": 9, "conversation_rank": 4},
+        ])
+        self.assertEqual(metrics["chunk_recall_at"]["1"], 0.0)
+        self.assertEqual(metrics["message_recall_at"]["5"], 0.5)
+        self.assertEqual(metrics["conversation_recall_at"]["5"], 1.0)
     def test_long_prose_is_split_into_tokenizer_aware_chunks_with_full_coverage(self) -> None:
         provider = MockDenseProvider(max_sequence_length=16)
         policy = build_chunk_policy([provider], version="v1")

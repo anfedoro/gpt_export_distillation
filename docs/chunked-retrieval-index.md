@@ -76,6 +76,39 @@ If `--input` is omitted, the command builds a small synthetic safe fixture. Use
 writes `report.json` and `report.md` under a timestamped run directory and
 prints the resolved provider contract before indexing each model.
 
+## Private Real-data Preflight
+
+Before rebuilding a full private archive, run the isolated preflight. It writes
+the selected document manifest, generated probes, filtered source copy, report,
+and dedicated SQLite database only to local ignored paths. The repository ships
+only [manifest schema example](real-data-preflight-manifest.example.json) and
+[probe schema example](real-data-preflight-probes.example.json), never private
+conversation identifiers or text.
+
+```bash
+kb-real-data-preflight \
+  --input /Users/anfedoro/Downloads/gpt-export-30.06.2026 \
+  --manifest .local/preflight/bge_m3_real_manifest.json \
+  --probe-file .local/preflight/bge_m3_real_probes.json \
+  --work-dir benchmarks/real_data_preflight \
+  --output-db /Users/anfedoro/Downloads/gpt-export-30.06.2026/preflight_bge_m3_512.db \
+  --dense-model BAAI/bge-m3 \
+  --dense-device mps \
+  --dense-torch-dtype float16 \
+  --sparse-provider sentence-transformers \
+  --sparse-device mps \
+  --sparse-torch-dtype float16 \
+  --chunk-policy canonical_token_chunks:v2 \
+  --chunk-content-budget 512 \
+  --batch-size 16 \
+  --keep-database
+```
+
+The preflight rejects `chat_memory.db` and `chat_memory_v2_bge_m3.db` as output
+paths. It also validates the requested content budget against the safe contract
+of **every** active provider before parsing or embedding. It never silently
+reduces a requested budget or falls back from MPS to CPU.
+
 ## Rebuild Path
 
 Databases created with block-level embeddings should be rebuilt from the distilled Markdown archive:

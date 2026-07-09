@@ -23,3 +23,7 @@ wheels/
 
 # Local benchmark run artifacts
 benchmarks/runs/
+benchmarks/real_data_preflight/
+
+# Private local preflight manifests, probes, and filtered source samples
+.local/
