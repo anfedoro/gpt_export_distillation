@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import tempfile
 from io import StringIO
@@ -15,7 +16,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from kb.cli import build_edges_command, build_nodes_command, build_parser as build_index_parser, embed_knowledge_blocks, import_knowledge_base, ingest_attachments, ingest_chats  # noqa: E402
-from kb.benchmark import DirectRetrievalSession, RankingConfig, default_ranking_configs, run_direct_retrieval_benchmark, validate_direct_retrieval_dataset  # noqa: E402
+from kb.benchmark import DirectRetrievalSession, RankingConfig, calculate_query_metrics, default_ranking_configs, evaluate_direct_retrieval_run, run_direct_retrieval_benchmark, validate_direct_retrieval_dataset  # noqa: E402
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider  # noqa: E402
@@ -249,6 +250,108 @@ class KBMilestone1Tests(unittest.TestCase):
             "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
             encoding="utf-8",
         )
+
+    def _metric_dataset_record(self, query_id: str, expected: list[dict]) -> dict:
+        return {
+            "id": query_id,
+            "query": f"query {query_id}",
+            "query_type": "exact_terms",
+            "language": "en",
+            "source_language": "en",
+            "topic": "metrics",
+            "expected": expected,
+            "notes": "Synthetic metric fixture.",
+        }
+
+    def _metric_result_record(self, dataset_record: dict, *, config: dict | None = None, ranks: dict[str, int | None], top_results: list[dict] | None = None) -> dict:
+        config = config or {"id": "dense_100_sparse_000", "alpha": 1.0, "beta": 0.0}
+        return {
+            "schema_version": "kb.benchmark.query_result.v1",
+            "query_id": dataset_record["id"],
+            "query": dataset_record["query"],
+            "query_type": dataset_record["query_type"],
+            "language": dataset_record["language"],
+            "source_language": dataset_record["source_language"],
+            "topic": dataset_record["topic"],
+            "configuration": config,
+            "expected": [
+                {"block_id": item["block_id"], "relevance": item["relevance"], "rank": ranks.get(item["block_id"])}
+                for item in dataset_record["expected"]
+            ],
+            "candidate_blocks": 10,
+            "top_results": top_results if top_results is not None else [],
+            "diagnostics": {},
+            "latency_ms": {},
+        }
+
+    def _write_synthetic_evaluation_run(self, root: Path, *, query_count: int = 120, duplicate: bool = False, status: str = "completed", hash_mismatch: bool = False) -> tuple[Path, Path]:
+        run_dir = root / "run"
+        run_dir.mkdir()
+        dataset = root / "dataset.jsonl"
+        configs = [config.as_dict() for config in default_ranking_configs()]
+        dataset_records = [
+            self._metric_dataset_record(
+                f"query-{idx:03d}",
+                [
+                    {
+                        "block_id": f"kb-{idx:03d}",
+                        "relevance": 3,
+                        "source_path": f"doc-{idx:03d}.md",
+                        "conversation_id": f"conv-{idx:03d}",
+                        "message_id": f"msg-{idx:03d}",
+                    }
+                ],
+            )
+            for idx in range(query_count)
+        ]
+        self._write_dataset(dataset, dataset_records)
+        dataset_hash = "bad" if hash_mismatch else self._file_sha256(dataset)
+        manifest = {
+            "schema_version": "kb.benchmark.run.v1",
+            "run_id": "synthetic-run",
+            "status": status,
+            "dataset": {"path": str(dataset), "sha256": dataset_hash, "query_count": query_count},
+            "database": {"path": "db", "candidate_blocks": 10},
+            "providers": {},
+            "configurations": configs,
+            "timing_ms": {},
+            "completed_queries": query_count,
+            "failed_queries": 0,
+        }
+        (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        records = []
+        for dataset_record in dataset_records:
+            for config in configs:
+                records.append(
+                    self._metric_result_record(
+                        dataset_record,
+                        config=config,
+                        ranks={dataset_record["expected"][0]["block_id"]: 1},
+                        top_results=[
+                            {
+                                "rank": 1,
+                                "block_id": dataset_record["expected"][0]["block_id"],
+                                "source_path": dataset_record["expected"][0]["source_path"],
+                                "conversation_id": dataset_record["expected"][0]["conversation_id"],
+                                "message_id": dataset_record["expected"][0]["message_id"],
+                            }
+                        ],
+                    )
+                )
+        if duplicate:
+            records.append(records[0])
+        (run_dir / "results.jsonl").write_text(
+            "".join(json.dumps(record) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        return run_dir, dataset
+
+    def _file_sha256(self, path: Path) -> str:
+        import hashlib
+
+        digest = hashlib.sha256()
+        digest.update(path.read_bytes())
+        return digest.hexdigest()
 
     def test_scan_detects_export_tree_kinds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1254,6 +1357,141 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertEqual(load_calls, 1)
             self.assertEqual(dense.query_calls, 3)
             self.assertEqual(sparse.query_calls, 3)
+
+    def test_evaluation_metrics_recall_mrr_and_primary_are_rank_based(self) -> None:
+        dataset = self._metric_dataset_record(
+            "q",
+            [
+                {"block_id": "primary", "relevance": 3, "source_path": "a.md", "conversation_id": "conv-a", "message_id": "m1"},
+                {"block_id": "secondary", "relevance": 2, "source_path": "b.md", "conversation_id": "conv-b", "message_id": "m2"},
+            ],
+        )
+        result = self._metric_result_record(
+            dataset,
+            ranks={"primary": 5, "secondary": 1},
+            top_results=[
+                {"rank": 1, "block_id": "secondary", "source_path": "b.md", "conversation_id": "conv-b", "message_id": "m2"},
+                {"rank": 5, "block_id": "primary", "source_path": "a.md", "conversation_id": "conv-a", "message_id": "m1"},
+            ],
+        )
+
+        metrics = calculate_query_metrics(result, dataset)
+
+        self.assertEqual(metrics["first_relevant_rank"], 1)
+        self.assertEqual(metrics["primary_rank"], 5)
+        self.assertEqual(metrics["recall_at"], {"1": 1, "5": 1, "10": 1, "20": 1})
+        self.assertEqual(metrics["primary_recall_at"], {"1": 0, "5": 1, "10": 1, "20": 1})
+        self.assertAlmostEqual(metrics["reciprocal_rank"], 1.0)
+        self.assertAlmostEqual(metrics["primary_reciprocal_rank"], 0.2)
+
+    def test_evaluation_metrics_handle_rank_beyond_20(self) -> None:
+        dataset = self._metric_dataset_record(
+            "q",
+            [{"block_id": "primary", "relevance": 3, "source_path": "a.md", "conversation_id": "conv-a", "message_id": "m1"}],
+        )
+        result = self._metric_result_record(dataset, ranks={"primary": 25})
+
+        metrics = calculate_query_metrics(result, dataset)
+
+        self.assertEqual(metrics["recall_at"], {"1": 0, "5": 0, "10": 0, "20": 0})
+        self.assertAlmostEqual(metrics["reciprocal_rank"], 1 / 25)
+
+    def test_evaluation_metrics_ndcg_uses_graded_relevance_and_truncation(self) -> None:
+        dataset = self._metric_dataset_record(
+            "q",
+            [
+                {"block_id": "rel3", "relevance": 3, "source_path": "a.md", "conversation_id": "conv-a", "message_id": "m1"},
+                {"block_id": "rel2", "relevance": 2, "source_path": "b.md", "conversation_id": "conv-b", "message_id": "m2"},
+                {"block_id": "rel1", "relevance": 1, "source_path": "c.md", "conversation_id": "conv-c", "message_id": "m3"},
+            ],
+        )
+        result = self._metric_result_record(dataset, ranks={"rel3": 4, "rel2": 2, "rel1": 7})
+
+        metrics = calculate_query_metrics(result, dataset)
+
+        self.assertEqual(metrics["ndcg_at"]["1"], 0.0)
+        dcg5 = (3 / math.log2(3)) + (7 / math.log2(5))
+        idcg5 = 7 + (3 / math.log2(3)) + (1 / math.log2(4))
+        self.assertAlmostEqual(metrics["ndcg_at"]["5"], dcg5 / idcg5)
+        dcg10 = dcg5 + (1 / math.log2(8))
+        self.assertAlmostEqual(metrics["ndcg_at"]["10"], dcg10 / idcg5)
+
+    def test_evaluation_metrics_document_and_conversation_recall(self) -> None:
+        dataset = self._metric_dataset_record(
+            "q",
+            [{"block_id": "primary", "relevance": 3, "source_path": "doc.md", "conversation_id": "conv-a", "message_id": "m1"}],
+        )
+        result = self._metric_result_record(
+            dataset,
+            ranks={"primary": 50},
+            top_results=[
+                {"rank": 1, "block_id": "other-doc", "source_path": "doc.md", "conversation_id": "other", "message_id": "m2"},
+                {"rank": 2, "block_id": "other-conv", "source_path": "other.md", "conversation_id": "conv-a", "message_id": "m3"},
+            ],
+        )
+
+        metrics = calculate_query_metrics(result, dataset)
+
+        self.assertEqual(metrics["document_recall_at"]["1"], 1)
+        self.assertEqual(metrics["conversation_recall_at"]["1"], 0)
+        self.assertEqual(metrics["conversation_recall_at"]["5"], 1)
+
+    def test_evaluation_metrics_ignore_null_conversation_matches(self) -> None:
+        dataset = self._metric_dataset_record(
+            "q",
+            [{"block_id": "primary", "relevance": 3, "source_path": "doc.md", "conversation_id": None, "message_id": "m1"}],
+        )
+        result = self._metric_result_record(
+            dataset,
+            ranks={"primary": 10},
+            top_results=[{"rank": 1, "block_id": "other", "source_path": "other.md", "conversation_id": None, "message_id": "m2"}],
+        )
+
+        metrics = calculate_query_metrics(result, dataset)
+
+        self.assertEqual(metrics["conversation_recall_at"], {"1": 0, "5": 0, "10": 0, "20": 0})
+
+    def test_evaluate_run_writes_completed_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, dataset = self._write_synthetic_evaluation_run(Path(tmp))
+
+            report = evaluate_direct_retrieval_run(run_dir=run_dir, dataset_path=dataset)
+
+            self.assertEqual(report["status"], "completed")
+            self.assertEqual(report["query_count"], 120)
+            self.assertEqual(report["configuration_count"], 7)
+            self.assertEqual(report["query_metric_records"], 840)
+            evaluation_dir = Path(report["evaluation_dir"])
+            self.assertEqual(len((evaluation_dir / "query_metrics.jsonl").read_text().splitlines()), 840)
+            summary = json.loads((evaluation_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["configuration_count"], 7)
+            self.assertIn("| Configuration | R@1 | R@5 |", (evaluation_dir / "report.md").read_text(encoding="utf-8"))
+            manifest = json.loads((evaluation_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "completed")
+            self.assertEqual(manifest["query_metric_records"], 840)
+            self.assertIn("source_manifest_sha256", manifest)
+
+    def test_evaluate_run_rejects_duplicate_query_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, dataset = self._write_synthetic_evaluation_run(Path(tmp), duplicate=True)
+
+            report = evaluate_direct_retrieval_run(run_dir=run_dir, dataset_path=dataset)
+
+            self.assertEqual(report["status"], "failed")
+            self.assertIn("duplicate", report["error"])
+
+    def test_evaluate_run_rejects_hash_mismatch_and_incomplete_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, dataset = self._write_synthetic_evaluation_run(Path(tmp), hash_mismatch=True)
+            hash_report = evaluate_direct_retrieval_run(run_dir=run_dir, dataset_path=dataset)
+            self.assertEqual(hash_report["status"], "failed")
+            self.assertIn("SHA256", hash_report["error"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, dataset = self._write_synthetic_evaluation_run(Path(tmp), status="failed")
+            status_report = evaluate_direct_retrieval_run(run_dir=run_dir, dataset_path=dataset)
+            self.assertEqual(status_report["status"], "failed")
+            self.assertIn("completed", status_report["error"])
 
     def test_query_and_context_direct_scores_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
