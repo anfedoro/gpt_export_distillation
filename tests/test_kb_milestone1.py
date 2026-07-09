@@ -16,7 +16,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from kb.cli import build_edges_command, build_nodes_command, build_parser as build_index_parser, embed_knowledge_blocks, import_knowledge_base, ingest_attachments, ingest_chats  # noqa: E402
-from kb.benchmark import DirectRetrievalSession, RankingConfig, calculate_query_metrics, default_ranking_configs, evaluate_direct_retrieval_run, run_direct_retrieval_benchmark, validate_direct_retrieval_dataset  # noqa: E402
+from kb.benchmark import DirectRetrievalSession, RankingConfig, analyze_direct_retrieval_evaluation, build_breakdowns, build_pairwise_queries, calculate_query_metrics, default_ranking_configs, evaluate_direct_retrieval_run, run_direct_retrieval_benchmark, validate_direct_retrieval_dataset  # noqa: E402
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider  # noqa: E402
@@ -1492,6 +1492,172 @@ class KBMilestone1Tests(unittest.TestCase):
             status_report = evaluate_direct_retrieval_run(run_dir=run_dir, dataset_path=dataset)
             self.assertEqual(status_report["status"], "failed")
             self.assertIn("completed", status_report["error"])
+
+    def test_analysis_breakdowns_group_dimensions_and_metrics(self) -> None:
+        configs = [
+            {"id": "dense_100_sparse_000", "alpha": 1.0, "beta": 0.0},
+            {"id": "dense_000_sparse_100", "alpha": 0.0, "beta": 1.0},
+        ]
+        items = []
+        for query_id, query_type, language, source_language, topic, rr in [
+            ("q1", "exact_terms", "en", "ru", "llm_memory", 1.0),
+            ("q2", "paraphrase", "ru", "ru", "career", 0.5),
+        ]:
+            for config in configs:
+                items.append(
+                    {
+                        "query_id": query_id,
+                        "query": query_id,
+                        "query_type": query_type,
+                        "language": language,
+                        "source_language": source_language,
+                        "topic": topic,
+                        "configuration": config,
+                        "recall_at": {"1": int(rr == 1.0), "5": 1, "10": 1, "20": 1},
+                        "primary_recall_at": {"1": int(rr == 1.0), "5": 1, "10": 1, "20": 1},
+                        "reciprocal_rank": rr,
+                        "primary_reciprocal_rank": rr,
+                        "ndcg_at": {"1": rr, "5": rr, "10": rr, "20": rr},
+                        "document_recall_at": {"1": 0, "5": 1, "10": 1, "20": 1},
+                        "conversation_recall_at": {"1": 0, "5": 1, "10": 1, "20": 1},
+                        "primary_rank": int(1 / rr),
+                    }
+                )
+
+        breakdowns = build_breakdowns(items, configs)
+
+        self.assertEqual(set(breakdowns["dimensions"]), {"query_type", "language", "source_language", "language_direction", "topic"})
+        exact_slice = next(item for item in breakdowns["dimensions"]["query_type"] if item["value"] == "exact_terms")
+        self.assertEqual(exact_slice["query_count"], 1)
+        self.assertTrue(exact_slice["small_sample"])
+        self.assertEqual(exact_slice["configurations"][0]["mean_primary_rank"], 1.0)
+        self.assertEqual(exact_slice["configurations"][0]["primary_miss_count"], 0)
+
+    def test_analysis_best_configuration_uses_metrics_and_tiebreak(self) -> None:
+        configs = [
+            {"id": "dense_100_sparse_000", "alpha": 1.0, "beta": 0.0},
+            {"id": "dense_000_sparse_100", "alpha": 0.0, "beta": 1.0},
+        ]
+        items = []
+        for config in configs:
+            items.append(
+                {
+                    "query_id": "q1",
+                    "query": "q1",
+                    "query_type": "exact_terms",
+                    "language": "en",
+                    "source_language": "en",
+                    "topic": "topic",
+                    "configuration": config,
+                    "recall_at": {"1": 1, "5": 1, "10": 1, "20": 1},
+                    "primary_recall_at": {"1": 1, "5": 1, "10": 1, "20": 1},
+                    "reciprocal_rank": 1.0,
+                    "primary_reciprocal_rank": 1.0,
+                    "ndcg_at": {"1": 1, "5": 1, "10": 1, "20": 1},
+                    "document_recall_at": {"1": 1, "5": 1, "10": 1, "20": 1},
+                    "conversation_recall_at": {"1": 1, "5": 1, "10": 1, "20": 1},
+                    "primary_rank": 1,
+                }
+            )
+
+        breakdowns = build_breakdowns(items, configs)
+        slice_item = breakdowns["dimensions"]["query_type"][0]
+
+        self.assertEqual(slice_item["best_configuration"]["mrr"], "dense_100_sparse_000")
+        self.assertEqual(slice_item["best_configuration"]["recall_at_10"], "dense_100_sparse_000")
+        self.assertEqual(slice_item["best_configuration"]["ndcg_at_10"], "dense_100_sparse_000")
+
+    def test_analysis_pairwise_and_hybrid_classes(self) -> None:
+        def metric(query_id, config_id, rr, recall10=1, doc10=1, rank=1):
+            alpha = 1.0 if config_id == "dense_100_sparse_000" else 0.0
+            return {
+                "query_id": query_id,
+                "query": query_id,
+                "query_type": "exact_terms",
+                "language": "en",
+                "source_language": "en",
+                "topic": "topic",
+                "configuration": {"id": config_id, "alpha": alpha, "beta": 1.0 - alpha},
+                "reciprocal_rank": rr,
+                "primary_rank": rank,
+                "recall_at": {"10": recall10},
+                "document_recall_at": {"10": doc10},
+            }
+
+        config_ids = [c[0] for c in [
+            ("dense_100_sparse_000",),
+            ("dense_080_sparse_020",),
+            ("dense_065_sparse_035",),
+            ("dense_050_sparse_050",),
+            ("dense_035_sparse_065",),
+            ("dense_020_sparse_080",),
+            ("dense_000_sparse_100",),
+        ]]
+        items = []
+        cases = {
+            "dense_win": (1.0, 0.5, 0.75),
+            "sparse_win": (0.5, 1.0, 0.75),
+            "tie": (1.0, 1.0, 1.0),
+            "both_miss": (0.0, 0.0, 0.0),
+            "hybrid_beats_both": (0.5, 0.5, 1.0),
+        }
+        for query_id, (dense_rr, sparse_rr, hybrid_rr) in cases.items():
+            for config_id in config_ids:
+                rr = dense_rr if config_id == "dense_100_sparse_000" else sparse_rr if config_id == "dense_000_sparse_100" else hybrid_rr
+                items.append(metric(query_id, config_id, rr, recall10=int(rr > 0), doc10=int(rr > 0), rank=1 if rr else None))
+        items.append(metric("doc_hit", "dense_100_sparse_000", 0.0, recall10=0, doc10=1, rank=None))
+        for config_id in config_ids[1:]:
+            items.append(metric("doc_hit", config_id, 0.0, recall10=0, doc10=0, rank=None))
+
+        pairwise = {item["query_id"]: item for item in build_pairwise_queries(items)}
+
+        self.assertEqual(pairwise["dense_win"]["dense_vs_sparse_class"], "dense_win")
+        self.assertEqual(pairwise["sparse_win"]["dense_vs_sparse_class"], "sparse_win")
+        self.assertEqual(pairwise["tie"]["dense_vs_sparse_class"], "tie")
+        self.assertEqual(pairwise["both_miss"]["dense_vs_sparse_class"], "both_miss")
+        self.assertEqual(pairwise["doc_hit"]["dense_vs_sparse_class"], "dense_block_miss_document_hit")
+        self.assertEqual(pairwise["hybrid_beats_both"]["hybrid_comparison_class"], "hybrid_beats_both")
+
+    def test_analyze_run_writes_completed_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, dataset = self._write_synthetic_evaluation_run(Path(tmp))
+            evaluation = evaluate_direct_retrieval_run(run_dir=run_dir, dataset_path=dataset)
+
+            report = analyze_direct_retrieval_evaluation(evaluation_dir=Path(evaluation["evaluation_dir"]), dataset_path=dataset)
+
+            self.assertEqual(report["status"], "completed")
+            self.assertEqual(report["query_count"], 120)
+            self.assertEqual(report["configuration_count"], 7)
+            self.assertEqual(report["breakdown_dimensions"], 5)
+            self.assertEqual(report["pairwise_record_count"], 120)
+            analysis_dir = Path(report["analysis_dir"])
+            self.assertEqual(len((analysis_dir / "pairwise_queries.jsonl").read_text().splitlines()), 120)
+            breakdowns = json.loads((analysis_dir / "breakdowns.json").read_text(encoding="utf-8"))
+            self.assertEqual(set(breakdowns["dimensions"]), {"query_type", "language", "source_language", "language_direction", "topic"})
+            self.assertIn("Dense vs sparse", (analysis_dir / "report.md").read_text(encoding="utf-8"))
+            manifest = json.loads((analysis_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "completed")
+            self.assertEqual(manifest["pairwise_record_count"], 120)
+
+    def test_analyze_run_rejects_hash_and_summary_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, dataset = self._write_synthetic_evaluation_run(Path(tmp))
+            evaluation = evaluate_direct_retrieval_run(run_dir=run_dir, dataset_path=dataset)
+            dataset.write_text(dataset.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+            report = analyze_direct_retrieval_evaluation(evaluation_dir=Path(evaluation["evaluation_dir"]), dataset_path=dataset)
+            self.assertEqual(report["status"], "failed")
+            self.assertIn("SHA256", report["error"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, dataset = self._write_synthetic_evaluation_run(Path(tmp))
+            evaluation = evaluate_direct_retrieval_run(run_dir=run_dir, dataset_path=dataset)
+            summary_path = Path(evaluation["evaluation_dir"]) / "summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary["metrics"][0]["mrr"] = 0.123
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+            report = analyze_direct_retrieval_evaluation(evaluation_dir=Path(evaluation["evaluation_dir"]), dataset_path=dataset)
+            self.assertEqual(report["status"], "failed")
+            self.assertIn("summary mismatch", report["error"])
 
     def test_query_and_context_direct_scores_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

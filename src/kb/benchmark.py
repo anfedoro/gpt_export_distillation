@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import sqlite3
+import statistics
 import sys
 import time
 from collections import Counter
@@ -29,6 +30,9 @@ QUERY_RESULT_SCHEMA_VERSION = "kb.benchmark.query_result.v1"
 QUERY_METRICS_SCHEMA_VERSION = "kb.benchmark.query_metrics.v1"
 EVALUATION_SCHEMA_VERSION = "kb.benchmark.evaluation.v1"
 EVALUATION_MANIFEST_SCHEMA_VERSION = "kb.benchmark.evaluation_manifest.v1"
+ANALYSIS_MANIFEST_SCHEMA_VERSION = "kb.benchmark.analysis_manifest.v1"
+BREAKDOWNS_SCHEMA_VERSION = "kb.benchmark.breakdowns.v1"
+PAIRWISE_QUERY_SCHEMA_VERSION = "kb.benchmark.pairwise_query.v1"
 METRIC_K_VALUES = (1, 5, 10, 20)
 DEFAULT_DENSE_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_SPARSE_MODEL = "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1"
@@ -68,6 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--run-dir", required=True)
     evaluate.add_argument("--dataset", required=True)
     evaluate.add_argument("--output-dir")
+    analyze = sub.add_parser("analyze", help="Analyze an existing direct-retrieval evaluation.")
+    analyze.add_argument("--evaluation-dir", required=True)
+    analyze.add_argument("--dataset", required=True)
+    analyze.add_argument("--output-dir")
     return parser
 
 
@@ -102,6 +110,14 @@ def main() -> int:
     if args.command == "evaluate":
         report = evaluate_direct_retrieval_run(
             run_dir=Path(args.run_dir).expanduser(),
+            dataset_path=Path(args.dataset).expanduser(),
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0 if report["status"] == "completed" else 1
+    if args.command == "analyze":
+        report = analyze_direct_retrieval_evaluation(
+            evaluation_dir=Path(args.evaluation_dir).expanduser(),
             dataset_path=Path(args.dataset).expanduser(),
             output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
         )
@@ -751,6 +767,89 @@ def evaluate_direct_retrieval_run(
         }
 
 
+def analyze_direct_retrieval_evaluation(
+    *,
+    evaluation_dir: Path,
+    dataset_path: Path,
+    output_dir: Path | None = None,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    analysis_dir = output_dir or (evaluation_dir / "analysis")
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = analysis_dir / "manifest.json"
+    manifest: dict[str, Any] = {
+        "schema_version": ANALYSIS_MANIFEST_SCHEMA_VERSION,
+        "status": "failed",
+        "source_evaluation_dir": str(evaluation_dir),
+        "source_evaluation_manifest_sha256": None,
+        "query_metrics_sha256": None,
+        "dataset_sha256": None,
+        "query_count": 0,
+        "configuration_count": 0,
+        "breakdown_record_count": 0,
+        "pairwise_record_count": 0,
+        "created_at_utc": datetime.now(UTC).isoformat(),
+        "timing_ms": {"input_validation": 0.0, "analysis": 0.0, "artifact_writing": 0.0, "total": 0.0},
+    }
+    try:
+        validation_started = time.perf_counter()
+        loaded = _load_and_validate_analysis_inputs(evaluation_dir=evaluation_dir, dataset_path=dataset_path)
+        validation_finished = time.perf_counter()
+        manifest.update(
+            {
+                "source_evaluation_manifest_sha256": _sha256(evaluation_dir / "manifest.json"),
+                "query_metrics_sha256": _sha256(evaluation_dir / "query_metrics.jsonl"),
+                "dataset_sha256": loaded["dataset_sha256"],
+                "query_count": len(loaded["dataset_records"]),
+                "configuration_count": len(loaded["configurations"]),
+            }
+        )
+        manifest["timing_ms"]["input_validation"] = _elapsed_ms(validation_started, validation_finished)
+
+        analysis_started = time.perf_counter()
+        breakdowns = build_breakdowns(loaded["query_metrics"], loaded["configurations"])
+        pairwise = build_pairwise_queries(loaded["query_metrics"])
+        analysis_finished = time.perf_counter()
+        manifest["timing_ms"]["analysis"] = _elapsed_ms(analysis_started, analysis_finished)
+
+        write_started = time.perf_counter()
+        breakdowns_path = analysis_dir / "breakdowns.json"
+        pairwise_path = analysis_dir / "pairwise_queries.jsonl"
+        report_path = analysis_dir / "report.md"
+        breakdowns_path.write_text(json.dumps(breakdowns, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        pairwise_path.write_text("".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in pairwise), encoding="utf-8")
+        report_path.write_text(_render_analysis_report(loaded["summary"], breakdowns, pairwise), encoding="utf-8")
+        write_finished = time.perf_counter()
+        manifest["breakdown_record_count"] = sum(
+            len(slice_item["configurations"])
+            for dimension in breakdowns["dimensions"].values()
+            for slice_item in dimension
+        )
+        manifest["pairwise_record_count"] = len(pairwise)
+        manifest["timing_ms"]["artifact_writing"] = _elapsed_ms(write_started, write_finished)
+        manifest["timing_ms"]["total"] = _elapsed_ms(started, time.perf_counter())
+        manifest["status"] = "completed"
+        _write_manifest(manifest_path, manifest)
+        return {
+            "status": "completed",
+            "analysis_dir": str(analysis_dir),
+            "manifest": str(manifest_path),
+            "breakdowns": str(breakdowns_path),
+            "pairwise_queries": str(pairwise_path),
+            "report": str(report_path),
+            "query_count": manifest["query_count"],
+            "configuration_count": manifest["configuration_count"],
+            "breakdown_dimensions": len(breakdowns["dimensions"]),
+            "pairwise_record_count": len(pairwise),
+            "timing_ms": manifest["timing_ms"],
+        }
+    except Exception as exc:
+        manifest["error"] = str(exc)
+        manifest["timing_ms"]["total"] = _elapsed_ms(started, time.perf_counter())
+        _write_manifest(manifest_path, manifest)
+        return {"status": "failed", "analysis_dir": str(analysis_dir), "manifest": str(manifest_path), "error": str(exc)}
+
+
 def calculate_query_metrics(result_record: dict[str, Any], dataset_record: dict[str, Any]) -> dict[str, Any]:
     expected_from_dataset = {item["block_id"]: int(item["relevance"]) for item in dataset_record["expected"]}
     expected_from_result = {item["block_id"]: item for item in result_record["expected"]}
@@ -815,6 +914,164 @@ def calculate_query_metrics(result_record: dict[str, Any], dataset_record: dict[
         "document_recall_at": document_recall_at,
         "conversation_recall_at": conversation_recall_at,
     }
+
+
+def build_breakdowns(query_metrics: list[dict[str, Any]], configurations: list[dict[str, Any]]) -> dict[str, Any]:
+    dimensions = {
+        "query_type": lambda item: item["query_type"],
+        "language": lambda item: item["language"],
+        "source_language": lambda item: item["source_language"],
+        "language_direction": lambda item: f"{item['source_language']}->{item['language']}",
+        "topic": lambda item: item["topic"],
+    }
+    output: dict[str, list[dict[str, Any]]] = {}
+    config_ids = [config["id"] for config in configurations]
+    for dimension, key_fn in dimensions.items():
+        query_ids_by_value: dict[str, set[str]] = {}
+        metrics_by_value: dict[str, list[dict[str, Any]]] = {}
+        for item in query_metrics:
+            value = str(key_fn(item))
+            query_ids_by_value.setdefault(value, set()).add(item["query_id"])
+            metrics_by_value.setdefault(value, []).append(item)
+        slices: list[dict[str, Any]] = []
+        for value in sorted(metrics_by_value):
+            items = metrics_by_value[value]
+            query_count = len(query_ids_by_value[value])
+            per_config = []
+            for config in configurations:
+                config_items = [item for item in items if item["configuration"]["id"] == config["id"]]
+                per_config.append(_slice_metrics(config, config_items))
+            slices.append(
+                {
+                    "value": value,
+                    "query_count": query_count,
+                    "small_sample": query_count < 10,
+                    "best_configuration": _best_configurations(per_config),
+                    "configurations": per_config,
+                }
+            )
+        output[dimension] = slices
+    return {"schema_version": BREAKDOWNS_SCHEMA_VERSION, "dimensions": output, "configuration_ids": config_ids}
+
+
+def build_pairwise_queries(query_metrics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_query: dict[str, dict[str, dict[str, Any]]] = {}
+    for item in query_metrics:
+        by_query.setdefault(item["query_id"], {})[item["configuration"]["id"]] = item
+    records: list[dict[str, Any]] = []
+    hybrid_ids = [
+        "dense_080_sparse_020",
+        "dense_065_sparse_035",
+        "dense_050_sparse_050",
+        "dense_035_sparse_065",
+        "dense_020_sparse_080",
+    ]
+    for query_id in sorted(by_query):
+        configs = by_query[query_id]
+        dense = configs["dense_100_sparse_000"]
+        sparse = configs["dense_000_sparse_100"]
+        dense_rr = float(dense["reciprocal_rank"])
+        sparse_rr = float(sparse["reciprocal_rank"])
+        best_hybrid = max((configs[config_id] for config_id in hybrid_ids), key=lambda item: (float(item["reciprocal_rank"]), item["configuration"]["alpha"], item["configuration"]["id"]))
+        best_hybrid_rr = float(best_hybrid["reciprocal_rank"])
+        record = {
+            "schema_version": PAIRWISE_QUERY_SCHEMA_VERSION,
+            "query_id": query_id,
+            "query": dense["query"],
+            "query_type": dense["query_type"],
+            "language": dense["language"],
+            "source_language": dense["source_language"],
+            "language_direction": f"{dense['source_language']}->{dense['language']}",
+            "topic": dense["topic"],
+            "dense_reciprocal_rank": dense_rr,
+            "sparse_reciprocal_rank": sparse_rr,
+            "rr_delta": sparse_rr - dense_rr,
+            "dense_primary_rank": dense["primary_rank"],
+            "sparse_primary_rank": sparse["primary_rank"],
+            "dense_recall_at_10": dense["recall_at"]["10"],
+            "sparse_recall_at_10": sparse["recall_at"]["10"],
+            "dense_document_recall_at_10": dense["document_recall_at"]["10"],
+            "sparse_document_recall_at_10": sparse["document_recall_at"]["10"],
+            "dense_vs_sparse_class": _dense_sparse_class(dense, sparse),
+            "best_hybrid_configuration": best_hybrid["configuration"]["id"],
+            "best_hybrid_rr": best_hybrid_rr,
+            "hybrid_comparison_class": _hybrid_class(best_hybrid_rr, dense_rr, sparse_rr),
+        }
+        records.append(record)
+    return records
+
+
+def _slice_metrics(config: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, Any]:
+    if not items:
+        raise ValueError(f"empty slice for configuration {config['id']}")
+    ranks = [int(item["primary_rank"]) for item in items if item["primary_rank"] is not None]
+    return {
+        "configuration": config,
+        "query_count": len(items),
+        "recall_at": _average_at(items, "recall_at"),
+        "mrr": _average_scalar(items, "reciprocal_rank"),
+        "ndcg_at": _average_at(items, "ndcg_at"),
+        "document_recall_at": _average_at(items, "document_recall_at"),
+        "conversation_recall_at": _average_at(items, "conversation_recall_at"),
+        "mean_primary_rank": (sum(ranks) / len(ranks)) if ranks else None,
+        "median_primary_rank": statistics.median(ranks) if ranks else None,
+        "primary_miss_count": len(items) - len(ranks),
+    }
+
+
+def _best_configurations(config_metrics: list[dict[str, Any]]) -> dict[str, str]:
+    return {
+        "mrr": _best_config(config_metrics, lambda item: item["mrr"]),
+        "recall_at_10": _best_config(config_metrics, lambda item: item["recall_at"]["10"]),
+        "ndcg_at_10": _best_config(config_metrics, lambda item: item["ndcg_at"]["10"]),
+    }
+
+
+def _best_config(config_metrics: list[dict[str, Any]], metric_fn) -> str:
+    best = max(
+        config_metrics,
+        key=lambda item: (
+            float(metric_fn(item)),
+            float(item["configuration"]["alpha"]),
+            _reverse_lex_key(str(item["configuration"]["id"])),
+        ),
+    )
+    return str(best["configuration"]["id"])
+
+
+def _reverse_lex_key(value: str) -> tuple[int, ...]:
+    return tuple(-ord(char) for char in value)
+
+
+def _dense_sparse_class(dense: dict[str, Any], sparse: dict[str, Any]) -> str:
+    dense_rr = float(dense["reciprocal_rank"])
+    sparse_rr = float(sparse["reciprocal_rank"])
+    if dense["recall_at"]["10"] == 0 and dense["document_recall_at"]["10"] == 1:
+        return "dense_block_miss_document_hit"
+    if sparse["recall_at"]["10"] == 0 and sparse["document_recall_at"]["10"] == 1:
+        return "sparse_block_miss_document_hit"
+    if dense_rr == 0.0 and sparse_rr == 0.0:
+        return "both_miss"
+    if dense_rr > sparse_rr:
+        base = "dense_win"
+    elif sparse_rr > dense_rr:
+        base = "sparse_win"
+    else:
+        base = "tie"
+    return base
+
+
+def _hybrid_class(best_hybrid_rr: float, dense_rr: float, sparse_rr: float) -> str:
+    best_endpoint = max(dense_rr, sparse_rr)
+    if best_hybrid_rr > dense_rr and best_hybrid_rr > sparse_rr:
+        return "hybrid_beats_both"
+    if best_hybrid_rr > dense_rr and best_hybrid_rr <= sparse_rr:
+        return "hybrid_beats_dense_only"
+    if best_hybrid_rr > sparse_rr and best_hybrid_rr <= dense_rr:
+        return "hybrid_beats_sparse_only"
+    if best_hybrid_rr == best_endpoint:
+        return "hybrid_equals_best_endpoint"
+    return "hybrid_worse_than_best_endpoint"
 
 
 def _load_and_validate_evaluation_inputs(*, run_dir: Path, dataset_path: Path) -> dict[str, Any]:
@@ -888,6 +1145,122 @@ def _load_and_validate_evaluation_inputs(*, run_dir: Path, dataset_path: Path) -
         "configurations": configurations,
         "results": results,
     }
+
+
+def _load_and_validate_analysis_inputs(*, evaluation_dir: Path, dataset_path: Path) -> dict[str, Any]:
+    manifest_path = evaluation_dir / "manifest.json"
+    query_metrics_path = evaluation_dir / "query_metrics.jsonl"
+    summary_path = evaluation_dir / "summary.json"
+    if not manifest_path.exists():
+        raise ValueError(f"evaluation manifest does not exist: {manifest_path}")
+    if not query_metrics_path.exists():
+        raise ValueError(f"query_metrics.jsonl does not exist: {query_metrics_path}")
+    if not summary_path.exists():
+        raise ValueError(f"summary.json does not exist: {summary_path}")
+    if not dataset_path.exists():
+        raise ValueError(f"dataset does not exist: {dataset_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != EVALUATION_MANIFEST_SCHEMA_VERSION:
+        raise ValueError(f"unsupported evaluation manifest schema_version: {manifest.get('schema_version')}")
+    if manifest.get("status") != "completed":
+        raise ValueError(f"evaluation manifest status must be completed, got {manifest.get('status')}")
+    dataset_sha256 = _sha256(dataset_path)
+    if manifest.get("dataset_sha256") != dataset_sha256:
+        raise ValueError("dataset SHA256 does not match evaluation manifest")
+    if manifest.get("query_count") != 120:
+        raise ValueError(f"evaluation query_count must be 120, got {manifest.get('query_count')}")
+    if manifest.get("configuration_count") != 7:
+        raise ValueError(f"evaluation configuration_count must be 7, got {manifest.get('configuration_count')}")
+    if manifest.get("query_metric_records") != 840:
+        raise ValueError(f"query_metric_records must be 840, got {manifest.get('query_metric_records')}")
+    dataset_records = _load_dataset_records(dataset_path)
+    dataset_by_id = {record["id"]: record for record in dataset_records}
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if summary.get("schema_version") != EVALUATION_SCHEMA_VERSION:
+        raise ValueError(f"unsupported summary schema_version: {summary.get('schema_version')}")
+    configurations = [item["configuration"] for item in summary["metrics"]]
+    query_metrics = _load_query_metric_records(query_metrics_path)
+    _validate_query_metrics_against_dataset(query_metrics, dataset_by_id, configurations)
+    recomputed = _aggregate_query_metrics(
+        run_manifest={"run_id": summary["run_id"], "completed_queries": len(dataset_records)},
+        dataset_sha256=dataset_sha256,
+        query_metrics=query_metrics,
+        configurations=configurations,
+    )
+    _assert_summary_close(recomputed, summary)
+    return {
+        "manifest": manifest,
+        "summary": summary,
+        "dataset_sha256": dataset_sha256,
+        "dataset_records": dataset_records,
+        "dataset_by_id": dataset_by_id,
+        "query_metrics": query_metrics,
+        "configurations": configurations,
+    }
+
+
+def _load_query_metric_records(path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"query_metrics.jsonl line {line_no}: invalid JSON: {exc}") from exc
+        if record.get("schema_version") != QUERY_METRICS_SCHEMA_VERSION:
+            raise ValueError(f"query_metrics.jsonl line {line_no}: unsupported schema_version")
+        records.append(record)
+    return records
+
+
+def _validate_query_metrics_against_dataset(
+    query_metrics: list[dict[str, Any]],
+    dataset_by_id: dict[str, dict[str, Any]],
+    configurations: list[dict[str, Any]],
+) -> None:
+    if len(query_metrics) != 840:
+        raise ValueError(f"query_metrics must contain 840 records, got {len(query_metrics)}")
+    config_by_id = {config["id"]: config for config in configurations}
+    expected_pairs = {(query_id, config_id) for query_id in dataset_by_id for config_id in config_by_id}
+    seen: set[tuple[str, str]] = set()
+    for record in query_metrics:
+        query_id = record["query_id"]
+        config_id = record["configuration"]["id"]
+        if query_id not in dataset_by_id:
+            raise ValueError(f"query metric query_id not in dataset: {query_id}")
+        dataset_record = dataset_by_id[query_id]
+        for field in ("query_type", "language", "source_language", "topic"):
+            if record.get(field) != dataset_record.get(field):
+                raise ValueError(f"{query_id}: {field} mismatch between query metrics and dataset")
+        if config_id not in config_by_id:
+            raise ValueError(f"{query_id}: configuration not in summary: {config_id}")
+        if record["configuration"] != config_by_id[config_id]:
+            raise ValueError(f"{query_id}: configuration payload mismatch")
+        pair = (query_id, config_id)
+        if pair in seen:
+            raise ValueError(f"duplicate query/configuration metric: {query_id} {config_id}")
+        seen.add(pair)
+    missing = expected_pairs - seen
+    if missing:
+        raise ValueError(f"missing query/configuration metrics: {sorted(missing)[:3]}")
+
+
+def _assert_summary_close(actual: dict[str, Any], expected: dict[str, Any], tolerance: float = 1e-9) -> None:
+    if actual["query_count"] != expected["query_count"] or actual["configuration_count"] != expected["configuration_count"]:
+        raise ValueError("summary counts do not match recomputed metrics")
+    expected_by_id = {item["configuration"]["id"]: item for item in expected["metrics"]}
+    for actual_item in actual["metrics"]:
+        expected_item = expected_by_id.get(actual_item["configuration"]["id"])
+        if expected_item is None:
+            raise ValueError(f"summary missing configuration {actual_item['configuration']['id']}")
+        for field in ("recall_at", "primary_recall_at", "ndcg_at", "document_recall_at", "conversation_recall_at"):
+            for key, value in actual_item[field].items():
+                if abs(float(value) - float(expected_item[field][key])) > tolerance:
+                    raise ValueError(f"summary mismatch for {actual_item['configuration']['id']} {field}@{key}")
+        for field in ("mrr", "primary_mrr"):
+            if abs(float(actual_item[field]) - float(expected_item[field])) > tolerance:
+                raise ValueError(f"summary mismatch for {actual_item['configuration']['id']} {field}")
 
 
 def _load_result_records(results_path: Path) -> list[dict[str, Any]]:
@@ -1052,6 +1425,130 @@ def _render_evaluation_report(summary: dict[str, Any]) -> str:
 
 def _fmt(value: float) -> str:
     return f"{value:.4f}"
+
+
+def _render_analysis_report(summary: dict[str, Any], breakdowns: dict[str, Any], pairwise: list[dict[str, Any]]) -> str:
+    lines = [
+        "# Direct Retrieval Breakdown Analysis",
+        "",
+        "## Overall",
+        "",
+        "| Configuration | R@1 | R@5 | R@10 | R@20 | MRR | nDCG@10 | Doc R@10 | Conv R@10 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for item in summary["metrics"]:
+        lines.append(_overall_row(item))
+    lines += ["", "## By query type", ""]
+    lines += _breakdown_table(breakdowns, "query_type", "Query type")
+    lines += ["", "## By language", "", "### Query language", ""]
+    lines += _breakdown_table(breakdowns, "language", "Query language")
+    lines += ["", "### Source language", ""]
+    lines += _breakdown_table(breakdowns, "source_language", "Source language")
+    lines += ["", "### Language direction", ""]
+    lines += _breakdown_table(breakdowns, "language_direction", "Language direction")
+    lines += ["", "## By topic", ""]
+    lines += _breakdown_table(breakdowns, "topic", "Topic")
+
+    dense_counts = Counter(item["dense_vs_sparse_class"] for item in pairwise)
+    lines += [
+        "",
+        "## Dense vs sparse",
+        "",
+        "| Class | Count |",
+        "|---|---:|",
+    ]
+    for label in ("dense_win", "sparse_win", "tie", "both_miss", "dense_block_miss_document_hit", "sparse_block_miss_document_hit"):
+        lines.append(f"| {label} | {dense_counts.get(label, 0)} |")
+
+    hybrid_counts = Counter(item["hybrid_comparison_class"] for item in pairwise)
+    lines += [
+        "",
+        "## Hybrid contribution",
+        "",
+        "| Class | Count |",
+        "|---|---:|",
+    ]
+    for label in (
+        "hybrid_beats_both",
+        "hybrid_beats_dense_only",
+        "hybrid_beats_sparse_only",
+        "hybrid_equals_best_endpoint",
+        "hybrid_worse_than_best_endpoint",
+    ):
+        lines.append(f"| {label} | {hybrid_counts.get(label, 0)} |")
+
+    sparse_better = sorted([item for item in pairwise if item["rr_delta"] > 0], key=lambda item: item["rr_delta"], reverse=True)[:15]
+    dense_better = sorted([item for item in pairwise if item["rr_delta"] < 0], key=lambda item: item["rr_delta"])[:15]
+    lines += ["", "## Largest disagreements", "", "### Sparse over dense", ""]
+    lines += _disagreement_table(sparse_better)
+    lines += ["", "### Dense over sparse", ""]
+    lines += _disagreement_table(dense_better)
+
+    block_miss_doc_hit = [
+        item
+        for item in pairwise
+        if (item["dense_recall_at_10"] == 0 and item["dense_document_recall_at_10"] == 1)
+        or (item["sparse_recall_at_10"] == 0 and item["sparse_document_recall_at_10"] == 1)
+    ][:20]
+    lines += ["", "## Block miss but document hit", ""]
+    lines += _block_miss_table(block_miss_doc_hit)
+    return "\n".join(lines) + "\n"
+
+
+def _overall_row(item: dict[str, Any]) -> str:
+    return (
+        f"| {item['configuration']['id']} | {_fmt(item['recall_at']['1'])} | {_fmt(item['recall_at']['5'])} | "
+        f"{_fmt(item['recall_at']['10'])} | {_fmt(item['recall_at']['20'])} | {_fmt(item['mrr'])} | "
+        f"{_fmt(item['ndcg_at']['10'])} | {_fmt(item['document_recall_at']['10'])} | {_fmt(item['conversation_recall_at']['10'])} |"
+    )
+
+
+def _breakdown_table(breakdowns: dict[str, Any], dimension: str, label: str) -> list[str]:
+    lines = [
+        f"| {label} | N | Configuration | R@1 | R@5 | R@10 | MRR | nDCG@10 | Doc R@10 |",
+        "|---|---:|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for slice_item in breakdowns["dimensions"][dimension]:
+        value = slice_item["value"] + (" (small sample)" if slice_item["small_sample"] else "")
+        for config in slice_item["configurations"]:
+            lines.append(
+                f"| {value} | {slice_item['query_count']} | {config['configuration']['id']} | "
+                f"{_fmt(config['recall_at']['1'])} | {_fmt(config['recall_at']['5'])} | {_fmt(config['recall_at']['10'])} | "
+                f"{_fmt(config['mrr'])} | {_fmt(config['ndcg_at']['10'])} | {_fmt(config['document_recall_at']['10'])} |"
+            )
+    return lines
+
+
+def _disagreement_table(items: list[dict[str, Any]]) -> list[str]:
+    lines = [
+        "| Query ID | Query type | Topic | Direction | Dense rank | Sparse rank | Dense RR | Sparse RR | RR delta |",
+        "|---|---|---|---|---:|---:|---:|---:|---:|",
+    ]
+    for item in items:
+        lines.append(
+            f"| {item['query_id']} | {item['query_type']} | {item['topic']} | {item['language_direction']} | "
+            f"{_rank_display(item['dense_primary_rank'])} | {_rank_display(item['sparse_primary_rank'])} | "
+            f"{_fmt(item['dense_reciprocal_rank'])} | {_fmt(item['sparse_reciprocal_rank'])} | {_fmt(item['rr_delta'])} |"
+        )
+    return lines
+
+
+def _block_miss_table(items: list[dict[str, Any]]) -> list[str]:
+    lines = [
+        "| Query ID | Query type | Topic | Direction | Dense rank | Sparse rank | Dense Doc R@10 | Sparse Doc R@10 |",
+        "|---|---|---|---|---:|---:|---:|---:|",
+    ]
+    for item in items:
+        lines.append(
+            f"| {item['query_id']} | {item['query_type']} | {item['topic']} | {item['language_direction']} | "
+            f"{_rank_display(item['dense_primary_rank'])} | {_rank_display(item['sparse_primary_rank'])} | "
+            f"{item['dense_document_recall_at_10']} | {item['sparse_document_recall_at_10']} |"
+        )
+    return lines
+
+
+def _rank_display(rank: Any) -> str:
+    return "" if rank is None else str(rank)
 
 
 def _load_dataset_records(dataset_path: Path) -> list[dict[str, Any]]:
