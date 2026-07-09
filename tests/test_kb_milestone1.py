@@ -19,7 +19,7 @@ from kb.cli import _chunked_embedding_space_id, build_edges_command, build_nodes
 from kb.benchmark import DirectRetrievalSession, RankingConfig, analyze_direct_retrieval_evaluation, build_breakdowns, build_pairwise_queries, calculate_query_metrics, default_ranking_configs, evaluate_direct_retrieval_run, run_direct_retrieval_benchmark, validate_direct_retrieval_dataset  # noqa: E402
 from kb.canary.multilingual_dense import run_canary  # noqa: E402
 from kb.canary.real_data import _probe_metrics, _reject_unsafe_output_path, _validate_content_budget, load_or_create_manifest, validate_source_offsets  # noqa: E402
-from kb.fusion_eval import SNAPSHOT_SCHEMA, SnapshotRow, _score_variant, evaluate_raw_score_snapshot  # noqa: E402
+from kb.fusion_eval import SNAPSHOT_SCHEMA, SnapshotRow, _lexical_overlap, _rescue_analysis, _score_variant, evaluate_raw_score_snapshot  # noqa: E402
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider  # noqa: E402
@@ -193,6 +193,16 @@ def _static_sparse_terms(text: str) -> dict[str, float]:
 
 
 class KBMilestone1Tests(unittest.TestCase):
+    def test_fusion_lexical_overlap_and_rescue_counts(self) -> None:
+        from kb.canary.real_data import RealProbe
+
+        probe = RealProbe("p", "different conceptual wording", "en", "c", "m", "strong_paraphrase", transformation_type="strong_paraphrase", source_language="en")
+        lexical = _lexical_overlap(probe, "unrelated source vocabulary")
+        self.assertEqual(lexical["shared_normalized_terms"], [])
+        records = lambda rank: [{"probe_id": "p", "transformation_type": "strong_paraphrase", "message_rank": rank}]
+        rescue = _rescue_analysis(dense_records=records(4), sparse_records=records(31), rrf_records=records(3))
+        self.assertEqual(len(rescue["dense_rescues"]), 1)
+        self.assertEqual(rescue["counts"]["dense_only_wins"], 1)
     def test_rrf_uses_branch_ranks_and_candidate_union(self) -> None:
         rows = [
             SnapshotRow("p", "dense", "b", 1, "m1", "c", "assistant", "prose", 0.9, 0.0, 1, 3),
@@ -218,7 +228,7 @@ class KBMilestone1Tests(unittest.TestCase):
             root = Path(tmp)
             probes = {
                 "schema_version": "kb.real_data_preflight.probes.v1",
-                "probes": [{"probe_id": "p", "query": "private", "query_language": "en", "expected_conversation_id": "c1", "expected_message_id": "m1", "probe_type": "code"}],
+                "probes": [{"probe_id": "p", "query": "private", "query_language": "en", "source_language": "ru", "transformation_type": "RU->EN", "expected_conversation_id": "c1", "expected_message_id": "m1"}],
             }
             probe_path = root / "probes.json"
             probe_path.write_text(json.dumps(probes), encoding="utf-8")

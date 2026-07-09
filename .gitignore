@@ -25,6 +25,7 @@ wheels/
 benchmarks/runs/
 benchmarks/real_data_preflight/
 benchmarks/fusion_eval/
+benchmarks/semantic_mismatch_eval/
 
 # Private local preflight manifests, probes, and filtered source samples
 .local/
