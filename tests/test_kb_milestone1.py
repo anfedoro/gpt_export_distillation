@@ -1056,6 +1056,17 @@ class KBMilestone1Tests(unittest.TestCase):
         query_args = parser.parse_args(["query", "memory routing", "--db", "chat_memory.db"])
         context_args = parser.parse_args(["context", "memory routing", "--db", "chat_memory.db"])
         import_args = index_parser.parse_args(["import", "--input", "export", "--db", "chat_memory.db"])
+        explicit_policy_args = index_parser.parse_args(
+            [
+                "import",
+                "--input",
+                "export",
+                "--db",
+                "chat_memory.db",
+                "--chunk-policy",
+                "canonical_token_chunks:v2",
+            ]
+        )
         mcp_args = mcp_parser.parse_args(["--db", "chat_memory.db"])
 
         self.assertEqual(
@@ -1068,6 +1079,7 @@ class KBMilestone1Tests(unittest.TestCase):
         )
         self.assertEqual(query_args.sparse_model, import_args.sparse_model)
         self.assertEqual(query_args.sparse_model, mcp_args.sparse_model)
+        self.assertEqual(explicit_policy_args.chunk_policy, "canonical_token_chunks:v2")
 
     def test_dense_runtime_metadata_mismatch_does_not_block_lookup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
