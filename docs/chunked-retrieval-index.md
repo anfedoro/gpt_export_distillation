@@ -109,6 +109,27 @@ paths. It also validates the requested content budget against the safe contract
 of **every** active provider before parsing or embedding. It never silently
 reduces a requested budget or falls back from MPS to CPU.
 
+## Fusion Snapshot Evaluation
+
+Fusion experiments are split deliberately. `snapshot` loads providers once and
+stores only private per-chunk raw scores, never query text or query vectors.
+`evaluate` is file-only: it loads no models, does not open the DB, and can
+repeat normalized weights, RRF, candidate unions, and message-max aggregation.
+
+```bash
+kb-retrieval-fusion-eval snapshot \
+  --db /Users/anfedoro/Downloads/gpt-export-30.06.2026/preflight_bge_m3_506.db \
+  --probe-file .local/preflight/bge_m3_real_probes.json \
+  --output-dir benchmarks/fusion_eval/<timestamp> \
+  --dense-device mps --sparse-device mps \
+  --dense-torch-dtype float16 --sparse-torch-dtype float16
+
+kb-retrieval-fusion-eval evaluate \
+  --snapshot benchmarks/fusion_eval/<timestamp>/raw_scores.jsonl \
+  --probe-file .local/preflight/bge_m3_real_probes.json \
+  --output-dir benchmarks/fusion_eval/<timestamp>/evaluation
+```
+
 ## Rebuild Path
 
 Databases created with block-level embeddings should be rebuilt from the distilled Markdown archive:
