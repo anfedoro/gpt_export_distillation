@@ -49,6 +49,8 @@ class RealProbe:
     expected_role: str | None = None
     expected_block_type: str | None = None
     notes: str | None = None
+    transformation_type: str = "unspecified"
+    source_language: str | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:

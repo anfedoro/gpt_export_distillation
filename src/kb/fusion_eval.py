@@ -124,6 +124,7 @@ def create_raw_score_snapshot(
     providers_loaded_s = time.perf_counter() - started
     session = DirectRetrievalSession(db_path=db_path, dense_provider=dense, sparse_provider=sparse, chunk_policy=policy)
     source_messages, source_conversations = _source_identity_maps(db_path)
+    source_texts = _source_message_texts(db_path)
     metadata = _chunk_metadata(db_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     snapshot_path = output_dir / "raw_scores.jsonl"
@@ -167,6 +168,7 @@ def create_raw_score_snapshot(
         "devices": {"dense": dense_device, "sparse": sparse_device},
         "dtypes": {"dense": dense_torch_dtype, "sparse": sparse_torch_dtype},
         "timing_ms": {"providers_load": providers_loaded_s * 1000, "corpus_load": session.corpus_load_ms, "queries": query_timing, "total": (time.perf_counter() - started) * 1000},
+        "lexical_overlap": [_lexical_overlap(probe, source_texts.get(probe.expected_message_id, "")) for probe in probes],
     }
     manifest_path = output_dir / "snapshot_manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
@@ -185,6 +187,7 @@ def evaluate_raw_score_snapshot(
     probes = _load_probes(probe_path)
     rows = _load_snapshot(snapshot_path)
     grouped = _group_snapshot(rows, probes)
+    snapshot_manifest = _load_snapshot_manifest(snapshot_path)
     started = time.perf_counter()
     variants = _build_variants(candidate_ks, rrf_k)
     all_results: list[dict[str, Any]] = []
@@ -214,10 +217,16 @@ def evaluate_raw_score_snapshot(
         "chunk_count": len(next(iter(grouped.values()))),
         "current_fusion": {"formula": "0.65 * dense_cosine + 0.35 * sparse_cosine", "normalization": "none", "candidate_pool": "all chunks", "missing_score": "zero", "tie_break": "chunk_id ascending"},
         "candidate_pool_analysis": _candidate_pool_analysis(probes, grouped, candidate_ks),
+        "lexical_overlap": snapshot_manifest.get("lexical_overlap", []),
         "variants": all_results,
         "best_variant": best,
         "baseline_sparse_only": baseline,
         "miss_diagnostics": diagnostics,
+        "rescue_analysis": _rescue_analysis(
+            dense_records=per_variant["dense_only"]["records"],
+            sparse_records=per_variant["sparse_only"]["records"],
+            rrf_records=per_variant["rrf_k60_union_20"]["records"],
+        ),
         "verdict": verdict,
         "recommendation": _recommendation(best, baseline),
         "timing_ms": {"evaluation": (time.perf_counter() - started) * 1000},
@@ -236,7 +245,12 @@ def _load_probes(path: Path) -> list[RealProbe]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("schema_version") != PROBES_SCHEMA:
         raise ValueError("Unsupported probe manifest schema.")
-    return [RealProbe(**item) for item in payload["probes"]]
+    probes = []
+    for item in payload["probes"]:
+        normalized = dict(item)
+        normalized.setdefault("probe_type", normalized.get("transformation_type", "unspecified"))
+        probes.append(RealProbe(**normalized))
+    return probes
 
 
 def _load_chunk_policy(db_path: Path) -> ChunkPolicy:
@@ -256,6 +270,42 @@ def _chunk_metadata(db_path: Path) -> dict[str, dict[str, Any]]:
     with SQLiteStore(db_path, read_only=True) as store:
         rows = store.conn.execute("SELECT id, ordinal FROM retrieval_chunks").fetchall()
     return {str(row["id"]): {"chunk_ordinal": int(row["ordinal"])} for row in rows}
+
+
+def _source_message_texts(db_path: Path) -> dict[str, str]:
+    with SQLiteStore(db_path, read_only=True) as store:
+        rows = store.conn.execute("SELECT message_id, raw_text FROM messages WHERE message_id IS NOT NULL").fetchall()
+    return {str(row["message_id"]): str(row["raw_text"]) for row in rows}
+
+
+def _load_snapshot_manifest(snapshot_path: Path) -> dict[str, Any]:
+    path = snapshot_path.with_name("snapshot_manifest.json")
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != SNAPSHOT_MANIFEST_SCHEMA:
+        raise ValueError("Unsupported snapshot manifest schema.")
+    return payload
+
+
+def _lexical_overlap(probe: RealProbe, source_text: str) -> dict[str, Any]:
+    query_terms = _normalized_terms(probe.query)
+    source_terms = _normalized_terms(source_text)
+    shared = sorted(query_terms & source_terms)
+    union = query_terms | source_terms
+    return {
+        "probe_id": probe.probe_id,
+        "shared_normalized_terms": shared[:20],
+        "query_term_count": len(query_terms),
+        "source_term_count": len(source_terms),
+        "term_jaccard": len(shared) / len(union) if union else 0.0,
+        "query_term_coverage": len(shared) / len(query_terms) if query_terms else 0.0,
+        "suspiciously_high": len(query_terms) >= 3 and len(shared) / len(query_terms) >= 0.60,
+    }
+
+
+def _normalized_terms(text: str) -> set[str]:
+    return {item.lower() for item in re.findall(r"[^\W_]{2,}", text, flags=re.UNICODE)}
 
 
 def _ranks(scores: Any, chunk_ids: list[str]) -> dict[str, int]:
@@ -327,7 +377,7 @@ def _evaluate_probe(probe: RealProbe, rows: list[SnapshotRow], variant: dict[str
     expected_chunk_rank = min((chunk_ranks.get(row.chunk_id) for row in expected_rows if row.chunk_id in chunk_ranks), default=None)
     expected_message_rank = message_ranks.get(probe.expected_message_id)
     expected_conversation_rank = conversation_ranks.get(probe.expected_conversation_id)
-    return {"probe_id": probe.probe_id, "probe_type": probe.probe_type, "query_language": probe.query_language, "expected_message_id": probe.expected_message_id, "expected_conversation_id": probe.expected_conversation_id, "expected_chunk_ids": [row.chunk_id for row in expected_rows], "chunk_rank": expected_chunk_rank, "message_rank": expected_message_rank, "conversation_rank": expected_conversation_rank, "supporting_chunk_id": messages.get(probe.expected_message_id, (None, 0.0))[0].chunk_id if probe.expected_message_id in messages else None, "top_chunks": [_row_for_report(row, score, chunk_ranks[row.chunk_id]) for row, score in chunk_order[:20]], "latency_ms": (time.perf_counter() - started) * 1000}
+    return {"probe_id": probe.probe_id, "probe_type": probe.probe_type, "transformation_type": probe.transformation_type, "query_language": probe.query_language, "source_language": probe.source_language, "expected_message_id": probe.expected_message_id, "expected_conversation_id": probe.expected_conversation_id, "expected_chunk_ids": [row.chunk_id for row in expected_rows], "chunk_rank": expected_chunk_rank, "message_rank": expected_message_rank, "conversation_rank": expected_conversation_rank, "supporting_chunk_id": messages.get(probe.expected_message_id, (None, 0.0))[0].chunk_id if probe.expected_message_id in messages else None, "top_chunks": [_row_for_report(row, score, chunk_ranks[row.chunk_id]) for row, score in chunk_order[:20]], "latency_ms": (time.perf_counter() - started) * 1000}
 
 
 def _score_variant(rows: list[SnapshotRow], variant: dict[str, Any]) -> list[tuple[SnapshotRow, float]]:
@@ -364,8 +414,10 @@ def _metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
 def _breakdown(records: list[dict[str, Any]]) -> dict[str, Any]:
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in records:
-        groups[row["probe_type"]].append(row)
+        groups[row["transformation_type"]].append(row)
         groups[f"query_language:{row['query_language']}"] .append(row)
+        if row["source_language"] in {"ru", "en"} and row["query_language"] in {"ru", "en"}:
+            groups[f"{row['source_language'].upper()}->{row['query_language'].upper()}"] .append(row)
     return {key: {"count": len(value), "message_recall_at_10": sum(1 for row in value if row["message_rank"] and row["message_rank"] <= 10) / len(value), "message_mrr": sum(1 / row["message_rank"] for row in value if row["message_rank"]) / len(value)} for key, value in sorted(groups.items())}
 
 
@@ -430,6 +482,40 @@ def _candidate_pool_analysis(probes: list[RealProbe], grouped: dict[str, list[Sn
     return output
 
 
+def _rescue_analysis(
+    *,
+    dense_records: list[dict[str, Any]],
+    sparse_records: list[dict[str, Any]],
+    rrf_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    dense = {row["probe_id"]: row for row in dense_records}
+    sparse = {row["probe_id"]: row for row in sparse_records}
+    rrf = {row["probe_id"]: row for row in rrf_records}
+    dense_rescues = []
+    sparse_rescues = []
+    rrf_rescues = []
+    dense_wins = sparse_wins = both_hit = both_miss = 0
+    for probe_id, dense_row in dense.items():
+        sparse_row, rrf_row = sparse[probe_id], rrf[probe_id]
+        dense_rank, sparse_rank, rrf_rank = dense_row["message_rank"], sparse_row["message_rank"], rrf_row["message_rank"]
+        record = {"probe_id": probe_id, "transformation_type": dense_row["transformation_type"], "dense_rank": dense_rank, "sparse_rank": sparse_rank, "rrf_rank": rrf_rank}
+        if dense_rank and dense_rank <= 20 and (not sparse_rank or sparse_rank > 20):
+            dense_rescues.append(record)
+        if sparse_rank and sparse_rank <= 20 and (not dense_rank or dense_rank > 20):
+            sparse_rescues.append(record)
+        if (not dense_rank or dense_rank > 10) and (not sparse_rank or sparse_rank > 10) and rrf_rank and rrf_rank <= 10:
+            rrf_rescues.append(record)
+        if dense_rank and dense_rank <= 10 and (not sparse_rank or sparse_rank > 20):
+            dense_wins += 1
+        elif sparse_rank and sparse_rank <= 10 and (not dense_rank or dense_rank > 20):
+            sparse_wins += 1
+        elif dense_rank and dense_rank <= 10 and sparse_rank and sparse_rank <= 10:
+            both_hit += 1
+        elif (not dense_rank or dense_rank > 20) and (not sparse_rank or sparse_rank > 20):
+            both_miss += 1
+    return {"dense_rescues": dense_rescues, "sparse_rescues": sparse_rescues, "rrf_rescues": rrf_rescues, "counts": {"dense_only_wins": dense_wins, "sparse_only_wins": sparse_wins, "both_hit_at_10": both_hit, "both_miss_at_20": both_miss}}
+
+
 def _meets_sparse_guard(metrics: dict[str, Any], baseline: dict[str, Any]) -> bool:
     return metrics["message_recall_at"]["10"] >= baseline["message_recall_at"]["10"] and metrics["message_recall_at"]["20"] >= baseline["message_recall_at"]["20"] and metrics["message_mrr"] >= baseline["message_mrr"] - 0.01
 
@@ -463,6 +549,21 @@ def _markdown_report(report: dict[str, Any]) -> str:
     for item in report["variants"]:
         metric, latency = item["metrics"], item["latency_ms"]
         lines.append(f"| {item['id']} | {metric['message_recall_at']['10']:.3f} | {metric['message_recall_at']['20']:.3f} | {metric['message_mrr']:.3f} | {metric['chunk_recall_at']['20']:.3f} | {metric['conversation_recall_at']['20']:.3f} | {latency['p50']:.3f} |")
+    lexical = report.get("lexical_overlap", [])
+    if lexical:
+        suspicious = [item["probe_id"] for item in lexical if item.get("suspiciously_high")]
+        lines.extend(["", "## Lexical-overlap Diagnostics", "", f"- probes: {len(lexical)}", f"- suspiciously high query-term overlap: {', '.join(suspicious) if suspicious else 'none'}", "- query and source text are intentionally omitted from this local report."])
+    rescues = report.get("rescue_analysis", {})
+    if rescues:
+        counts = rescues.get("counts", {})
+        lines.extend(["", "## Branch Contribution", "", f"- dense rescues@20: {len(rescues.get('dense_rescues', []))}", f"- sparse rescues@20: {len(rescues.get('sparse_rescues', []))}", f"- RRF rescues@10: {len(rescues.get('rrf_rescues', []))}", f"- dense-only wins@10: {counts.get('dense_only_wins', 0)}", f"- sparse-only wins@10: {counts.get('sparse_only_wins', 0)}"])
+    key_variants = [item for item in report["variants"] if item["id"] in {"dense_only", "sparse_only", "current_weighted_065_035", "rrf_k60_union_20"}]
+    categories = sorted({key for item in key_variants for key in item["metrics"]["breakdown"] if not key.startswith("query_language:")})
+    if categories:
+        lines.extend(["", "## Breakdown: Message R@10", "", "| Category | " + " | ".join(item["id"] for item in key_variants) + " |", "|---|" + "|".join("---:" for _ in key_variants) + "|"])
+        for category in categories:
+            values = [item["metrics"]["breakdown"].get(category, {}).get("message_recall_at_10", 0.0) for item in key_variants]
+            lines.append("| " + category + " | " + " | ".join(f"{value:.3f}" for value in values) + " |")
     lines.extend(["", "## Recommendation", "", report["recommendation"], "", "## Miss Diagnostics", ""])
     for miss in report["miss_diagnostics"]:
         lines.append(f"- `{miss['probe_id']}`: dense rank {miss['expected_dense_rank']}, sparse rank {miss['expected_sparse_rank']}, classification `{miss['classification']}`. Content relevance requires private human review.")
