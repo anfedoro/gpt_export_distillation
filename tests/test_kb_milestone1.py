@@ -19,6 +19,7 @@ from kb.cli import _chunked_embedding_space_id, build_edges_command, build_nodes
 from kb.benchmark import DirectRetrievalSession, RankingConfig, analyze_direct_retrieval_evaluation, build_breakdowns, build_pairwise_queries, calculate_query_metrics, default_ranking_configs, evaluate_direct_retrieval_run, run_direct_retrieval_benchmark, validate_direct_retrieval_dataset  # noqa: E402
 from kb.canary.multilingual_dense import run_canary  # noqa: E402
 from kb.canary.real_data import _probe_metrics, _reject_unsafe_output_path, _validate_content_budget, load_or_create_manifest, validate_source_offsets  # noqa: E402
+from kb.fusion_eval import SNAPSHOT_SCHEMA, SnapshotRow, _score_variant, evaluate_raw_score_snapshot  # noqa: E402
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider  # noqa: E402
@@ -192,6 +193,54 @@ def _static_sparse_terms(text: str) -> dict[str, float]:
 
 
 class KBMilestone1Tests(unittest.TestCase):
+    def test_rrf_uses_branch_ranks_and_candidate_union(self) -> None:
+        rows = [
+            SnapshotRow("p", "dense", "b", 1, "m1", "c", "assistant", "prose", 0.9, 0.0, 1, 3),
+            SnapshotRow("p", "sparse", "b", 2, "m2", "c", "assistant", "prose", 0.0, 0.9, 3, 1),
+            SnapshotRow("p", "both", "b", 3, "m3", "c", "assistant", "prose", 0.8, 0.8, 2, 2),
+        ]
+        scores = dict((row.chunk_id, score) for row, score in _score_variant(rows, {"kind": "rrf", "pool": 2, "rrf_k": 60}))
+        self.assertEqual(set(scores), {"dense", "sparse", "both"})
+        self.assertAlmostEqual(scores["both"], 2 / 62)
+        self.assertGreater(scores["both"], scores["dense"])
+
+    def test_fusion_missing_branch_score_is_zero_not_penalty(self) -> None:
+        rows = [
+            SnapshotRow("p", "sparse-hit", "b", 1, "m1", "c", "assistant", "prose", 0.0, 0.9, 2, 1),
+            SnapshotRow("p", "dense-hit", "b", 2, "m2", "c", "assistant", "prose", 0.9, 0.0, 1, 2),
+        ]
+        scores = dict((row.chunk_id, score) for row, score in _score_variant(rows, {"kind": "raw", "dense_weight": 0.1, "sparse_weight": 0.9, "pool": None}))
+        self.assertAlmostEqual(scores["sparse-hit"], 0.81)
+        self.assertGreater(scores["sparse-hit"], scores["dense-hit"])
+
+    def test_fusion_evaluation_is_file_only_and_message_max_aggregation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            probes = {
+                "schema_version": "kb.real_data_preflight.probes.v1",
+                "probes": [{"probe_id": "p", "query": "private", "query_language": "en", "expected_conversation_id": "c1", "expected_message_id": "m1", "probe_type": "code"}],
+            }
+            probe_path = root / "probes.json"
+            probe_path.write_text(json.dumps(probes), encoding="utf-8")
+            rows = [
+                {"schema_version": SNAPSHOT_SCHEMA, "probe_id": "p", "chunk_id": "a", "block_id": "b", "chunk_ordinal": 1, "source_message_id": "m1", "source_conversation_id": "c1", "role": "assistant", "block_type": "code", "dense_score": 0.2, "sparse_score": 0.9, "dense_rank": 3, "sparse_rank": 1},
+                {"schema_version": SNAPSHOT_SCHEMA, "probe_id": "p", "chunk_id": "b", "block_id": "b", "chunk_ordinal": 2, "source_message_id": "m1", "source_conversation_id": "c1", "role": "assistant", "block_type": "code", "dense_score": 0.1, "sparse_score": 0.8, "dense_rank": 4, "sparse_rank": 2},
+                {"schema_version": SNAPSHOT_SCHEMA, "probe_id": "p", "chunk_id": "c", "block_id": "b", "chunk_ordinal": 1, "source_message_id": "m2", "source_conversation_id": "c2", "role": "assistant", "block_type": "prose", "dense_score": 0.9, "sparse_score": 0.1, "dense_rank": 1, "sparse_rank": 3},
+                {"schema_version": SNAPSHOT_SCHEMA, "probe_id": "p", "chunk_id": "d", "block_id": "b", "chunk_ordinal": 1, "source_message_id": "m3", "source_conversation_id": "c3", "role": "assistant", "block_type": "prose", "dense_score": 0.8, "sparse_score": 0.0, "dense_rank": 2, "sparse_rank": 4},
+            ]
+            snapshot = root / "raw_scores.jsonl"
+            snapshot.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            with patch("kb.fusion_eval._build_dense_provider", side_effect=AssertionError("providers must not be loaded")), patch("kb.fusion_eval.SQLiteStore", side_effect=AssertionError("DB must not be opened")):
+                report = evaluate_raw_score_snapshot(snapshot_path=snapshot, probe_path=probe_path, output_dir=root / "out")
+                repeated = evaluate_raw_score_snapshot(snapshot_path=snapshot, probe_path=probe_path, output_dir=root / "out-repeated")
+            self.assertEqual(report["status"], "completed")
+            self.assertEqual(
+                [(item["id"], item["metrics"]) for item in report["variants"]],
+                [(item["id"], item["metrics"]) for item in repeated["variants"]],
+            )
+            sparse = next(item for item in report["variants"] if item["id"] == "sparse_only")
+            self.assertEqual(sparse["metrics"]["message_recall_at"]["1"], 1.0)
+            self.assertTrue(Path(report["report_json"]).exists())
     def test_real_preflight_manifest_selection_is_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "export"
