@@ -15,11 +15,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from kb.cli import build_edges_command, build_nodes_command, build_parser as build_index_parser, embed_knowledge_blocks, import_knowledge_base, ingest_attachments, ingest_chats  # noqa: E402
+from kb.cli import _chunked_embedding_space_id, build_edges_command, build_nodes_command, build_parser as build_index_parser, embed_knowledge_blocks, import_knowledge_base, ingest_attachments, ingest_chats  # noqa: E402
 from kb.benchmark import DirectRetrievalSession, RankingConfig, analyze_direct_retrieval_evaluation, build_breakdowns, build_pairwise_queries, calculate_query_metrics, default_ranking_configs, evaluate_direct_retrieval_run, run_direct_retrieval_benchmark, validate_direct_retrieval_dataset  # noqa: E402
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider  # noqa: E402
+from kb.index.chunk_builder import build_chunk_policy, build_retrieval_chunks  # noqa: E402
 from kb.mcp.server import ServerConfig, build_parser as build_mcp_parser, handle_request  # noqa: E402
 from kb.retrieval.context_pack import ContextPackOptions, build_context_pack  # noqa: E402
 from kb.retrieval.hybrid_search import QUERY_RESULT_SCHEMA_VERSION, build_parser as build_search_parser, hybrid_query, main as kb_search_main  # noqa: E402
@@ -64,8 +65,10 @@ flowchart TD
 
 class StaticDenseProvider:
     model_name = "static-dense"
-    embedding_space_id = "static-dense;dim=2;normalize=false;symmetric=true"
+    effective_max_sequence_length = 64
+    embedding_space_id = "static-dense;dim=2;normalize=false;symmetric=true;max_seq=64"
     runtime_metadata = {"backend": "test"}
+    document_prefix = ""
 
     @property
     def model_version(self) -> str:
@@ -82,6 +85,18 @@ class StaticDenseProvider:
     def embed_query(self, query: str) -> list[float]:
         self.query_calls += 1
         return [1.0, 0.0]
+
+    def embedding_input(self, text: str) -> str:
+        return text
+
+    def token_count(self, text: str) -> int:
+        return len(text.split()) or (1 if text else 0)
+
+    def assert_fits(self, text: str, *, chunk_id: str, block_id: str, source_identity: str) -> int:
+        count = self.token_count(self.embedding_input(text))
+        if count > self.effective_max_sequence_length:
+            raise ValueError("over limit")
+        return count
 
 
 class RuntimeVariantDenseProvider(StaticDenseProvider):
@@ -102,8 +117,10 @@ class IncompatibleDenseProvider(StaticDenseProvider):
 
 class StaticSparseProvider:
     model_name = "static-sparse"
-    embedding_space_id = "static-sparse;document_encoder=documents;query_encoder=query;top_k=all"
+    effective_max_sequence_length = 64
+    embedding_space_id = "static-sparse;document_encoder=documents;query_encoder=query;top_k=all;max_seq=64"
     runtime_metadata = {"backend": "test"}
+    document_prefix = ""
 
     @property
     def model_version(self) -> str:
@@ -120,6 +137,18 @@ class StaticSparseProvider:
     def embed_query(self, query: str) -> dict[str, float]:
         self.query_calls += 1
         return {"sparse": 1.0}
+
+    def embedding_input(self, text: str) -> str:
+        return text
+
+    def token_count(self, text: str) -> int:
+        return len(text.split()) or (1 if text else 0)
+
+    def assert_fits(self, text: str, *, chunk_id: str, block_id: str, source_identity: str) -> int:
+        count = self.token_count(self.embedding_input(text))
+        if count > self.effective_max_sequence_length:
+            raise ValueError("over limit")
+        return count
 
 
 class SpySparseEncoder:
@@ -160,6 +189,98 @@ def _static_sparse_terms(text: str) -> dict[str, float]:
 
 
 class KBMilestone1Tests(unittest.TestCase):
+    def test_long_prose_is_split_into_tokenizer_aware_chunks_with_full_coverage(self) -> None:
+        provider = MockDenseProvider(max_sequence_length=16)
+        policy = build_chunk_policy([provider])
+        text = " ".join(f"token{i}" for i in range(80))
+        chunks = build_retrieval_chunks(
+            block_id="block-long",
+            block_text=text,
+            block_char_start=10,
+            policy=policy,
+            tokenizer_provider=provider,
+        )
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(chunk.token_count <= policy.content_token_budget for chunk in chunks))
+        ranges = sorted((chunk.source_char_start, chunk.source_char_end) for chunk in chunks)
+        covered = set()
+        for start, end in ranges:
+            covered.update(range(start, end))
+        self.assertEqual(covered, set(range(10, 10 + len(text))))
+        self.assertLess(chunks[1].source_char_start, chunks[0].source_char_end)
+
+    def test_chunk_offsets_preserve_cyrillic_emoji_and_mixed_text(self) -> None:
+        provider = MockDenseProvider(max_sequence_length=12)
+        policy = build_chunk_policy([provider])
+        text = "Привет 😀 memory routing\nСледующая строка с SIP и VoLTE"
+        chunks = build_retrieval_chunks(
+            block_id="block-unicode",
+            block_text=text,
+            block_char_start=3,
+            policy=policy,
+            tokenizer_provider=provider,
+        )
+
+        for chunk in chunks:
+            local_start = chunk.source_char_start - 3
+            local_end = chunk.source_char_end - 3
+            self.assertEqual(chunk.text, text[local_start:local_end])
+
+    def test_provider_assert_fits_rejects_over_limit_embedding_input(self) -> None:
+        provider = MockDenseProvider(max_sequence_length=4)
+        with self.assertRaisesRegex(ValueError, "Embedding input exceeds provider limit"):
+            provider.assert_fits(
+                "one two three four five",
+                chunk_id="chunk-over",
+                block_id="block-over",
+                source_identity="message-over",
+            )
+
+    def test_embedding_pipeline_writes_chunk_representations_and_searches_late_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            chat_dir = root / "Projects" / "Project_17"
+            chat_dir.mkdir(parents=True)
+            long_prefix = " ".join(f"filler{i}" for i in range(90))
+            late_terms = "late searchable sentinel protocol aware tokenization"
+            chat = SAMPLE_CHAT.replace("How should memory write routing work?", f"{long_prefix} {late_terms}")
+            (chat_dir / "chat.md").write_text(chat, encoding="utf-8")
+            db = Path(tmp) / "chat_memory.db"
+
+            ingest_chats(root, db, limit=10)
+            embed_knowledge_blocks(
+                db_path=db,
+                provider="mock",
+                dense_provider="mock",
+                sparse_provider="mock",
+                batch_size=4,
+            )
+            payload = hybrid_query(
+                db_path=db,
+                query="sentinel protocol aware tokenization",
+                dense_provider="mock",
+                sparse_provider="mock",
+                alpha=0.0,
+                beta=1.0,
+                limit=5,
+            )
+
+            self.assertGreater(payload["candidate_blocks"], 0)
+            self.assertGreater(payload["results"][0]["sparse_score"], 0.0)
+            self.assertGreater(payload["results"][0]["source_char_start"], 0)
+            with SQLiteStore(db) as store:
+                table_stats = store.stats()
+                self.assertGreater(table_stats["retrieval_chunks"], table_stats["blocks"])
+                self.assertEqual(
+                    store.conn.execute("SELECT COUNT(*) FROM dense_vectors WHERE owner_type != 'retrieval_chunk'").fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    store.conn.execute("SELECT COUNT(*) FROM sparse_terms WHERE owner_type != 'retrieval_chunk'").fetchone()[0],
+                    0,
+                )
+
     def _static_retrieval_db(self, tmp: str) -> Path:
         root = Path(tmp) / "export"
         chat_dir = root / "Projects" / "Project_17"
@@ -177,34 +298,52 @@ class KBMilestone1Tests(unittest.TestCase):
         ingest_chats(root, db, limit=10)
         dense = StaticDenseProvider()
         sparse = StaticSparseProvider()
+        policy = build_chunk_policy([dense, sparse])
         with SQLiteStore(db) as store:
-            rows = store.conn.execute(
-                "SELECT id, text_for_embedding FROM knowledge_blocks ORDER BY text_for_embedding"
-            ).fetchall()
+            store.rebuild_retrieval_chunks(policy=policy, tokenizer_provider=dense, skip_low_interest_content=True)
+            dense_space_id = _chunked_embedding_space_id(dense.embedding_space_id, policy.id)
+            sparse_space_id = _chunked_embedding_space_id(sparse.embedding_space_id, policy.id)
+            rows = store.conn.execute("SELECT id, text FROM retrieval_chunks ORDER BY text").fetchall()
             for row in rows:
-                text = str(row["text_for_embedding"])
-                dense_vector_id = store.upsert_dense_vector(
-                    owner_type="knowledge_block",
+                text = str(row["text"])
+                store.upsert_dense_vector(
+                    owner_type="retrieval_chunk",
                     owner_id=str(row["id"]),
                     model_name=dense.model_name,
-                    model_version=dense.model_version,
+                    model_version=dense_space_id,
                     runtime_metadata_json=json.dumps(dense.runtime_metadata, sort_keys=True),
                     vector=dense.embed_documents([text])[0],
                 )
-                sparse_vector_id = store.replace_sparse_terms(
-                    owner_type="knowledge_block",
+                store.replace_sparse_terms(
+                    owner_type="retrieval_chunk",
                     owner_id=str(row["id"]),
                     model_name=sparse.model_name,
-                    embedding_space_id=sparse.embedding_space_id,
+                    embedding_space_id=sparse_space_id,
                     terms=sparse.embed_documents([text])[0],
-                )
-                store.set_knowledge_block_vector_ids(
-                    knowledge_block_id=str(row["id"]),
-                    dense_vector_id=dense_vector_id,
-                    sparse_vector_id=sparse_vector_id,
                 )
             store.commit()
         return db
+
+    def _first_chunk_row(self, db: Path, *, descending: bool = False):
+        order = "DESC" if descending else "ASC"
+        with SQLiteStore(db) as store:
+            return store.conn.execute(
+                f"""
+                SELECT
+                    rc.id,
+                    sd.relative_path,
+                    c.id AS conversation_id,
+                    m.id AS message_id,
+                    rc.text AS text_for_display
+                FROM retrieval_chunks rc
+                JOIN blocks b ON b.id = rc.block_id
+                JOIN messages m ON m.id = b.message_id
+                JOIN conversations c ON c.id = m.conversation_id
+                JOIN source_documents sd ON sd.id = c.source_document_id
+                ORDER BY rc.id {order}
+                LIMIT 1
+                """
+            ).fetchone()
 
     def _single_block_dataset_record(
         self,
@@ -216,16 +355,7 @@ class KBMilestone1Tests(unittest.TestCase):
         language: str = "en",
         source_language: str = "en",
     ) -> dict:
-        with SQLiteStore(db) as store:
-            row = store.conn.execute(
-                """
-                SELECT kb.id, sd.relative_path, kb.conversation_id, kb.message_id
-                FROM knowledge_blocks kb
-                JOIN source_documents sd ON sd.id = kb.source_document_id
-                ORDER BY kb.id
-                LIMIT 1
-                """
-            ).fetchone()
+        row = self._first_chunk_row(db)
         return {
             "id": record_id,
             "query": query,
@@ -510,15 +640,16 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertEqual(second["candidate_blocks"], 0)
             with SQLiteStore(db) as store:
                 stats = store.stats()
-                linked = store.conn.execute(
-                    """
-                    SELECT COUNT(*) FROM knowledge_blocks
-                    WHERE dense_vector_id IS NOT NULL AND sparse_vector_id IS NOT NULL
-                    """
+                dense_chunk_vectors = store.conn.execute(
+                    "SELECT COUNT(*) FROM dense_vectors WHERE owner_type = 'retrieval_chunk'"
                 ).fetchone()[0]
-            self.assertEqual(stats["dense_vectors"], stats["knowledge_blocks"])
+                sparse_chunk_vectors = store.conn.execute(
+                    "SELECT COUNT(DISTINCT owner_id) FROM sparse_terms WHERE owner_type = 'retrieval_chunk'"
+                ).fetchone()[0]
+            self.assertEqual(stats["dense_vectors"], stats["retrieval_chunks"])
+            self.assertEqual(dense_chunk_vectors, stats["retrieval_chunks"])
+            self.assertEqual(sparse_chunk_vectors, stats["retrieval_chunks"])
             self.assertGreater(stats["sparse_terms"], 0)
-            self.assertEqual(linked, stats["knowledge_blocks"])
 
     def test_embed_limit_does_not_round_up_to_full_batch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -566,13 +697,14 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertEqual(stats["dense_vectors"], 3)
             self.assertEqual(stats["sparse_vectors"], 3)
             with SQLiteStore(db) as store:
-                linked = store.conn.execute(
-                    """
-                    SELECT COUNT(*) FROM knowledge_blocks
-                    WHERE dense_vector_id IS NOT NULL AND sparse_vector_id IS NOT NULL
-                    """
+                dense_chunks = store.conn.execute(
+                    "SELECT COUNT(*) FROM dense_vectors WHERE owner_type = 'retrieval_chunk'"
                 ).fetchone()[0]
-            self.assertEqual(linked, 3)
+                sparse_chunks = store.conn.execute(
+                    "SELECT COUNT(DISTINCT owner_id) FROM sparse_terms WHERE owner_type = 'retrieval_chunk'"
+                ).fetchone()[0]
+            self.assertEqual(dense_chunks, 3)
+            self.assertEqual(sparse_chunks, 3)
 
     def test_low_interest_content_is_skipped_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -856,16 +988,8 @@ class KBMilestone1Tests(unittest.TestCase):
             (chat_dir / "chat.md").write_text(SAMPLE_CHAT, encoding="utf-8")
             db = Path(tmp) / "chat_memory.db"
             ingest_chats(root, db, limit=10)
-            with SQLiteStore(db) as store:
-                row = store.conn.execute(
-                    """
-                    SELECT kb.id, sd.relative_path, kb.conversation_id, kb.message_id
-                    FROM knowledge_blocks kb
-                    JOIN source_documents sd ON sd.id = kb.source_document_id
-                    ORDER BY kb.id
-                    LIMIT 1
-                    """
-                ).fetchone()
+            embed_knowledge_blocks(db_path=db, provider="mock", dense_provider="mock", sparse_provider="mock")
+            row = self._first_chunk_row(db)
             dataset = Path(tmp) / "dataset.jsonl"
             dataset.write_text(
                 json.dumps(
@@ -907,8 +1031,8 @@ class KBMilestone1Tests(unittest.TestCase):
             (chat_dir / "chat.md").write_text(SAMPLE_CHAT, encoding="utf-8")
             db = Path(tmp) / "chat_memory.db"
             ingest_chats(root, db, limit=10)
-            with SQLiteStore(db) as store:
-                row = store.conn.execute("SELECT id, conversation_id, message_id FROM knowledge_blocks LIMIT 1").fetchone()
+            embed_knowledge_blocks(db_path=db, provider="mock", dense_provider="mock", sparse_provider="mock")
+            row = self._first_chunk_row(db)
             dataset = Path(tmp) / "dataset.jsonl"
             dataset.write_text(
                 json.dumps(
@@ -1137,22 +1261,13 @@ class KBMilestone1Tests(unittest.TestCase):
             scores.dense_scores[:] = 0.0
             results, _, _ = session.rank(scores, RankingConfig("dense_100_sparse_000", 1.0, 0.0), top_k=10)
 
-            block_ids = [item["block_id"] for item in results]
-            self.assertEqual(block_ids, sorted(block_ids))
+            chunk_ids = [item["chunk_id"] for item in results]
+            self.assertEqual(chunk_ids, sorted(chunk_ids))
 
     def test_benchmark_run_writes_manifest_and_results_from_single_raw_scores(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = self._static_retrieval_db(tmp)
-            with SQLiteStore(db) as store:
-                rows = store.conn.execute(
-                    """
-                    SELECT kb.id, sd.relative_path, kb.conversation_id, kb.message_id, kb.text_for_display
-                    FROM knowledge_blocks kb
-                    JOIN source_documents sd ON sd.id = kb.source_document_id
-                    ORDER BY kb.id
-                    LIMIT 2
-                    """
-                ).fetchall()
+            rows = [self._first_chunk_row(db), self._first_chunk_row(db, descending=True)]
             dataset = Path(tmp) / "dataset.jsonl"
             dataset.write_text(
                 "".join(
@@ -1190,7 +1305,7 @@ class KBMilestone1Tests(unittest.TestCase):
                 db_path=db,
                 dataset_path=dataset,
                 output_dir=output_dir,
-                top_k=10,
+                top_k=50,
                 dense_provider_name="mock",
                 sparse_provider_name="mock",
                 dense_provider=dense,
@@ -1210,10 +1325,10 @@ class KBMilestone1Tests(unittest.TestCase):
             per_query = [row for row in results if row["query_id"] == "query-1"]
             self.assertEqual(len(per_query), len(default_ranking_configs()))
             first_scores = {
-                item["block_id"]: (item["dense_score"], item["sparse_score"]) for item in per_query[0]["top_results"]
+                item["chunk_id"]: (item["dense_score"], item["sparse_score"]) for item in per_query[0]["top_results"]
             }
             last_scores = {
-                item["block_id"]: (item["dense_score"], item["sparse_score"]) for item in per_query[-1]["top_results"]
+                item["chunk_id"]: (item["dense_score"], item["sparse_score"]) for item in per_query[-1]["top_results"]
             }
             self.assertEqual(first_scores, last_scores)
             for row in results:
@@ -1231,16 +1346,7 @@ class KBMilestone1Tests(unittest.TestCase):
     def test_benchmark_run_keeps_expected_rank_outside_top_k(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = self._static_retrieval_db(tmp)
-            with SQLiteStore(db) as store:
-                row = store.conn.execute(
-                    """
-                    SELECT kb.id, sd.relative_path, kb.conversation_id, kb.message_id
-                    FROM knowledge_blocks kb
-                    JOIN source_documents sd ON sd.id = kb.source_document_id
-                    ORDER BY kb.id DESC
-                    LIMIT 1
-                    """
-                ).fetchone()
+            row = self._first_chunk_row(db, descending=True)
             dataset = Path(tmp) / "dataset.jsonl"
             dataset.write_text(
                 json.dumps(
@@ -1288,16 +1394,7 @@ class KBMilestone1Tests(unittest.TestCase):
     def test_benchmark_run_builds_providers_and_loads_corpus_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = self._static_retrieval_db(tmp)
-            with SQLiteStore(db) as store:
-                row = store.conn.execute(
-                    """
-                    SELECT kb.id, sd.relative_path, kb.conversation_id, kb.message_id
-                    FROM knowledge_blocks kb
-                    JOIN source_documents sd ON sd.id = kb.source_document_id
-                    ORDER BY kb.id
-                    LIMIT 1
-                    """
-                ).fetchone()
+            row = self._first_chunk_row(db)
             dataset = Path(tmp) / "dataset.jsonl"
             dataset.write_text(
                 "\n".join(
@@ -1694,7 +1791,7 @@ class KBMilestone1Tests(unittest.TestCase):
                 ),
             )
 
-            query_scores = {item["block_id"]: item["final_score"] for item in query_payload["results"]}
+            query_scores = {item["chunk_id"]: item["final_score"] for item in query_payload["results"]}
             context_scores = {
                 trace["block_id"]: trace["score"]
                 for trace in context_payload["source_trace"]
@@ -1754,7 +1851,7 @@ class KBMilestone1Tests(unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(node_types, ["conversation", "project"])
             self.assertEqual(member_count, first["memberships_created"])
-            self.assertEqual(node_vector_count, 2)
+            self.assertEqual(node_vector_count, 0)
 
     def test_build_edges_creates_idempotent_similarity_edges(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1789,11 +1886,11 @@ class KBMilestone1Tests(unittest.TestCase):
                     "SELECT COUNT(*) FROM semantic_edges WHERE edge_kind = 'sparse_overlap' AND shared_terms_json IS NOT NULL"
                 ).fetchone()[0]
             self.assertIn("temporal_neighbor", edge_kinds)
-            self.assertIn("dense_sim", edge_kinds)
-            self.assertIn("sparse_overlap", edge_kinds)
-            self.assertIn("hybrid_sim", edge_kinds)
+            self.assertNotIn("dense_sim", edge_kinds)
+            self.assertNotIn("sparse_overlap", edge_kinds)
+            self.assertNotIn("hybrid_sim", edge_kinds)
             self.assertEqual(policy_versions, ["similarity-edges-v0"])
-            self.assertGreater(shared_terms_rows, 0)
+            self.assertEqual(shared_terms_rows, 0)
 
     def test_build_edges_without_embeddings_skips_similarity_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

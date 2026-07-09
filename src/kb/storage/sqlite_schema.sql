@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 
 INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES (2);
 
 CREATE TABLE IF NOT EXISTS source_documents (
     id TEXT PRIMARY KEY,
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     id TEXT PRIMARY KEY,
     message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    parent_block_id TEXT REFERENCES blocks(id) ON DELETE CASCADE,
     ordinal INTEGER NOT NULL,
     block_type TEXT NOT NULL,
     language TEXT,
@@ -68,6 +70,19 @@ CREATE TABLE IF NOT EXISTS blocks (
     char_end INTEGER NOT NULL,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     UNIQUE(message_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS retrieval_chunks (
+    id TEXT PRIMARY KEY,
+    block_id TEXT NOT NULL REFERENCES blocks(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    source_char_start INTEGER NOT NULL,
+    source_char_end INTEGER NOT NULL,
+    token_count INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    chunk_policy_id TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(block_id, chunk_policy_id, ordinal)
 );
 
 CREATE TABLE IF NOT EXISTS attachment_documents (
@@ -189,5 +204,6 @@ CREATE INDEX IF NOT EXISTS idx_source_documents_kind ON source_documents(source_
 CREATE INDEX IF NOT EXISTS idx_source_documents_interest ON source_documents(interest_tier);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_blocks_conversation ON blocks(conversation_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_retrieval_chunks_block ON retrieval_chunks(block_id, chunk_policy_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_knowledge_blocks_project ON knowledge_blocks(project_id, folder_kind, block_type);
 CREATE INDEX IF NOT EXISTS idx_knowledge_blocks_interest ON knowledge_blocks(interest_tier);

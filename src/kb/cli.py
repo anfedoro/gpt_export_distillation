@@ -17,6 +17,7 @@ from kb.embeddings.sentence_transformer_provider import (
     SentenceTransformerDenseProvider,
     SentenceTransformerSparseProvider,
 )
+from kb.index.chunk_builder import build_chunk_policy
 from kb.index.edge_builder import build_similarity_edges
 from kb.index.semantic_node_builder import build_deterministic_nodes
 from kb.ingest.attachment_parser import parse_attachment
@@ -636,13 +637,25 @@ def _embed_knowledge_blocks_joint(
     dense_dim_total = 0
     sparse_nnz_total = 0
     with SQLiteStore(db_path) as store:
-        candidate_count = store.count_knowledge_blocks_for_embedding(
+        active_providers = [item for item in (dense, sparse) if item is not None]
+        policy = build_chunk_policy(active_providers)
+        tokenizer_provider = min(active_providers, key=lambda item: int(item.effective_max_sequence_length or 0))
+        audit = store.rebuild_retrieval_chunks(
+            policy=policy,
+            tokenizer_provider=tokenizer_provider,
+            skip_low_interest_content=skip_low_interest_content,
+        )
+        _raise_on_failed_chunk_audit(audit)
+        dense_space_id = _chunked_embedding_space_id(dense.embedding_space_id, policy.id) if dense else None
+        sparse_space_id = _chunked_embedding_space_id(sparse.embedding_space_id, policy.id) if sparse else None
+        candidate_count = store.count_retrieval_chunks_for_embedding(
+            chunk_policy_id=policy.id,
             limit=limit,
             dense_model_name=dense.model_name if dense else None,
-            dense_model_version=dense.model_version if dense else None,
+            dense_model_version=dense_space_id if dense else None,
             sparse_model_name=sparse.model_name if sparse else None,
+            sparse_embedding_space_id=sparse_space_id if sparse else None,
             force=force,
-            skip_low_interest_content=skip_low_interest_content,
         )
         total_batches = math.ceil(candidate_count / batch_size) if candidate_count else 0
         batch_iter = _progress_iter(
@@ -659,20 +672,36 @@ def _embed_knowledge_blocks_joint(
             remaining = candidate_count - processed_candidates
             if remaining <= 0:
                 break
-            batch = store.knowledge_blocks_for_embedding_batch(
+            batch = store.retrieval_chunks_for_embedding_batch(
+                chunk_policy_id=policy.id,
                 after_id=after_id,
                 batch_size=min(batch_size, remaining),
                 dense_model_name=dense.model_name if dense else None,
-                dense_model_version=dense.model_version if dense else None,
+                dense_model_version=dense_space_id if dense else None,
                 sparse_model_name=sparse.model_name if sparse else None,
+                sparse_embedding_space_id=sparse_space_id if sparse else None,
                 force=force,
-                skip_low_interest_content=skip_low_interest_content,
             )
             if not batch:
                 break
             processed_candidates += len(batch)
             after_id = str(batch[-1]["id"])
-            texts = [str(row["text_for_embedding"]) for row in batch]
+            texts = [str(row["text"]) for row in batch]
+            for row, text in zip(batch, texts, strict=True):
+                if dense is not None:
+                    dense.assert_fits(
+                        text,
+                        chunk_id=str(row["id"]),
+                        block_id=str(row["block_id"]),
+                        source_identity=str(row["block_id"]),
+                    )
+                if sparse is not None:
+                    sparse.assert_fits(
+                        text,
+                        chunk_id=str(row["id"]),
+                        block_id=str(row["block_id"]),
+                        source_identity=str(row["block_id"]),
+                    )
             dense_results = dense.embed_documents(texts) if dense else [None] * len(batch)
             sparse_results = sparse.embed_documents(texts) if sparse else [None] * len(batch)
             batch_sparse_terms_count = sum(len(sparse_vector) for sparse_vector in sparse_results if sparse_vector)
@@ -684,10 +713,10 @@ def _embed_knowledge_blocks_joint(
                     sparse_vector_id = None
                     if dense_vector is not None and dense is not None:
                         dense_vector_id = store.upsert_dense_vector(
-                            owner_type="knowledge_block",
+                            owner_type="retrieval_chunk",
                             owner_id=owner_id,
                             model_name=dense.model_name,
-                            model_version=dense.model_version,
+                            model_version=dense_space_id,
                             runtime_metadata_json=json.dumps(dense.runtime_metadata, sort_keys=True, separators=(",", ":")),
                             vector=dense_vector,
                         )
@@ -696,23 +725,18 @@ def _embed_knowledge_blocks_joint(
                     if sparse_vector is not None and sparse is not None:
                         pending_insert_rows_count += len(sparse_vector)
                         sparse_vector_id = store.replace_sparse_terms(
-                            owner_type="knowledge_block",
+                            owner_type="retrieval_chunk",
                             owner_id=owner_id,
                             model_name=sparse.model_name,
-                            embedding_space_id=sparse.embedding_space_id,
+                            embedding_space_id=sparse_space_id,
                             terms=sparse_vector,
                         )
                         sparse_vectors += 1
                         sparse_terms += len(sparse_vector)
                         sparse_nnz_total += len(sparse_vector)
-                    store.set_knowledge_block_vector_ids(
-                        knowledge_block_id=owner_id,
-                        dense_vector_id=dense_vector_id,
-                        sparse_vector_id=sparse_vector_id,
-                    )
                 except Exception as exc:  # noqa: BLE001
                     errors += 1
-                    print(f"failed embedding knowledge_block {row['id']}: {exc}")
+                    print(f"failed embedding retrieval_chunk {row['id']}: {exc}")
             store.commit()
             store.shrink_memory()
             memory_before_cleanup = _process_memory_mb()
@@ -737,13 +761,17 @@ def _embed_knowledge_blocks_joint(
         store.commit()
     return {
         "dense_model": dense.model_name if dense else None,
-        "dense_model_version": dense.model_version if dense else None,
-        "dense_embedding_space_id": dense.embedding_space_id if dense else None,
+        "dense_model_version": dense_space_id if dense else None,
+        "dense_embedding_space_id": dense_space_id if dense else None,
         "sparse_model": sparse.model_name if sparse else None,
-        "sparse_model_version": sparse.model_version if sparse else None,
-        "sparse_embedding_space_id": sparse.embedding_space_id if sparse else None,
+        "sparse_model_version": sparse_space_id if sparse else None,
+        "sparse_embedding_space_id": sparse_space_id if sparse else None,
+        "chunk_policy_id": policy.id,
+        "indexing_audit": audit,
         "candidate_blocks": candidate_count,
+        "candidate_chunks": candidate_count,
         "blocks_embedded": max(dense_vectors, sparse_vectors),
+        "chunks_embedded": max(dense_vectors, sparse_vectors),
         "dense_vectors": dense_vectors,
         "sparse_vectors": sparse_vectors,
         "sparse_terms": sparse_terms,
@@ -924,6 +952,25 @@ def _build_sparse_provider(
             torch_compile=torch_compile,
         )
     raise ValueError(f"Unsupported sparse provider: {provider_name}")
+
+
+def _chunked_embedding_space_id(embedding_space_id: str, chunk_policy_id: str) -> str:
+    return f"{embedding_space_id};chunk_policy={chunk_policy_id}"
+
+
+def _raise_on_failed_chunk_audit(audit: dict[str, object]) -> None:
+    failures = {
+        key: audit.get(key)
+        for key in (
+            "uncovered_characters",
+            "chunks_over_limit",
+            "truncated_chunks",
+            "blocks_with_coverage_gaps",
+        )
+        if audit.get(key)
+    }
+    if failures:
+        raise RuntimeError(f"Retrieval chunk audit failed: {json.dumps(failures, sort_keys=True)}")
 
 
 def _release_batch_memory() -> None:

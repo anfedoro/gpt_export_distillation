@@ -7,7 +7,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from kb.cli import _build_dense_provider, _build_sparse_provider
+from kb.cli import _build_dense_provider, _build_sparse_provider, _chunked_embedding_space_id
+from kb.index.chunk_builder import build_chunk_policy
 from kb.storage.sqlite_store import SQLiteStore
 
 
@@ -134,6 +135,10 @@ def hybrid_query(
     sparse = _build_sparse_provider(sparse_provider, sparse_model, sparse_top_k) if sparse_provider != "none" else None
     if dense is None and sparse is None:
         raise ValueError("At least one retrieval provider must be enabled.")
+    active_providers = [item for item in (dense, sparse) if item is not None]
+    policy = build_chunk_policy(active_providers)
+    dense_space_id = _chunked_embedding_space_id(dense.embedding_space_id, policy.id) if dense else None
+    sparse_space_id = _chunked_embedding_space_id(sparse.embedding_space_id, policy.id) if sparse else None
     providers_loaded = time.perf_counter()
 
     query_encoding_started = time.perf_counter()
@@ -143,14 +148,20 @@ def hybrid_query(
 
     db_started = time.perf_counter()
     with SQLiteStore(db_path, read_only=True) as store:
-        rows = store.searchable_knowledge_blocks(
+        rows = store.searchable_retrieval_chunks(
+            chunk_policy_id=policy.id,
             dense_model_name=dense.model_name if dense else None,
-            dense_model_version=dense.model_version if dense else None,
+            dense_model_version=dense_space_id if dense else None,
             sparse_model_name=sparse.model_name if sparse else None,
-            sparse_embedding_space_id=sparse.embedding_space_id if sparse else None,
+            sparse_embedding_space_id=sparse_space_id if sparse else None,
             project=project,
             include_low_interest=include_low_interest,
         )
+        if not rows and store.legacy_block_level_embedding_count() > 0:
+            raise RuntimeError(
+                "This database contains legacy block-level embeddings but no compatible retrieval chunks. "
+                "Rebuild embeddings with `kb-index embed --force` or rebuild the database with `kb-index import`."
+            )
         candidates_loaded = time.perf_counter()
         representation_counts = store.retrieval_representation_counts(
             dense_model_name=dense.model_name if dense else None,
@@ -185,7 +196,8 @@ def hybrid_query(
         final_score = alpha * dense_score + beta * sparse_score
         scored.append(
             {
-                "block_id": row["knowledge_block_id"],
+                "chunk_id": row["chunk_id"],
+                "block_id": row["block_id"],
                 "source_path": row["source_path"],
                 "project": row["project_id"],
                 "folder_kind": row["folder_kind"],
@@ -193,8 +205,12 @@ def hybrid_query(
                 "conversation_id": row["conversation_id"],
                 "conversation_title": row["conversation_title"],
                 "message_id": row["message_id"],
+                "source_message_id": row.get("source_message_id"),
                 "role": row["role"],
                 "block_type": row["block_type"],
+                "source_char_start": row.get("source_char_start"),
+                "source_char_end": row.get("source_char_end"),
+                "chunk_token_count": row.get("token_count"),
                 "dense_score": dense_score,
                 "sparse_score": sparse_score,
                 "final_score": final_score,
@@ -225,9 +241,10 @@ def hybrid_query(
         "alpha": alpha,
         "beta": beta,
         "dense_model": dense.model_name if dense else None,
-        "dense_embedding_space_id": dense.embedding_space_id if dense else None,
+        "dense_embedding_space_id": dense_space_id if dense else None,
         "sparse_model": sparse.model_name if sparse else None,
-        "sparse_embedding_space_id": sparse.embedding_space_id if sparse else None,
+        "sparse_embedding_space_id": sparse_space_id if sparse else None,
+        "chunk_policy_id": policy.id,
         "candidate_blocks": len(scored),
         "latency_ms": {
             "total": _elapsed_ms(started, finished),
