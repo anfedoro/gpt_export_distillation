@@ -26,6 +26,10 @@ VALID_RELEVANCE = {1, 2, 3}
 VALID_LANGUAGES = {"ru", "en", "mixed"}
 RUN_SCHEMA_VERSION = "kb.benchmark.run.v1"
 QUERY_RESULT_SCHEMA_VERSION = "kb.benchmark.query_result.v1"
+QUERY_METRICS_SCHEMA_VERSION = "kb.benchmark.query_metrics.v1"
+EVALUATION_SCHEMA_VERSION = "kb.benchmark.evaluation.v1"
+EVALUATION_MANIFEST_SCHEMA_VERSION = "kb.benchmark.evaluation_manifest.v1"
+METRIC_K_VALUES = (1, 5, 10, 20)
 DEFAULT_DENSE_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_SPARSE_MODEL = "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1"
 DEFAULT_RANKING_CONFIGS: tuple[tuple[str, float, float], ...] = (
@@ -60,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--include-low-interest", action="store_true")
     run.add_argument("--max-queries", type=int)
     run.add_argument("--query-id")
+    evaluate = sub.add_parser("evaluate", help="Evaluate an existing direct-retrieval benchmark run.")
+    evaluate.add_argument("--run-dir", required=True)
+    evaluate.add_argument("--dataset", required=True)
+    evaluate.add_argument("--output-dir")
     return parser
 
 
@@ -88,6 +96,14 @@ def main() -> int:
             include_low_interest=args.include_low_interest,
             max_queries=args.max_queries,
             query_id=args.query_id,
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0 if report["status"] == "completed" else 1
+    if args.command == "evaluate":
+        report = evaluate_direct_retrieval_run(
+            run_dir=Path(args.run_dir).expanduser(),
+            dataset_path=Path(args.dataset).expanduser(),
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
         )
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
         return 0 if report["status"] == "completed" else 1
@@ -633,6 +649,409 @@ def run_direct_retrieval_benchmark(
 
 def default_ranking_configs() -> list[RankingConfig]:
     return [RankingConfig(id=config_id, alpha=alpha, beta=beta) for config_id, alpha, beta in DEFAULT_RANKING_CONFIGS]
+
+
+def evaluate_direct_retrieval_run(
+    *,
+    run_dir: Path,
+    dataset_path: Path,
+    output_dir: Path | None = None,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    evaluation_dir = output_dir or (run_dir / "evaluation")
+    evaluation_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = evaluation_dir / "manifest.json"
+    evaluation_manifest: dict[str, Any] = {
+        "schema_version": EVALUATION_MANIFEST_SCHEMA_VERSION,
+        "status": "failed",
+        "source_run_id": None,
+        "source_run_dir": str(run_dir),
+        "source_manifest_sha256": None,
+        "source_results_sha256": None,
+        "dataset_path": str(dataset_path),
+        "dataset_sha256": None,
+        "query_count": 0,
+        "configuration_count": 0,
+        "query_metric_records": 0,
+        "created_at_utc": datetime.now(UTC).isoformat(),
+        "timing_ms": {
+            "input_validation": 0.0,
+            "metric_calculation": 0.0,
+            "artifact_writing": 0.0,
+            "total": 0.0,
+        },
+    }
+    try:
+        validation_started = time.perf_counter()
+        loaded = _load_and_validate_evaluation_inputs(run_dir=run_dir, dataset_path=dataset_path)
+        validation_finished = time.perf_counter()
+        evaluation_manifest.update(
+            {
+                "source_run_id": loaded["manifest"]["run_id"],
+                "source_manifest_sha256": _sha256(run_dir / "manifest.json"),
+                "source_results_sha256": _sha256(run_dir / "results.jsonl"),
+                "dataset_sha256": loaded["dataset_sha256"],
+                "query_count": len(loaded["dataset_records"]),
+                "configuration_count": len(loaded["configurations"]),
+            }
+        )
+        evaluation_manifest["timing_ms"]["input_validation"] = _elapsed_ms(validation_started, validation_finished)
+
+        metric_started = time.perf_counter()
+        query_metrics = [
+            calculate_query_metrics(record, loaded["dataset_by_id"][record["query_id"]])
+            for record in loaded["results"]
+        ]
+        summary = _aggregate_query_metrics(
+            run_manifest=loaded["manifest"],
+            dataset_sha256=loaded["dataset_sha256"],
+            query_metrics=query_metrics,
+            configurations=loaded["configurations"],
+        )
+        metric_finished = time.perf_counter()
+        evaluation_manifest["timing_ms"]["metric_calculation"] = _elapsed_ms(metric_started, metric_finished)
+
+        write_started = time.perf_counter()
+        query_metrics_path = evaluation_dir / "query_metrics.jsonl"
+        summary_path = evaluation_dir / "summary.json"
+        report_path = evaluation_dir / "report.md"
+        query_metrics_path.write_text(
+            "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in query_metrics),
+            encoding="utf-8",
+        )
+        summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        report_path.write_text(_render_evaluation_report(summary), encoding="utf-8")
+        write_finished = time.perf_counter()
+        evaluation_manifest["query_metric_records"] = len(query_metrics)
+        evaluation_manifest["timing_ms"]["artifact_writing"] = _elapsed_ms(write_started, write_finished)
+        evaluation_manifest["timing_ms"]["total"] = _elapsed_ms(started, time.perf_counter())
+        evaluation_manifest["status"] = "completed"
+        _write_manifest(manifest_path, evaluation_manifest)
+        return {
+            "status": "completed",
+            "evaluation_dir": str(evaluation_dir),
+            "manifest": str(manifest_path),
+            "query_metrics": str(query_metrics_path),
+            "summary": str(summary_path),
+            "report": str(report_path),
+            "query_metric_records": len(query_metrics),
+            "query_count": len(loaded["dataset_records"]),
+            "configuration_count": len(loaded["configurations"]),
+            "timing_ms": evaluation_manifest["timing_ms"],
+        }
+    except Exception as exc:
+        evaluation_manifest["error"] = str(exc)
+        evaluation_manifest["timing_ms"]["total"] = _elapsed_ms(started, time.perf_counter())
+        _write_manifest(manifest_path, evaluation_manifest)
+        return {
+            "status": "failed",
+            "evaluation_dir": str(evaluation_dir),
+            "manifest": str(manifest_path),
+            "error": str(exc),
+        }
+
+
+def calculate_query_metrics(result_record: dict[str, Any], dataset_record: dict[str, Any]) -> dict[str, Any]:
+    expected_from_dataset = {item["block_id"]: int(item["relevance"]) for item in dataset_record["expected"]}
+    expected_from_result = {item["block_id"]: item for item in result_record["expected"]}
+    expected_ranks: dict[str, int | None] = {}
+    for block_id, relevance in expected_from_dataset.items():
+        result_expected = expected_from_result.get(block_id)
+        rank = result_expected.get("rank") if result_expected else None
+        expected_ranks[block_id] = int(rank) if isinstance(rank, int) and rank > 0 else None
+        if result_expected is None or int(result_expected.get("relevance", -1)) != relevance:
+            raise ValueError(f"{result_record['query_id']}: expected relevance mismatch for {block_id}")
+
+    relevant_ranks = [rank for rank in expected_ranks.values() if rank is not None]
+    first_relevant_rank = min(relevant_ranks) if relevant_ranks else None
+    primary_blocks = [block_id for block_id, relevance in expected_from_dataset.items() if relevance == 3]
+    if len(primary_blocks) != 1:
+        raise ValueError(f"{result_record['query_id']}: expected exactly one primary block")
+    primary_rank = expected_ranks[primary_blocks[0]]
+    top_results = result_record["top_results"]
+    expected_source_paths = {item["source_path"] for item in dataset_record["expected"]}
+    expected_conversation_ids = {
+        item["conversation_id"] for item in dataset_record["expected"] if item.get("conversation_id") is not None
+    }
+    recall_at: dict[str, int] = {}
+    primary_recall_at: dict[str, int] = {}
+    ndcg_at: dict[str, float] = {}
+    document_recall_at: dict[str, int] = {}
+    conversation_recall_at: dict[str, int] = {}
+    for k in METRIC_K_VALUES:
+        recall_at[str(k)] = int(any(rank is not None and rank <= k for rank in expected_ranks.values()))
+        primary_recall_at[str(k)] = int(primary_rank is not None and primary_rank <= k)
+        ndcg_at[str(k)] = _ndcg_at(expected_from_dataset, expected_ranks, k)
+        document_recall_at[str(k)] = int(
+            any(item["rank"] <= k and item["source_path"] in expected_source_paths for item in top_results)
+        )
+        conversation_recall_at[str(k)] = int(
+            bool(expected_conversation_ids)
+            and any(
+                item["rank"] <= k
+                and item.get("conversation_id") is not None
+                and item.get("conversation_id") in expected_conversation_ids
+                for item in top_results
+            )
+        )
+
+    return {
+        "schema_version": QUERY_METRICS_SCHEMA_VERSION,
+        "query_id": result_record["query_id"],
+        "query": result_record["query"],
+        "query_type": result_record["query_type"],
+        "language": result_record["language"],
+        "source_language": result_record["source_language"],
+        "topic": result_record["topic"],
+        "configuration": result_record["configuration"],
+        "expected_count": len(expected_from_dataset),
+        "first_relevant_rank": first_relevant_rank,
+        "primary_rank": primary_rank,
+        "reciprocal_rank": 0.0 if first_relevant_rank is None else 1.0 / first_relevant_rank,
+        "primary_reciprocal_rank": 0.0 if primary_rank is None else 1.0 / primary_rank,
+        "recall_at": recall_at,
+        "primary_recall_at": primary_recall_at,
+        "ndcg_at": ndcg_at,
+        "document_recall_at": document_recall_at,
+        "conversation_recall_at": conversation_recall_at,
+    }
+
+
+def _load_and_validate_evaluation_inputs(*, run_dir: Path, dataset_path: Path) -> dict[str, Any]:
+    manifest_path = run_dir / "manifest.json"
+    results_path = run_dir / "results.jsonl"
+    if not manifest_path.exists():
+        raise ValueError(f"manifest.json does not exist: {manifest_path}")
+    if not results_path.exists():
+        raise ValueError(f"results.jsonl does not exist: {results_path}")
+    if not dataset_path.exists():
+        raise ValueError(f"dataset does not exist: {dataset_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != RUN_SCHEMA_VERSION:
+        raise ValueError(f"unsupported run schema_version: {manifest.get('schema_version')}")
+    if manifest.get("status") != "completed":
+        raise ValueError(f"run manifest status must be completed, got {manifest.get('status')}")
+    if manifest.get("completed_queries") != 120:
+        raise ValueError(f"completed_queries must be 120, got {manifest.get('completed_queries')}")
+    if manifest.get("failed_queries") != 0:
+        raise ValueError(f"failed_queries must be 0, got {manifest.get('failed_queries')}")
+    dataset_sha256 = _sha256(dataset_path)
+    if manifest.get("dataset", {}).get("sha256") != dataset_sha256:
+        raise ValueError("dataset SHA256 does not match run manifest")
+    dataset_records = _load_dataset_records(dataset_path)
+    dataset_by_id = {record["id"]: record for record in dataset_records}
+    if len(dataset_by_id) != len(dataset_records):
+        raise ValueError("dataset contains duplicate query ids")
+    configurations = manifest.get("configurations")
+    if not isinstance(configurations, list) or len(configurations) != 7:
+        raise ValueError("run manifest must contain exactly 7 ranking configurations")
+    config_by_id = {config["id"]: config for config in configurations}
+    if len(config_by_id) != 7:
+        raise ValueError("run manifest contains duplicate ranking configuration ids")
+
+    results = _load_result_records(results_path)
+    expected_pairs = {(query_id, config_id) for query_id in dataset_by_id for config_id in config_by_id}
+    seen_pairs: set[tuple[str, str]] = set()
+    for record in results:
+        if record.get("schema_version") != QUERY_RESULT_SCHEMA_VERSION:
+            raise ValueError(f"{record.get('query_id')}: unsupported result schema_version")
+        query_id = record.get("query_id")
+        if query_id not in dataset_by_id:
+            raise ValueError(f"result query_id is not in dataset: {query_id}")
+        configuration = record.get("configuration")
+        if not isinstance(configuration, dict):
+            raise ValueError(f"{query_id}: configuration must be an object")
+        config_id = configuration.get("id")
+        manifest_config = config_by_id.get(config_id)
+        if manifest_config is None:
+            raise ValueError(f"{query_id}: result configuration is not in manifest: {config_id}")
+        if configuration.get("alpha") != manifest_config.get("alpha") or configuration.get("beta") != manifest_config.get("beta"):
+            raise ValueError(f"{query_id}: result configuration weights do not match manifest")
+        pair = (query_id, config_id)
+        if pair in seen_pairs:
+            raise ValueError(f"duplicate query/configuration result: {query_id} {config_id}")
+        seen_pairs.add(pair)
+        _validate_result_record_against_dataset(record, dataset_by_id[query_id])
+    missing = expected_pairs - seen_pairs
+    extra = seen_pairs - expected_pairs
+    if missing:
+        sample = sorted(missing)[:3]
+        raise ValueError(f"missing query/configuration records: {sample}")
+    if extra:
+        sample = sorted(extra)[:3]
+        raise ValueError(f"unexpected query/configuration records: {sample}")
+    return {
+        "manifest": manifest,
+        "dataset_sha256": dataset_sha256,
+        "dataset_records": dataset_records,
+        "dataset_by_id": dataset_by_id,
+        "configurations": configurations,
+        "results": results,
+    }
+
+
+def _load_result_records(results_path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for line_no, line in enumerate(results_path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"results.jsonl line {line_no}: invalid JSON: {exc}") from exc
+    return records
+
+
+def _validate_result_record_against_dataset(record: dict[str, Any], dataset_record: dict[str, Any]) -> None:
+    query_id = record["query_id"]
+    expected_from_dataset = {item["block_id"]: int(item["relevance"]) for item in dataset_record["expected"]}
+    expected_from_result = {item.get("block_id"): item for item in record.get("expected", []) if isinstance(item, dict)}
+    if set(expected_from_result) != set(expected_from_dataset):
+        raise ValueError(f"{query_id}: result expected blocks do not match dataset")
+    for block_id, relevance in expected_from_dataset.items():
+        item = expected_from_result[block_id]
+        if item.get("relevance") != relevance:
+            raise ValueError(f"{query_id}: relevance mismatch for expected block {block_id}")
+        rank = item.get("rank")
+        if not isinstance(rank, int) or rank <= 0:
+            raise ValueError(f"{query_id}: expected block {block_id} rank must be a positive integer")
+    top_results = record.get("top_results")
+    if not isinstance(top_results, list):
+        raise ValueError(f"{query_id}: top_results must be a list")
+    if len(top_results) > 20:
+        raise ValueError(f"{query_id}: top_results contains more than top-k records")
+    ranks = [item.get("rank") for item in top_results if isinstance(item, dict)]
+    if len(ranks) != len(top_results) or any(not isinstance(rank, int) or rank <= 0 for rank in ranks):
+        raise ValueError(f"{query_id}: top_results ranks must be positive integers")
+    if ranks != sorted(ranks):
+        raise ValueError(f"{query_id}: top_results must be sorted by rank")
+
+
+def _ndcg_at(expected_relevance: dict[str, int], expected_ranks: dict[str, int | None], k: int) -> float:
+    dcg = 0.0
+    for block_id, relevance in expected_relevance.items():
+        rank = expected_ranks.get(block_id)
+        if rank is not None and rank <= k:
+            dcg += _dcg_gain(relevance, rank)
+    ideal_relevances = sorted(expected_relevance.values(), reverse=True)
+    idcg = sum(_dcg_gain(relevance, rank) for rank, relevance in enumerate(ideal_relevances[:k], start=1))
+    return 0.0 if idcg == 0.0 else dcg / idcg
+
+
+def _dcg_gain(relevance: int, rank: int) -> float:
+    return (float(2**relevance) - 1.0) / math.log2(rank + 1)
+
+
+def _aggregate_query_metrics(
+    *,
+    run_manifest: dict[str, Any],
+    dataset_sha256: str,
+    query_metrics: list[dict[str, Any]],
+    configurations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    metrics_by_config: dict[str, list[dict[str, Any]]] = {config["id"]: [] for config in configurations}
+    for item in query_metrics:
+        metrics_by_config[item["configuration"]["id"]].append(item)
+    aggregate_metrics: list[dict[str, Any]] = []
+    for config in configurations:
+        items = metrics_by_config[config["id"]]
+        query_count = len(items)
+        if query_count == 0:
+            raise ValueError(f"configuration has no query metrics: {config['id']}")
+        aggregate_metrics.append(
+            {
+                "configuration": config,
+                "query_count": query_count,
+                "recall_at": _average_at(items, "recall_at"),
+                "primary_recall_at": _average_at(items, "primary_recall_at"),
+                "mrr": _average_scalar(items, "reciprocal_rank"),
+                "primary_mrr": _average_scalar(items, "primary_reciprocal_rank"),
+                "ndcg_at": _average_at(items, "ndcg_at"),
+                "document_recall_at": _average_at(items, "document_recall_at"),
+                "conversation_recall_at": _average_at(items, "conversation_recall_at"),
+            }
+        )
+    return {
+        "schema_version": EVALUATION_SCHEMA_VERSION,
+        "run_id": run_manifest["run_id"],
+        "dataset_sha256": dataset_sha256,
+        "query_count": run_manifest["completed_queries"],
+        "configuration_count": len(configurations),
+        "metrics": aggregate_metrics,
+    }
+
+
+def _average_at(items: list[dict[str, Any]], field: str) -> dict[str, float]:
+    return {
+        str(k): sum(float(item[field][str(k)]) for item in items) / len(items)
+        for k in METRIC_K_VALUES
+    }
+
+
+def _average_scalar(items: list[dict[str, Any]], field: str) -> float:
+    return sum(float(item[field]) for item in items) / len(items)
+
+
+def _render_evaluation_report(summary: dict[str, Any]) -> str:
+    lines = [
+        "# Direct Retrieval Evaluation",
+        "",
+        f"- Run ID: `{summary['run_id']}`",
+        f"- Query count: {summary['query_count']}",
+        f"- Configuration count: {summary['configuration_count']}",
+        "",
+        "## Retrieval Metrics",
+        "",
+        "| Configuration | R@1 | R@5 | R@10 | R@20 | MRR | nDCG@10 | Doc R@10 | Conv R@10 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for item in summary["metrics"]:
+        config_id = item["configuration"]["id"]
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    config_id,
+                    _fmt(item["recall_at"]["1"]),
+                    _fmt(item["recall_at"]["5"]),
+                    _fmt(item["recall_at"]["10"]),
+                    _fmt(item["recall_at"]["20"]),
+                    _fmt(item["mrr"]),
+                    _fmt(item["ndcg_at"]["10"]),
+                    _fmt(item["document_recall_at"]["10"]),
+                    _fmt(item["conversation_recall_at"]["10"]),
+                ]
+            )
+            + " |"
+        )
+    lines += [
+        "",
+        "## Primary Metrics",
+        "",
+        "| Configuration | Primary R@1 | Primary R@5 | Primary R@10 | Primary R@20 | Primary MRR |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for item in summary["metrics"]:
+        config_id = item["configuration"]["id"]
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    config_id,
+                    _fmt(item["primary_recall_at"]["1"]),
+                    _fmt(item["primary_recall_at"]["5"]),
+                    _fmt(item["primary_recall_at"]["10"]),
+                    _fmt(item["primary_recall_at"]["20"]),
+                    _fmt(item["primary_mrr"]),
+                ]
+            )
+            + " |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _fmt(value: float) -> str:
+    return f"{value:.4f}"
 
 
 def _load_dataset_records(dataset_path: Path) -> list[dict[str, Any]]:
