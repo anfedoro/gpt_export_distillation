@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from kb.cli import build_edges_command, build_nodes_command, build_parser as build_index_parser, embed_knowledge_blocks, import_knowledge_base, ingest_attachments, ingest_chats  # noqa: E402
+from kb.benchmark import DirectRetrievalSession, RankingConfig, default_ranking_configs, run_direct_retrieval_benchmark, validate_direct_retrieval_dataset  # noqa: E402
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider  # noqa: E402
@@ -698,6 +699,358 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertEqual([item["rank"] for item in payload["results"]], [1, 2, 3])
             self.assertIn("latency_ms", payload)
             self.assertIn("diagnostics", payload)
+
+    def test_benchmark_validator_accepts_valid_direct_retrieval_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            chat_dir = root / "Projects" / "Project_17"
+            chat_dir.mkdir(parents=True)
+            (chat_dir / "chat.md").write_text(SAMPLE_CHAT, encoding="utf-8")
+            db = Path(tmp) / "chat_memory.db"
+            ingest_chats(root, db, limit=10)
+            with SQLiteStore(db) as store:
+                row = store.conn.execute(
+                    """
+                    SELECT kb.id, sd.relative_path, kb.conversation_id, kb.message_id
+                    FROM knowledge_blocks kb
+                    JOIN source_documents sd ON sd.id = kb.source_document_id
+                    ORDER BY kb.id
+                    LIMIT 1
+                    """
+                ).fetchone()
+            dataset = Path(tmp) / "dataset.jsonl"
+            dataset.write_text(
+                json.dumps(
+                    {
+                        "id": "memory-001-exact",
+                        "query": "memory write routing",
+                        "query_type": "exact_terms",
+                        "language": "en",
+                        "topic": "llm_memory",
+                        "expected": [
+                            {
+                                "block_id": row["id"],
+                                "relevance": 3,
+                                "source_path": row["relative_path"],
+                                "conversation_id": row["conversation_id"],
+                                "message_id": row["message_id"],
+                            }
+                        ],
+                        "notes": "Synthetic validator fixture.",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = validate_direct_retrieval_dataset(db_path=db, dataset_path=dataset, expected_count=1)
+
+            self.assertTrue(report["ok"], report["errors"])
+            self.assertEqual(report["records"], 1)
+            self.assertEqual(report["query_type_distribution"], {"exact_terms": 1})
+
+    def test_benchmark_validator_rejects_bad_block_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            chat_dir = root / "Projects" / "Project_17"
+            chat_dir.mkdir(parents=True)
+            (chat_dir / "chat.md").write_text(SAMPLE_CHAT, encoding="utf-8")
+            db = Path(tmp) / "chat_memory.db"
+            ingest_chats(root, db, limit=10)
+            with SQLiteStore(db) as store:
+                row = store.conn.execute("SELECT id, conversation_id, message_id FROM knowledge_blocks LIMIT 1").fetchone()
+            dataset = Path(tmp) / "dataset.jsonl"
+            dataset.write_text(
+                json.dumps(
+                    {
+                        "id": "bad-001",
+                        "query": "bad metadata",
+                        "query_type": "exact_terms",
+                        "language": "en",
+                        "topic": "validator",
+                        "expected": [
+                            {
+                                "block_id": row["id"],
+                                "relevance": 3,
+                                "source_path": "wrong.md",
+                                "conversation_id": row["conversation_id"],
+                                "message_id": row["message_id"],
+                            }
+                        ],
+                        "notes": "Should fail.",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = validate_direct_retrieval_dataset(db_path=db, dataset_path=dataset, expected_count=1)
+
+            self.assertFalse(report["ok"])
+            self.assertTrue(any("source_path mismatch" in error for error in report["errors"]))
+
+    def test_direct_retrieval_session_matches_hybrid_query_for_all_benchmark_configs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+            dense = StaticDenseProvider()
+            sparse = StaticSparseProvider()
+            session = DirectRetrievalSession(db_path=db, dense_provider=dense, sparse_provider=sparse)
+
+            scores = session.score_query("memory routing")
+
+            for config in default_ranking_configs():
+                results, _, _ = session.rank(scores, config, top_k=10)
+                with (
+                    patch("kb.retrieval.hybrid_search._build_dense_provider", return_value=StaticDenseProvider()),
+                    patch("kb.retrieval.hybrid_search._build_sparse_provider", return_value=StaticSparseProvider()),
+                ):
+                    payload = hybrid_query(
+                        db_path=db,
+                        query="memory routing",
+                        dense_provider="mock",
+                        sparse_provider="mock",
+                        alpha=config.alpha,
+                        beta=config.beta,
+                        limit=10,
+                    )
+
+                self.assertEqual(
+                    [item["block_id"] for item in results],
+                    [item["block_id"] for item in payload["results"]],
+                )
+                for actual, expected in zip(results, payload["results"], strict=True):
+                    self.assertAlmostEqual(actual["dense_score"], expected["dense_score"], places=6)
+                    self.assertAlmostEqual(actual["sparse_score"], expected["sparse_score"], places=6)
+                    self.assertAlmostEqual(actual["final_score"], expected["final_score"], places=6)
+
+    def test_direct_retrieval_session_uses_stable_block_id_tiebreak(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+            session = DirectRetrievalSession(
+                db_path=db,
+                dense_provider=StaticDenseProvider(),
+                sparse_provider=None,
+            )
+
+            scores = session.score_query("zero tie")
+            scores.dense_scores[:] = 0.0
+            results, _, _ = session.rank(scores, RankingConfig("dense_100_sparse_000", 1.0, 0.0), top_k=10)
+
+            block_ids = [item["block_id"] for item in results]
+            self.assertEqual(block_ids, sorted(block_ids))
+
+    def test_benchmark_run_writes_manifest_and_results_from_single_raw_scores(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+            with SQLiteStore(db) as store:
+                rows = store.conn.execute(
+                    """
+                    SELECT kb.id, sd.relative_path, kb.conversation_id, kb.message_id, kb.text_for_display
+                    FROM knowledge_blocks kb
+                    JOIN source_documents sd ON sd.id = kb.source_document_id
+                    ORDER BY kb.id
+                    LIMIT 2
+                    """
+                ).fetchall()
+            dataset = Path(tmp) / "dataset.jsonl"
+            dataset.write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "id": f"query-{idx}",
+                            "query": f"memory routing {idx}",
+                            "query_type": "exact_terms",
+                            "language": "en",
+                            "topic": "llm_memory",
+                            "expected": [
+                                {
+                                    "block_id": row["id"],
+                                    "relevance": 3,
+                                    "source_path": row["relative_path"],
+                                    "conversation_id": row["conversation_id"],
+                                    "message_id": row["message_id"],
+                                }
+                            ],
+                            "notes": "Synthetic benchmark fixture.",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                    for idx, row in enumerate(rows, start=1)
+                ),
+                encoding="utf-8",
+            )
+            dense = StaticDenseProvider()
+            sparse = StaticSparseProvider()
+            output_dir = Path(tmp) / "runs"
+
+            report = run_direct_retrieval_benchmark(
+                db_path=db,
+                dataset_path=dataset,
+                output_dir=output_dir,
+                top_k=10,
+                dense_provider_name="mock",
+                sparse_provider_name="mock",
+                dense_provider=dense,
+                sparse_provider=sparse,
+            )
+
+            self.assertEqual(report["status"], "completed")
+            self.assertEqual(dense.query_calls, 2)
+            self.assertEqual(sparse.query_calls, 2)
+            manifest = json.loads(Path(report["manifest"]).read_text(encoding="utf-8"))
+            results = [json.loads(line) for line in Path(report["results"]).read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(manifest["status"], "completed")
+            self.assertEqual(manifest["completed_queries"], 2)
+            self.assertEqual(manifest["failed_queries"], 0)
+            self.assertEqual(len(results), 2 * len(default_ranking_configs()))
+            self.assertEqual(report["records_written"], len(results))
+            per_query = [row for row in results if row["query_id"] == "query-1"]
+            self.assertEqual(len(per_query), len(default_ranking_configs()))
+            first_scores = {
+                item["block_id"]: (item["dense_score"], item["sparse_score"]) for item in per_query[0]["top_results"]
+            }
+            last_scores = {
+                item["block_id"]: (item["dense_score"], item["sparse_score"]) for item in per_query[-1]["top_results"]
+            }
+            self.assertEqual(first_scores, last_scores)
+            for row in results:
+                self.assertIn("rank", row["expected"][0])
+                self.assertGreaterEqual(row["expected"][0]["rank"], 1)
+                self.assertEqual(row["candidate_blocks"], manifest["database"]["candidate_blocks"])
+                self.assertIn("query_encoding", row["latency_ms"])
+                self.assertIn("base_scoring", row["latency_ms"])
+                self.assertIn("ranking", row["latency_ms"])
+
+    def test_benchmark_run_keeps_expected_rank_outside_top_k(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+            with SQLiteStore(db) as store:
+                row = store.conn.execute(
+                    """
+                    SELECT kb.id, sd.relative_path, kb.conversation_id, kb.message_id
+                    FROM knowledge_blocks kb
+                    JOIN source_documents sd ON sd.id = kb.source_document_id
+                    ORDER BY kb.id DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+            dataset = Path(tmp) / "dataset.jsonl"
+            dataset.write_text(
+                json.dumps(
+                    {
+                        "id": "rank-outside-top-k",
+                        "query": "memory routing",
+                        "query_type": "exact_terms",
+                        "language": "en",
+                        "topic": "llm_memory",
+                        "expected": [
+                            {
+                                "block_id": row["id"],
+                                "relevance": 3,
+                                "source_path": row["relative_path"],
+                                "conversation_id": row["conversation_id"],
+                                "message_id": row["message_id"],
+                            }
+                        ],
+                        "notes": "Expected block rank is still recorded with top_k=1.",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = run_direct_retrieval_benchmark(
+                db_path=db,
+                dataset_path=dataset,
+                output_dir=Path(tmp) / "runs",
+                top_k=1,
+                dense_provider_name="mock",
+                sparse_provider_name="none",
+                dense_provider=StaticDenseProvider(),
+                sparse_provider=None,
+                ranking_configs=[RankingConfig("dense_100_sparse_000", 1.0, 0.0)],
+            )
+
+            result = json.loads(Path(report["results"]).read_text(encoding="utf-8").strip())
+            self.assertEqual(len(result["top_results"]), 1)
+            self.assertIsNotNone(result["expected"][0]["rank"])
+            self.assertGreaterEqual(result["expected"][0]["rank"], 1)
+
+    def test_benchmark_run_builds_providers_and_loads_corpus_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+            with SQLiteStore(db) as store:
+                row = store.conn.execute(
+                    """
+                    SELECT kb.id, sd.relative_path, kb.conversation_id, kb.message_id
+                    FROM knowledge_blocks kb
+                    JOIN source_documents sd ON sd.id = kb.source_document_id
+                    ORDER BY kb.id
+                    LIMIT 1
+                    """
+                ).fetchone()
+            dataset = Path(tmp) / "dataset.jsonl"
+            dataset.write_text(
+                "\n".join(
+                    json.dumps(
+                        {
+                            "id": f"query-{idx}",
+                            "query": f"memory routing {idx}",
+                            "query_type": "exact_terms",
+                            "language": "en",
+                            "topic": "llm_memory",
+                            "expected": [
+                                {
+                                    "block_id": row["id"],
+                                    "relevance": 3,
+                                    "source_path": row["relative_path"],
+                                    "conversation_id": row["conversation_id"],
+                                    "message_id": row["message_id"],
+                                }
+                            ],
+                            "notes": "Synthetic benchmark fixture.",
+                        },
+                        ensure_ascii=False,
+                    )
+                    for idx in range(1, 4)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            dense = StaticDenseProvider()
+            sparse = StaticSparseProvider()
+            original_load_corpus = DirectRetrievalSession.load_corpus
+            load_calls = 0
+
+            def counted_load_corpus(session):
+                nonlocal load_calls
+                load_calls += 1
+                return original_load_corpus(session)
+
+            with (
+                patch("kb.benchmark._build_dense_provider", return_value=dense) as build_dense,
+                patch("kb.benchmark._build_sparse_provider", return_value=sparse) as build_sparse,
+                patch.object(DirectRetrievalSession, "load_corpus", counted_load_corpus),
+            ):
+                report = run_direct_retrieval_benchmark(
+                    db_path=db,
+                    dataset_path=dataset,
+                    output_dir=Path(tmp) / "runs",
+                    top_k=3,
+                    dense_provider_name="mock",
+                    sparse_provider_name="mock",
+                )
+
+            self.assertEqual(report["status"], "completed")
+            self.assertEqual(build_dense.call_count, 1)
+            self.assertEqual(build_sparse.call_count, 1)
+            self.assertEqual(load_calls, 1)
+            self.assertEqual(dense.query_calls, 3)
+            self.assertEqual(sparse.query_calls, 3)
 
     def test_query_and_context_direct_scores_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
