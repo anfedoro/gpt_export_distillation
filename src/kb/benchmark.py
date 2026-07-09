@@ -20,9 +20,10 @@ from kb.retrieval.hybrid_search import _preview, _sparse_overlap
 from kb.storage.sqlite_store import SQLiteStore
 
 
-REQUIRED_FIELDS = {"id", "query", "query_type", "language", "topic", "expected", "notes"}
+REQUIRED_FIELDS = {"id", "query", "query_type", "language", "source_language", "topic", "expected", "notes"}
 EXPECTED_REQUIRED_FIELDS = {"block_id", "relevance", "source_path", "conversation_id", "message_id"}
 VALID_RELEVANCE = {1, 2, 3}
+VALID_LANGUAGES = {"ru", "en", "mixed"}
 RUN_SCHEMA_VERSION = "kb.benchmark.run.v1"
 QUERY_RESULT_SCHEMA_VERSION = "kb.benchmark.query_result.v1"
 DEFAULT_DENSE_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -327,6 +328,9 @@ def validate_direct_retrieval_dataset(*, db_path: Path, dataset_path: Path, expe
     queries: set[str] = set()
     query_types: Counter[str] = Counter()
     languages: Counter[str] = Counter()
+    source_languages: Counter[str] = Counter()
+    language_pairs: Counter[str] = Counter()
+    cross_language_pairs: Counter[str] = Counter()
     topics: Counter[str] = Counter()
 
     try:
@@ -365,8 +369,30 @@ def validate_direct_retrieval_dataset(*, db_path: Path, dataset_path: Path, expe
             queries.add(query)
         if isinstance(record.get("query_type"), str):
             query_types[record["query_type"]] += 1
-        if isinstance(record.get("language"), str):
-            languages[record["language"]] += 1
+        language = record.get("language")
+        source_language = record.get("source_language")
+        query_type = record.get("query_type")
+        if isinstance(language, str):
+            languages[language] += 1
+            if language not in VALID_LANGUAGES:
+                errors.append(f"line {line_no}: language must be one of {sorted(VALID_LANGUAGES)}")
+        if isinstance(source_language, str):
+            source_languages[source_language] += 1
+            if source_language not in VALID_LANGUAGES:
+                errors.append(f"line {line_no}: source_language must be one of {sorted(VALID_LANGUAGES)}")
+        if isinstance(language, str) and isinstance(source_language, str):
+            pair = f"{source_language}->{language}"
+            language_pairs[pair] += 1
+            if query_type == "cross_language":
+                cross_language_pairs[pair] += 1
+                if language == "mixed" or source_language == "mixed":
+                    errors.append(f"line {line_no}: cross_language records cannot use mixed language fields")
+                if language == source_language:
+                    errors.append(f"line {line_no}: cross_language records must use different source/query languages")
+        if isinstance(query, str) and isinstance(language, str):
+            mismatch = _obvious_query_language_mismatch(query, language)
+            if mismatch:
+                errors.append(f"line {line_no}: {mismatch}")
         if isinstance(record.get("topic"), str):
             topics[record["topic"]] += 1
         expected = record.get("expected")
@@ -403,6 +429,9 @@ def validate_direct_retrieval_dataset(*, db_path: Path, dataset_path: Path, expe
         "records": len(records),
         "query_type_distribution": dict(sorted(query_types.items())),
         "language_distribution": dict(sorted(languages.items())),
+        "source_language_distribution": dict(sorted(source_languages.items())),
+        "language_pair_distribution": dict(sorted(language_pairs.items())),
+        "cross_language_pair_distribution": dict(sorted(cross_language_pairs.items())),
         "topic_distribution": dict(sorted(topics.items())),
     }
 
@@ -542,6 +571,7 @@ def run_direct_retrieval_benchmark(
                             "query": record["query"],
                             "query_type": record["query_type"],
                             "language": record["language"],
+                            "source_language": record["source_language"],
                             "topic": record["topic"],
                             "configuration": config.as_dict(),
                             "expected": expected,
@@ -625,6 +655,76 @@ def _verify_primary_expected_candidates(records: list[dict[str, Any]], session: 
             missing.append(f"{record['id']}: primary expected block is not in candidates: {block_id}")
     if missing:
         raise ValueError("; ".join(missing))
+
+
+def _obvious_query_language_mismatch(query: str, language: str) -> str | None:
+    if language == "mixed":
+        return None
+    cyrillic_count = sum(1 for char in query if _is_cyrillic(char))
+    latin_words = _latin_words(query)
+    russian_words = _russian_words(query)
+    if language == "ru":
+        if cyrillic_count == 0 and _looks_like_english_sentence(latin_words, query):
+            return "query looks like an English sentence but language=ru"
+    if language == "en":
+        if russian_words and len(russian_words) >= 3:
+            return "query looks like a Russian sentence but language=en"
+    return None
+
+
+def _is_cyrillic(char: str) -> bool:
+    return ("А" <= char <= "я") or char in "Ёё"
+
+
+def _latin_words(text: str) -> list[str]:
+    import re
+
+    return re.findall(r"[A-Za-z][A-Za-z'-]*", text)
+
+
+def _russian_words(text: str) -> list[str]:
+    import re
+
+    return re.findall(r"[А-Яа-яЁё]{2,}", text)
+
+
+def _looks_like_english_sentence(latin_words: list[str], query: str) -> bool:
+    if len(latin_words) < 5:
+        return False
+    lower = {word.lower() for word in latin_words}
+    function_words = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "be",
+        "by",
+        "can",
+        "does",
+        "for",
+        "from",
+        "how",
+        "in",
+        "is",
+        "it",
+        "of",
+        "or",
+        "should",
+        "that",
+        "the",
+        "to",
+        "what",
+        "when",
+        "where",
+        "which",
+        "why",
+        "with",
+        "without",
+    }
+    if len(lower & function_words) >= 2:
+        return True
+    return query.rstrip().endswith("?") and bool(lower & {"what", "why", "how", "when", "where", "which"})
 
 
 def _run_id() -> str:

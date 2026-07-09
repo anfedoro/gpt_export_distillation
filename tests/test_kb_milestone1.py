@@ -205,6 +205,51 @@ class KBMilestone1Tests(unittest.TestCase):
             store.commit()
         return db
 
+    def _single_block_dataset_record(
+        self,
+        db: Path,
+        *,
+        record_id: str = "query-1",
+        query: str = "memory routing",
+        query_type: str = "exact_terms",
+        language: str = "en",
+        source_language: str = "en",
+    ) -> dict:
+        with SQLiteStore(db) as store:
+            row = store.conn.execute(
+                """
+                SELECT kb.id, sd.relative_path, kb.conversation_id, kb.message_id
+                FROM knowledge_blocks kb
+                JOIN source_documents sd ON sd.id = kb.source_document_id
+                ORDER BY kb.id
+                LIMIT 1
+                """
+            ).fetchone()
+        return {
+            "id": record_id,
+            "query": query,
+            "query_type": query_type,
+            "language": language,
+            "source_language": source_language,
+            "topic": "llm_memory",
+            "expected": [
+                {
+                    "block_id": row["id"],
+                    "relevance": 3,
+                    "source_path": row["relative_path"],
+                    "conversation_id": row["conversation_id"],
+                    "message_id": row["message_id"],
+                }
+            ],
+            "notes": "Synthetic validator fixture.",
+        }
+
+    def _write_dataset(self, path: Path, records: list[dict]) -> None:
+        path.write_text(
+            "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+            encoding="utf-8",
+        )
+
     def test_scan_detects_export_tree_kinds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -726,6 +771,7 @@ class KBMilestone1Tests(unittest.TestCase):
                         "query": "memory write routing",
                         "query_type": "exact_terms",
                         "language": "en",
+                        "source_language": "en",
                         "topic": "llm_memory",
                         "expected": [
                             {
@@ -768,6 +814,7 @@ class KBMilestone1Tests(unittest.TestCase):
                         "query": "bad metadata",
                         "query_type": "exact_terms",
                         "language": "en",
+                        "source_language": "en",
                         "topic": "validator",
                         "expected": [
                             {
@@ -790,6 +837,155 @@ class KBMilestone1Tests(unittest.TestCase):
 
             self.assertFalse(report["ok"])
             self.assertTrue(any("source_path mismatch" in error for error in report["errors"]))
+
+    def test_benchmark_validator_rejects_english_query_labeled_ru(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+            dataset = Path(tmp) / "dataset.jsonl"
+            self._write_dataset(
+                dataset,
+                [
+                    self._single_block_dataset_record(
+                        db,
+                        query="Why should memory routing use an explicit policy?",
+                        language="ru",
+                        source_language="ru",
+                    )
+                ],
+            )
+
+            report = validate_direct_retrieval_dataset(db_path=db, dataset_path=dataset, expected_count=1)
+
+            self.assertFalse(report["ok"])
+            self.assertTrue(any("English sentence" in error for error in report["errors"]))
+
+    def test_benchmark_validator_rejects_russian_query_labeled_en(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+            dataset = Path(tmp) / "dataset.jsonl"
+            self._write_dataset(
+                dataset,
+                [
+                    self._single_block_dataset_record(
+                        db,
+                        query="Почему память должна использовать явную политику маршрутизации?",
+                        language="en",
+                        source_language="ru",
+                    )
+                ],
+            )
+
+            report = validate_direct_retrieval_dataset(db_path=db, dataset_path=dataset, expected_count=1)
+
+            self.assertFalse(report["ok"])
+            self.assertTrue(any("Russian sentence" in error for error in report["errors"]))
+
+    def test_benchmark_validator_accepts_russian_query_with_english_identifiers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+            dataset = Path(tmp) / "dataset.jsonl"
+            self._write_dataset(
+                dataset,
+                [
+                    self._single_block_dataset_record(
+                        db,
+                        query="Почему SparseEncoder encode_query должен отличаться от encode_document?",
+                        language="ru",
+                        source_language="ru",
+                    )
+                ],
+            )
+
+            report = validate_direct_retrieval_dataset(db_path=db, dataset_path=dataset, expected_count=1)
+
+            self.assertTrue(report["ok"], report["errors"])
+
+    def test_benchmark_validator_accepts_cross_language_ru_to_en(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+            dataset = Path(tmp) / "dataset.jsonl"
+            self._write_dataset(
+                dataset,
+                [
+                    self._single_block_dataset_record(
+                        db,
+                        query="Why should memory routing use an explicit policy?",
+                        query_type="cross_language",
+                        language="en",
+                        source_language="ru",
+                    )
+                ],
+            )
+
+            report = validate_direct_retrieval_dataset(db_path=db, dataset_path=dataset, expected_count=1)
+
+            self.assertTrue(report["ok"], report["errors"])
+            self.assertEqual(report["cross_language_pair_distribution"], {"ru->en": 1})
+
+    def test_benchmark_validator_rejects_cross_language_with_same_language(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+            dataset = Path(tmp) / "dataset.jsonl"
+            self._write_dataset(
+                dataset,
+                [
+                    self._single_block_dataset_record(
+                        db,
+                        query="Why should memory routing use an explicit policy?",
+                        query_type="cross_language",
+                        language="en",
+                        source_language="en",
+                    )
+                ],
+            )
+
+            report = validate_direct_retrieval_dataset(db_path=db, dataset_path=dataset, expected_count=1)
+
+            self.assertFalse(report["ok"])
+            self.assertTrue(any("must use different" in error for error in report["errors"]))
+
+    def test_benchmark_validator_rejects_cross_language_with_mixed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+            dataset = Path(tmp) / "dataset.jsonl"
+            self._write_dataset(
+                dataset,
+                [
+                    self._single_block_dataset_record(
+                        db,
+                        query="Why should memory routing use an explicit policy?",
+                        query_type="cross_language",
+                        language="en",
+                        source_language="mixed",
+                    )
+                ],
+            )
+
+            report = validate_direct_retrieval_dataset(db_path=db, dataset_path=dataset, expected_count=1)
+
+            self.assertFalse(report["ok"])
+            self.assertTrue(any("cannot use mixed" in error for error in report["errors"]))
+
+    def test_benchmark_validator_allows_regular_query_same_source_and_query_language(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._static_retrieval_db(tmp)
+            dataset = Path(tmp) / "dataset.jsonl"
+            self._write_dataset(
+                dataset,
+                [
+                    self._single_block_dataset_record(
+                        db,
+                        query="Why should memory routing use an explicit policy?",
+                        query_type="answer_question",
+                        language="en",
+                        source_language="en",
+                    )
+                ],
+            )
+
+            report = validate_direct_retrieval_dataset(db_path=db, dataset_path=dataset, expected_count=1)
+
+            self.assertTrue(report["ok"], report["errors"])
 
     def test_direct_retrieval_session_matches_hybrid_query_for_all_benchmark_configs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -863,6 +1059,7 @@ class KBMilestone1Tests(unittest.TestCase):
                             "query": f"memory routing {idx}",
                             "query_type": "exact_terms",
                             "language": "en",
+                            "source_language": "en",
                             "topic": "llm_memory",
                             "expected": [
                                 {
@@ -917,6 +1114,10 @@ class KBMilestone1Tests(unittest.TestCase):
             }
             self.assertEqual(first_scores, last_scores)
             for row in results:
+                self.assertIn("language", row)
+                self.assertIn("source_language", row)
+                self.assertEqual(row["language"], "en")
+                self.assertEqual(row["source_language"], "en")
                 self.assertIn("rank", row["expected"][0])
                 self.assertGreaterEqual(row["expected"][0]["rank"], 1)
                 self.assertEqual(row["candidate_blocks"], manifest["database"]["candidate_blocks"])
@@ -945,6 +1146,7 @@ class KBMilestone1Tests(unittest.TestCase):
                         "query": "memory routing",
                         "query_type": "exact_terms",
                         "language": "en",
+                        "source_language": "en",
                         "topic": "llm_memory",
                         "expected": [
                             {
@@ -1002,6 +1204,7 @@ class KBMilestone1Tests(unittest.TestCase):
                             "query": f"memory routing {idx}",
                             "query_type": "exact_terms",
                             "language": "en",
+                            "source_language": "en",
                             "topic": "llm_memory",
                             "expected": [
                                 {
