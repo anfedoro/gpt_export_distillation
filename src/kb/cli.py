@@ -9,6 +9,7 @@ import os
 import resource
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, TypeVar
 
@@ -17,6 +18,7 @@ from kb.embeddings.sentence_transformer_provider import (
     SentenceTransformerDenseProvider,
     SentenceTransformerSparseProvider,
 )
+from kb.block_chunk_audit import audit_block_chunks
 from kb.index.chunk_builder import ChunkPolicy, build_chunk_policy
 from kb.index.edge_builder import build_similarity_edges
 from kb.index.semantic_node_builder import build_deterministic_nodes
@@ -131,6 +133,10 @@ def build_parser() -> argparse.ArgumentParser:
     embed.add_argument("--skip-low-interest-content", action=argparse.BooleanOptionalAction, default=True)
     embed.add_argument("--quiet", action="store_true", help="Disable progress output on stderr.")
 
+    audit_blocks = sub.add_parser("audit-block-chunks", help="Audit structural block to retrieval chunk distribution.")
+    audit_blocks.add_argument("--db", required=True)
+    audit_blocks.add_argument("--output-dir", help="Report directory; defaults to benchmarks/block_chunk_audit/<timestamp>.")
+
     build_nodes = sub.add_parser("build-nodes", help="Build deterministic semantic nodes.")
     build_nodes.add_argument("--db", required=True)
     build_nodes.add_argument("--mode", choices=["deterministic"], default="deterministic")
@@ -238,6 +244,16 @@ def main() -> None:
     if args.command == "stats":
         with SQLiteStore(Path(args.db).expanduser()) as store:
             print(json.dumps(store.stats(), ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if args.command == "audit-block-chunks":
+        output_dir = (
+            Path(args.output_dir).expanduser()
+            if args.output_dir
+            else Path("benchmarks/block_chunk_audit") / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        )
+        report = audit_block_chunks(Path(args.db).expanduser(), output_dir)
+        print(json.dumps({"output_dir": str(output_dir), **report["summary"], "consistency": report["consistency"]}, ensure_ascii=False, indent=2, sort_keys=True))
         return
 
     if args.command == "embed":
