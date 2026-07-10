@@ -12,10 +12,11 @@ import json
 import math
 import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from statistics import median
 from typing import Any, Iterable
 
 from kb.benchmark import DirectRetrievalSession
@@ -27,6 +28,7 @@ from kb.storage.sqlite_store import SQLiteStore
 
 SNAPSHOT_SCHEMA = "kb.fusion.raw_scores.v1"
 SNAPSHOT_MANIFEST_SCHEMA = "kb.fusion.snapshot_manifest.v1"
+UNIFIED_PROBES_SCHEMA = "kb.unified_retrieval_probes.v1"
 EVALUATION_SCHEMA = "kb.fusion.evaluation.v1"
 DEFAULT_DENSE_MODEL = "BAAI/bge-m3"
 DEFAULT_SPARSE_MODEL = "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1"
@@ -64,6 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--dense-torch-dtype", default="float16")
     snapshot.add_argument("--sparse-torch-dtype", default="float16")
     snapshot.add_argument("--sparse-top-k", type=int, default=128)
+    snapshot.add_argument("--snapshot-top-k", type=int, default=None)
     evaluate = commands.add_parser("evaluate", help="Evaluate a snapshot without models or database access.")
     evaluate.add_argument("--snapshot", required=True)
     evaluate.add_argument("--probe-file", required=True)
@@ -89,6 +92,7 @@ def main() -> int:
             dense_torch_dtype=args.dense_torch_dtype,
             sparse_torch_dtype=args.sparse_torch_dtype,
             sparse_top_k=args.sparse_top_k,
+            snapshot_top_k=args.snapshot_top_k,
         )
     else:
         report = evaluate_raw_score_snapshot(
@@ -114,6 +118,7 @@ def create_raw_score_snapshot(
     dense_torch_dtype: str = "float16",
     sparse_torch_dtype: str = "float16",
     sparse_top_k: int = 128,
+    snapshot_top_k: int | None = None,
 ) -> dict[str, Any]:
     """Create a private raw-score snapshot without mutating the DB."""
     probes = _load_probes(probe_path)
@@ -136,7 +141,18 @@ def create_raw_score_snapshot(
             dense_ranks = _ranks(scores.dense_scores, [block.chunk_id for block in session.blocks])
             sparse_ranks = _ranks(scores.sparse_scores, [block.chunk_id for block in session.blocks])
             query_timing[probe.probe_id] = {"query_encoding_ms": scores.query_encoding_ms, "base_scoring_ms": scores.base_scoring_ms}
-            for index, block in enumerate(session.blocks):
+            selected_indices = range(len(session.blocks))
+            if snapshot_top_k is not None:
+                if snapshot_top_k <= 0:
+                    raise ValueError("snapshot_top_k must be positive when provided.")
+                selected_indices = [
+                    index
+                    for index, block in enumerate(session.blocks)
+                    if dense_ranks[block.chunk_id] <= snapshot_top_k
+                    or sparse_ranks[block.chunk_id] <= snapshot_top_k
+                ]
+            for index in selected_indices:
+                block = session.blocks[index]
                 extra = metadata[block.chunk_id]
                 handle.write(json.dumps({
                     "schema_version": SNAPSHOT_SCHEMA,
@@ -164,6 +180,8 @@ def create_raw_score_snapshot(
         "chunk_count": session.candidate_blocks,
         "raw_score_rows": rows_written,
         "chunk_policy_id": policy.id,
+        "snapshot_top_k": snapshot_top_k,
+        "snapshot_score_coverage": "full_corpus_scores_top_k_persisted" if snapshot_top_k else "full_corpus_rows_persisted",
         "providers": {"dense": dense.contract_dict(), "sparse": sparse.contract_dict()},
         "devices": {"dense": dense_device, "sparse": sparse_device},
         "dtypes": {"dense": dense_torch_dtype, "sparse": sparse_torch_dtype},
@@ -213,8 +231,10 @@ def evaluate_raw_score_snapshot(
         "status": "completed",
         "created_at_utc": datetime.now(UTC).isoformat(),
         "snapshot": str(snapshot_path),
+        "snapshot_timing_ms": snapshot_manifest.get("timing_ms", {}),
         "probe_count": len(probes),
-        "chunk_count": len(next(iter(grouped.values()))),
+        "probe_counts": _probe_counts(probes),
+        "chunk_count": max((len(value) for value in grouped.values()), default=0),
         "current_fusion": {"formula": "0.65 * dense_cosine + 0.35 * sparse_cosine", "normalization": "none", "candidate_pool": "all chunks", "missing_score": "zero", "tie_break": "chunk_id ascending"},
         "candidate_pool_analysis": _candidate_pool_analysis(probes, grouped, candidate_ks),
         "lexical_overlap": snapshot_manifest.get("lexical_overlap", []),
@@ -226,6 +246,7 @@ def evaluate_raw_score_snapshot(
             dense_records=per_variant["dense_only"]["records"],
             sparse_records=per_variant["sparse_only"]["records"],
             rrf_records=per_variant["rrf_k60_union_20"]["records"],
+            current_records=per_variant["current_weighted_065_035"]["records"],
         ),
         "verdict": verdict,
         "recommendation": _recommendation(best, baseline),
@@ -243,12 +264,17 @@ def evaluate_raw_score_snapshot(
 
 def _load_probes(path: Path) -> list[RealProbe]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != PROBES_SCHEMA:
+    schema = payload.get("schema_version")
+    if schema not in {PROBES_SCHEMA, UNIFIED_PROBES_SCHEMA}:
         raise ValueError("Unsupported probe manifest schema.")
     probes = []
     for item in payload["probes"]:
         normalized = dict(item)
-        normalized.setdefault("probe_type", normalized.get("transformation_type", "unspecified"))
+        normalized.setdefault("category", normalized.get("probe_type", normalized.get("transformation_type", "unspecified")))
+        normalized.setdefault("probe_type", normalized["category"])
+        normalized.setdefault("transformation_type", normalized["category"])
+        normalized.setdefault("source_dataset", "unknown")
+        normalized.setdefault("expected_chunk_ids", None)
         probes.append(RealProbe(**normalized))
     return probes
 
@@ -330,9 +356,8 @@ def _group_snapshot(rows: list[SnapshotRow], probes: list[RealProbe]) -> dict[st
     expected_ids = {probe.probe_id for probe in probes}
     if set(grouped) != expected_ids:
         raise ValueError("Snapshot probe IDs do not match probe manifest.")
-    counts = {len(value) for value in grouped.values()}
-    if len(counts) != 1 or not counts or 0 in counts:
-        raise ValueError("Snapshot must contain the same non-zero chunk count for every probe.")
+    if not grouped or any(not value for value in grouped.values()):
+        raise ValueError("Snapshot must contain non-zero rows for every probe.")
     return dict(grouped)
 
 
@@ -374,10 +399,13 @@ def _evaluate_probe(probe: RealProbe, rows: list[SnapshotRow], variant: dict[str
     conversation_order = sorted(conversations.values(), key=lambda item: (-item[1], item[0].chunk_id))
     conversation_ranks = {row.source_conversation_id: rank for rank, (row, _) in enumerate(conversation_order, start=1)}
     expected_rows = [row for row in rows if row.source_message_id == probe.expected_message_id]
+    if probe.expected_chunk_ids:
+        expected_chunk_ids = set(probe.expected_chunk_ids)
+        expected_rows = [row for row in expected_rows if row.chunk_id in expected_chunk_ids]
     expected_chunk_rank = min((chunk_ranks.get(row.chunk_id) for row in expected_rows if row.chunk_id in chunk_ranks), default=None)
     expected_message_rank = message_ranks.get(probe.expected_message_id)
     expected_conversation_rank = conversation_ranks.get(probe.expected_conversation_id)
-    return {"probe_id": probe.probe_id, "probe_type": probe.probe_type, "transformation_type": probe.transformation_type, "query_language": probe.query_language, "source_language": probe.source_language, "expected_message_id": probe.expected_message_id, "expected_conversation_id": probe.expected_conversation_id, "expected_chunk_ids": [row.chunk_id for row in expected_rows], "chunk_rank": expected_chunk_rank, "message_rank": expected_message_rank, "conversation_rank": expected_conversation_rank, "supporting_chunk_id": messages.get(probe.expected_message_id, (None, 0.0))[0].chunk_id if probe.expected_message_id in messages else None, "top_chunks": [_row_for_report(row, score, chunk_ranks[row.chunk_id]) for row, score in chunk_order[:20]], "latency_ms": (time.perf_counter() - started) * 1000}
+    return {"probe_id": probe.probe_id, "probe_type": probe.probe_type, "transformation_type": probe.transformation_type, "category": probe.category, "source_dataset": probe.source_dataset, "expected_role": probe.expected_role, "query_language": probe.query_language, "source_language": probe.source_language, "expected_message_id": probe.expected_message_id, "expected_conversation_id": probe.expected_conversation_id, "expected_chunk_ids": [row.chunk_id for row in expected_rows], "chunk_rank": expected_chunk_rank, "message_rank": expected_message_rank, "conversation_rank": expected_conversation_rank, "supporting_chunk_id": messages.get(probe.expected_message_id, (None, 0.0))[0].chunk_id if probe.expected_message_id in messages else None, "top_chunks": [_row_for_report(row, score, chunk_ranks[row.chunk_id]) for row, score in chunk_order[:20]], "latency_ms": (time.perf_counter() - started) * 1000}
 
 
 def _score_variant(rows: list[SnapshotRow], variant: dict[str, Any]) -> list[tuple[SnapshotRow, float]]:
@@ -408,7 +436,8 @@ def _metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
         return sum(1 for row in records if row[field] is not None and row[field] <= k) / len(records) if records else 0.0
     def mrr(field: str) -> float:
         return sum(1.0 / row[field] for row in records if row[field]) / len(records) if records else 0.0
-    return {"chunk_recall_at": {str(k): recall("chunk_rank", k) for k in (1, 5, 10, 20)}, "message_recall_at": {str(k): recall("message_rank", k) for k in (1, 5, 10, 20)}, "conversation_recall_at": {str(k): recall("conversation_rank", k) for k in (10, 20)}, "message_mrr": mrr("message_rank"), "breakdown": _breakdown(records)}
+    message_ranks = [row["message_rank"] for row in records if row["message_rank"]]
+    return {"chunk_recall_at": {str(k): recall("chunk_rank", k) for k in (1, 5, 10, 20)}, "message_recall_at": {str(k): recall("message_rank", k) for k in (1, 5, 10, 20)}, "conversation_recall_at": {str(k): recall("conversation_rank", k) for k in (10, 20)}, "message_mrr": mrr("message_rank"), "median_expected_message_rank": median(message_ranks) if message_ranks else None, "message_miss_count_at_20": sum(1 for row in records if not row["message_rank"] or row["message_rank"] > 20), "breakdown": _breakdown(records)}
 
 
 def _breakdown(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -416,9 +445,22 @@ def _breakdown(records: list[dict[str, Any]]) -> dict[str, Any]:
     for row in records:
         groups[row["transformation_type"]].append(row)
         groups[f"query_language:{row['query_language']}"] .append(row)
+        groups[f"category:{row['category']}"] .append(row)
+        groups[f"expected_role:{row['expected_role'] or 'unknown'}"] .append(row)
+        groups[f"source_dataset:{row['source_dataset']}"] .append(row)
         if row["source_language"] in {"ru", "en"} and row["query_language"] in {"ru", "en"}:
             groups[f"{row['source_language'].upper()}->{row['query_language'].upper()}"] .append(row)
     return {key: {"count": len(value), "message_recall_at_10": sum(1 for row in value if row["message_rank"] and row["message_rank"] <= 10) / len(value), "message_mrr": sum(1 / row["message_rank"] for row in value if row["message_rank"]) / len(value)} for key, value in sorted(groups.items())}
+
+
+def _probe_counts(probes: list[RealProbe]) -> dict[str, dict[str, int]]:
+    dimensions = {
+        "category": [probe.category for probe in probes],
+        "query_language": [probe.query_language for probe in probes],
+        "expected_role": [probe.expected_role or "unknown" for probe in probes],
+        "source_dataset": [probe.source_dataset for probe in probes],
+    }
+    return {dimension: dict(sorted(Counter(values).items())) for dimension, values in dimensions.items()}
 
 
 def _miss_diagnostics(
@@ -487,24 +529,30 @@ def _rescue_analysis(
     dense_records: list[dict[str, Any]],
     sparse_records: list[dict[str, Any]],
     rrf_records: list[dict[str, Any]],
+    current_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     dense = {row["probe_id"]: row for row in dense_records}
     sparse = {row["probe_id"]: row for row in sparse_records}
     rrf = {row["probe_id"]: row for row in rrf_records}
+    current = {row["probe_id"]: row for row in (current_records or [])}
     dense_rescues = []
     sparse_rescues = []
     rrf_rescues = []
+    hybrid_regressions = []
     dense_wins = sparse_wins = both_hit = both_miss = 0
     for probe_id, dense_row in dense.items():
         sparse_row, rrf_row = sparse[probe_id], rrf[probe_id]
         dense_rank, sparse_rank, rrf_rank = dense_row["message_rank"], sparse_row["message_rank"], rrf_row["message_rank"]
-        record = {"probe_id": probe_id, "transformation_type": dense_row["transformation_type"], "dense_rank": dense_rank, "sparse_rank": sparse_rank, "rrf_rank": rrf_rank}
+        record = {"probe_id": probe_id, "transformation_type": dense_row["transformation_type"], "category": dense_row.get("category", dense_row["transformation_type"]), "source_dataset": dense_row.get("source_dataset", "unknown"), "dense_rank": dense_rank, "sparse_rank": sparse_rank, "rrf_rank": rrf_rank}
         if dense_rank and dense_rank <= 20 and (not sparse_rank or sparse_rank > 20):
             dense_rescues.append(record)
         if sparse_rank and sparse_rank <= 20 and (not dense_rank or dense_rank > 20):
             sparse_rescues.append(record)
         if (not dense_rank or dense_rank > 10) and (not sparse_rank or sparse_rank > 10) and rrf_rank and rrf_rank <= 10:
             rrf_rescues.append(record)
+        if current_rank := current.get(probe_id, {}).get("message_rank"):
+            if current_rank > 20 and ((dense_rank and dense_rank <= 20) or (sparse_rank and sparse_rank <= 20)):
+                hybrid_regressions.append({**record, "current_rank": current_rank})
         if dense_rank and dense_rank <= 10 and (not sparse_rank or sparse_rank > 20):
             dense_wins += 1
         elif sparse_rank and sparse_rank <= 10 and (not dense_rank or dense_rank > 20):
@@ -513,7 +561,7 @@ def _rescue_analysis(
             both_hit += 1
         elif (not dense_rank or dense_rank > 20) and (not sparse_rank or sparse_rank > 20):
             both_miss += 1
-    return {"dense_rescues": dense_rescues, "sparse_rescues": sparse_rescues, "rrf_rescues": rrf_rescues, "counts": {"dense_only_wins": dense_wins, "sparse_only_wins": sparse_wins, "both_hit_at_10": both_hit, "both_miss_at_20": both_miss}}
+    return {"dense_rescues": dense_rescues, "sparse_rescues": sparse_rescues, "rrf_rescues": rrf_rescues, "hybrid_regressions": hybrid_regressions, "counts": {"dense_only_wins": dense_wins, "sparse_only_wins": sparse_wins, "both_hit_at_10": both_hit, "both_miss_at_20": both_miss}}
 
 
 def _meets_sparse_guard(metrics: dict[str, Any], baseline: dict[str, Any]) -> bool:
@@ -545,10 +593,14 @@ def _recommendation(best: dict[str, Any], baseline: dict[str, Any]) -> str:
 
 
 def _markdown_report(report: dict[str, Any]) -> str:
-    lines = ["# Dense/Sparse Fusion Evaluation", "", f"Verdict: **{report['verdict']}**", "", "## Variants", "", "| Variant | Message R@10 | Message R@20 | Message MRR | Chunk R@20 | Conv R@20 | p50 ms |", "|---|---:|---:|---:|---:|---:|---:|"]
+    lines = ["# Dense/Sparse Fusion Evaluation", "", f"Verdict: **{report['verdict']}**", "", "## Probe Set", ""]
+    for dimension, values in report.get("probe_counts", {}).items():
+        lines.append(f"- {dimension}: `{json.dumps(values, ensure_ascii=False, sort_keys=True)}`")
+    lines += ["", "## Variants", "", "| Variant | Message R@10 | Message R@20 | Message MRR | Median rank | Miss@20 | Chunk R@20 | Conv R@20 | p50 ms |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for item in report["variants"]:
         metric, latency = item["metrics"], item["latency_ms"]
-        lines.append(f"| {item['id']} | {metric['message_recall_at']['10']:.3f} | {metric['message_recall_at']['20']:.3f} | {metric['message_mrr']:.3f} | {metric['chunk_recall_at']['20']:.3f} | {metric['conversation_recall_at']['20']:.3f} | {latency['p50']:.3f} |")
+        median_rank = metric.get("median_expected_message_rank")
+        lines.append(f"| {item['id']} | {metric['message_recall_at']['10']:.3f} | {metric['message_recall_at']['20']:.3f} | {metric['message_mrr']:.3f} | {median_rank if median_rank is not None else 'n/a'} | {metric.get('message_miss_count_at_20', 'n/a')} | {metric['chunk_recall_at']['20']:.3f} | {metric['conversation_recall_at']['20']:.3f} | {latency['p50']:.3f} |")
     lexical = report.get("lexical_overlap", [])
     if lexical:
         suspicious = [item["probe_id"] for item in lexical if item.get("suspiciously_high")]
@@ -557,6 +609,7 @@ def _markdown_report(report: dict[str, Any]) -> str:
     if rescues:
         counts = rescues.get("counts", {})
         lines.extend(["", "## Branch Contribution", "", f"- dense rescues@20: {len(rescues.get('dense_rescues', []))}", f"- sparse rescues@20: {len(rescues.get('sparse_rescues', []))}", f"- RRF rescues@10: {len(rescues.get('rrf_rescues', []))}", f"- dense-only wins@10: {counts.get('dense_only_wins', 0)}", f"- sparse-only wins@10: {counts.get('sparse_only_wins', 0)}"])
+        lines.append(f"- current hybrid regressions versus a single branch: {len(rescues.get('hybrid_regressions', []))}")
     key_variants = [item for item in report["variants"] if item["id"] in {"dense_only", "sparse_only", "current_weighted_065_035", "rrf_k60_union_20"}]
     categories = sorted({key for item in key_variants for key in item["metrics"]["breakdown"] if not key.startswith("query_language:")})
     if categories:

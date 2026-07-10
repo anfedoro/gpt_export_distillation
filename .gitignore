@@ -27,6 +27,7 @@ benchmarks/real_data_preflight/
 benchmarks/fusion_eval/
 benchmarks/semantic_mismatch_eval/
 benchmarks/block_chunk_audit/
+benchmarks/full_retrieval_eval/
 
 # Private local preflight manifests, probes, and filtered source samples
 .local/

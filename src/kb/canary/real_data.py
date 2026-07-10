@@ -51,6 +51,9 @@ class RealProbe:
     notes: str | None = None
     transformation_type: str = "unspecified"
     source_language: str | None = None
+    category: str = "unspecified"
+    source_dataset: str = "unknown"
+    expected_chunk_ids: list[str] | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
