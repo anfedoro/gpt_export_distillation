@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import sqlite3
 import sys
 import tempfile
 from io import StringIO
@@ -17,6 +18,7 @@ if str(SRC) not in sys.path:
 
 from kb.cli import _chunked_embedding_space_id, build_edges_command, build_nodes_command, build_parser as build_index_parser, embed_knowledge_blocks, import_knowledge_base, ingest_attachments, ingest_chats  # noqa: E402
 from kb.benchmark import DirectRetrievalSession, RankingConfig, analyze_direct_retrieval_evaluation, build_breakdowns, build_pairwise_queries, calculate_query_metrics, default_ranking_configs, evaluate_direct_retrieval_run, run_direct_retrieval_benchmark, validate_direct_retrieval_dataset  # noqa: E402
+from kb.block_chunk_audit import audit_block_chunks  # noqa: E402
 from kb.canary.multilingual_dense import run_canary  # noqa: E402
 from kb.canary.real_data import _probe_metrics, _reject_unsafe_output_path, _validate_content_budget, load_or_create_manifest, validate_source_offsets  # noqa: E402
 from kb.fusion_eval import SNAPSHOT_SCHEMA, SnapshotRow, _lexical_overlap, _rescue_analysis, _score_variant, evaluate_raw_score_snapshot  # noqa: E402
@@ -193,6 +195,49 @@ def _static_sparse_terms(text: str) -> dict[str, float]:
 
 
 class KBMilestone1Tests(unittest.TestCase):
+    def test_block_chunk_audit_reports_distribution_and_consistency(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "audit.db"
+            output_dir = Path(tmp) / "report"
+            conn = sqlite3.connect(db_path)
+            conn.executescript(
+                """
+                CREATE TABLE source_documents (id TEXT PRIMARY KEY, interest_tier TEXT NOT NULL);
+                CREATE TABLE conversations (id TEXT PRIMARY KEY, source_document_id TEXT NOT NULL);
+                CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL);
+                CREATE TABLE blocks (
+                    id TEXT PRIMARY KEY, message_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
+                    block_type TEXT NOT NULL, raw_text TEXT NOT NULL, char_start INTEGER NOT NULL,
+                    char_end INTEGER NOT NULL
+                );
+                CREATE TABLE retrieval_chunks (
+                    id TEXT PRIMARY KEY, block_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+                    source_char_start INTEGER NOT NULL, source_char_end INTEGER NOT NULL,
+                    token_count INTEGER NOT NULL
+                );
+                INSERT INTO source_documents VALUES ('sd-1', 'normal');
+                INSERT INTO conversations VALUES ('conv-1', 'sd-1');
+                INSERT INTO messages VALUES ('msg-1', 'conv-1', 'user');
+                INSERT INTO blocks VALUES ('block-1', 'msg-1', 'conv-1', 'prose', 'abcdefghij', 0, 10);
+                INSERT INTO blocks VALUES ('block-2', 'msg-1', 'conv-1', 'code', '   ', 10, 13);
+                INSERT INTO retrieval_chunks VALUES ('chunk-1', 'block-1', 1, 0, 5, 4);
+                INSERT INTO retrieval_chunks VALUES ('chunk-2', 'block-1', 2, 5, 10, 5);
+                """
+            )
+            conn.commit()
+            conn.close()
+
+            report = audit_block_chunks(db_path, output_dir)
+
+            self.assertEqual(report["summary"]["total_structural_blocks"], 2)
+            self.assertEqual(report["summary"]["total_retrieval_chunks"], 2)
+            self.assertEqual(report["distribution"][0]["chunks_per_block"], 0)
+            self.assertEqual(report["distribution"][1]["chunks_per_block"], 2)
+            self.assertEqual(report["blocks_without_chunks"]["by_reason"], {"empty_or_whitespace": 1})
+            self.assertTrue(report["consistency"]["all_checks_passed"])
+            self.assertTrue((output_dir / "report.md").exists())
+            self.assertTrue((output_dir / "report.json").exists())
+
     def test_fusion_lexical_overlap_and_rescue_counts(self) -> None:
         from kb.canary.real_data import RealProbe
 
