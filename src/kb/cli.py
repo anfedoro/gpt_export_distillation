@@ -21,6 +21,7 @@ from kb.embeddings.sentence_transformer_provider import (
 from kb.block_chunk_audit import audit_block_chunks
 from kb.storage_audit import audit_storage
 from kb.storage.dense_native import audit_dense_native, migrate_dense_native, write_dense_native_report
+from kb.storage.sparse_backend_spike import run_sparse_backend_spike
 from kb.index.chunk_builder import ChunkPolicy, build_chunk_policy
 from kb.index.edge_builder import build_similarity_edges
 from kb.index.semantic_node_builder import build_deterministic_nodes
@@ -160,6 +161,16 @@ def build_parser() -> argparse.ArgumentParser:
     audit_dense_native_parser.add_argument("--source-db")
     audit_dense_native_parser.add_argument("--sample-size", type=int, default=1000)
     audit_dense_native_parser.add_argument("--report-dir")
+
+    sparse_spike_parser = sub.add_parser(
+        "sparse-backend-spike",
+        help="Compare compact sparse storage formats on an existing representation subset.",
+    )
+    sparse_spike_parser.add_argument("--db", required=True)
+    sparse_spike_parser.add_argument("--output-dir", required=True)
+    sparse_spike_parser.add_argument("--chunks", type=int, default=15000)
+    sparse_spike_parser.add_argument("--queries", type=int, default=32)
+    sparse_spike_parser.add_argument("--top-k", type=int, default=20)
 
     build_nodes = sub.add_parser("build-nodes", help="Build deterministic semantic nodes.")
     build_nodes.add_argument("--db", required=True)
@@ -308,6 +319,17 @@ def main() -> None:
         )
         if args.report_dir:
             write_dense_native_report(report, Path(args.report_dir).expanduser())
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if args.command == "sparse-backend-spike":
+        report = run_sparse_backend_spike(
+            source_db=Path(args.db).expanduser(),
+            output_dir=Path(args.output_dir).expanduser(),
+            chunk_limit=args.chunks,
+            query_count=args.queries,
+            top_k=args.top_k,
+        )
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
         return
 

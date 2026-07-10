@@ -22,6 +22,7 @@ from kb.benchmark import DirectRetrievalSession, RankingConfig, analyze_direct_r
 from kb.block_chunk_audit import audit_block_chunks  # noqa: E402
 from kb.storage_audit import audit_storage  # noqa: E402
 from kb.storage.dense_native import DenseNativeError, NativeDenseSearchBackend, migrate_dense_native, serialize_float32  # noqa: E402
+from kb.storage.sparse_backend_spike import run_sparse_backend_spike, sparse_cosine  # noqa: E402
 from kb.canary.multilingual_dense import run_canary  # noqa: E402
 from kb.canary.real_data import _probe_metrics, _reject_unsafe_output_path, _validate_content_budget, load_or_create_manifest, validate_source_offsets  # noqa: E402
 from kb.fusion_eval import SNAPSHOT_SCHEMA, SnapshotRow, _load_probes, _lexical_overlap, _rescue_analysis, _score_variant, evaluate_raw_score_snapshot  # noqa: E402
@@ -342,6 +343,33 @@ class KBMilestone1Tests(unittest.TestCase):
             sqlite3.connect(path).close()
             with self.assertRaises(DenseNativeError):
                 NativeDenseSearchBackend(path)
+
+    def test_sparse_backend_spike_reconstructs_vectors_and_preserves_scores(self) -> None:
+        self.assertAlmostEqual(
+            sparse_cosine({1: 2.0, 2: 1.0}, {1: 2.0, 2: 1.0}),
+            1.0,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.db"
+            output = Path(tmp) / "spike"
+            init_db(source)
+            with sqlite3.connect(source) as conn:
+                for owner, rows in (
+                    ("chunk-a", [("term-a", "a", 1.0), ("term-b", "b", 0.5)]),
+                    ("chunk-b", [("term-a", "a", 0.5), ("term-c", "c", 1.0)]),
+                ):
+                    conn.executemany(
+                        "INSERT INTO sparse_terms(owner_type,owner_id,token_id,token_text,weight,model_name,embedding_space_id) VALUES(?,?,?,?,?,?,?)",
+                        [("retrieval_chunk", owner, token_id, token_text, weight, "sparse", "space") for token_id, token_text, weight in rows],
+                    )
+            before = source.read_bytes()
+            report = run_sparse_backend_spike(source_db=source, output_dir=output, chunk_limit=2, query_count=2, top_k=2)
+            self.assertEqual(report["subset"]["chunks"], 2)
+            self.assertEqual(report["results"]["compact_blob"]["parity"]["top_k_identical_count"], 2)
+            self.assertEqual(report["results"]["compact_postings"]["parity"]["top_k_identical_count"], 2)
+            self.assertEqual(source.read_bytes(), before)
+            self.assertTrue((output / "report.json").exists())
+            self.assertTrue((output / "report.md").exists())
 
     def test_fusion_lexical_overlap_and_rescue_counts(self) -> None:
         from kb.canary.real_data import RealProbe
