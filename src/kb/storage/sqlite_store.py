@@ -958,6 +958,66 @@ class SQLiteStore:
                 item["sparse_embedding_space_id"] = row["embedding_space_id"]
         return list(grouped.values())
 
+    def retrieval_chunk_provenance(self, chunk_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Load chunk provenance without loading dense JSON or sparse terms."""
+        result: dict[str, dict[str, Any]] = {}
+        for offset in range(0, len(chunk_ids), 900):
+            batch = chunk_ids[offset : offset + 900]
+            if not batch:
+                continue
+            placeholders = ",".join("?" for _ in batch)
+            query = f"""
+                SELECT
+                    rc.id AS chunk_id,
+                    rc.block_id,
+                    rc.ordinal AS chunk_ordinal,
+                    rc.source_char_start,
+                    rc.source_char_end,
+                    rc.token_count,
+                    rc.text AS chunk_text,
+                    b.block_type,
+                    b.language,
+                    m.id AS message_id,
+                    m.role,
+                    m.message_id AS source_message_id,
+                    c.id AS conversation_id,
+                    c.conversation_id AS source_conversation_id,
+                    c.title AS conversation_title,
+                    c.project_id,
+                    c.folder_kind,
+                    sd.interest_tier,
+                    sd.relative_path AS source_path
+                FROM retrieval_chunks rc
+                JOIN blocks b ON b.id = rc.block_id
+                JOIN messages m ON m.id = b.message_id
+                JOIN conversations c ON c.id = m.conversation_id
+                JOIN source_documents sd ON sd.id = c.source_document_id
+                WHERE rc.id IN ({placeholders})
+            """
+            for row in self.conn.execute(query, batch):
+                chunk_id = str(row["chunk_id"])
+                result[chunk_id] = {
+                    "chunk_id": chunk_id,
+                    "block_id": row["block_id"],
+                    "project_id": row["project_id"],
+                    "folder_kind": row["folder_kind"],
+                    "interest_tier": row["interest_tier"],
+                    "conversation_id": row["conversation_id"],
+                    "source_conversation_id": row["source_conversation_id"],
+                    "message_id": row["message_id"],
+                    "source_message_id": row["source_message_id"],
+                    "role": row["role"],
+                    "block_type": row["block_type"],
+                    "language": row["language"],
+                    "source_char_start": row["source_char_start"],
+                    "source_char_end": row["source_char_end"],
+                    "token_count": row["token_count"],
+                    "text_for_display": row["chunk_text"],
+                    "source_path": row["source_path"],
+                    "conversation_title": row["conversation_title"],
+                }
+        return result
+
     def legacy_block_level_embedding_count(self) -> int:
         dense = self.conn.execute("SELECT COUNT(*) FROM dense_vectors WHERE owner_type = 'knowledge_block'").fetchone()[0]
         sparse = self.conn.execute("SELECT COUNT(*) FROM sparse_terms WHERE owner_type = 'knowledge_block'").fetchone()[0]
