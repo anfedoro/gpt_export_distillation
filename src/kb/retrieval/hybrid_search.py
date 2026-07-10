@@ -10,6 +10,7 @@ from typing import Any
 from kb.cli import _build_dense_provider, _build_sparse_provider, _chunked_embedding_space_id
 from kb.index.chunk_builder import build_chunk_policy
 from kb.storage.dense_native import DenseNativeError, NativeDenseSearchBackend
+from kb.storage.native_pre_mvp import NativePreMvpError, native_pre_mvp_query
 from kb.storage.sqlite_store import SQLiteStore
 
 
@@ -28,7 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--beta", type=float, default=0.35)
     query.add_argument("--project")
     query.add_argument("--dense-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
-    query.add_argument("--dense-backend", choices=["legacy-json", "sqlite-native"], default="legacy-json")
+    query.add_argument("--dense-backend", choices=["legacy-json", "sqlite-native", "compact-native"], default="legacy-json")
+    query.add_argument("--dense-device")
+    query.add_argument("--sparse-device")
+    query.add_argument("--dense-torch-dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
+    query.add_argument("--sparse-torch-dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
     query.add_argument("--sparse-provider", choices=["sentence-transformers", "mock", "none"], default="sentence-transformers")
     query.add_argument("--dense-model", default="sentence-transformers/all-MiniLM-L6-v2")
     query.add_argument("--sparse-model", default="opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1")
@@ -73,6 +78,10 @@ def main() -> None:
             sparse_provider=args.sparse_provider,
             dense_model=args.dense_model,
             sparse_model=args.sparse_model,
+            dense_device=args.dense_device,
+            sparse_device=args.sparse_device,
+            dense_torch_dtype=args.dense_torch_dtype,
+            sparse_torch_dtype=args.sparse_torch_dtype,
             sparse_top_k=args.sparse_top_k,
             include_low_interest=args.include_low_interest,
             diagnostics=args.diagnostics,
@@ -127,6 +136,10 @@ def hybrid_query(
     sparse_provider: str = "sentence-transformers",
     dense_model: str = "sentence-transformers/all-MiniLM-L6-v2",
     sparse_model: str = "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1",
+    dense_device: str | None = None,
+    sparse_device: str | None = None,
+    dense_torch_dtype: str = "auto",
+    sparse_torch_dtype: str = "auto",
     sparse_top_k: int = 128,
     include_low_interest: bool = False,
     diagnostics: bool = False,
@@ -135,8 +148,8 @@ def hybrid_query(
     if limit <= 0:
         raise ValueError("--limit must be positive.")
     provider_started = time.perf_counter()
-    dense = _build_dense_provider(dense_provider, dense_model) if dense_provider != "none" else None
-    sparse = _build_sparse_provider(sparse_provider, sparse_model, sparse_top_k) if sparse_provider != "none" else None
+    dense = _build_dense_provider(dense_provider, dense_model, device=dense_device, torch_dtype=dense_torch_dtype) if dense_provider != "none" else None
+    sparse = _build_sparse_provider(sparse_provider, sparse_model, sparse_top_k, device=sparse_device, torch_dtype=sparse_torch_dtype) if sparse_provider != "none" else None
     if dense is None and sparse is None:
         raise ValueError("At least one retrieval provider must be enabled.")
     active_providers = [item for item in (dense, sparse) if item is not None]
@@ -149,6 +162,22 @@ def hybrid_query(
     query_dense = dense.embed_query(query) if dense else None
     query_sparse = sparse.embed_query(query) if sparse else None
     query_encoded = time.perf_counter()
+
+    if dense_backend == "compact-native":
+        if dense is None or sparse is None:
+            raise ValueError("The compact-native backend requires both dense and sparse providers.")
+        if project is not None or include_low_interest:
+            raise NativePreMvpError("The compact-native backend only searches the canonical indexable corpus; metadata filters are not implemented.")
+        return native_pre_mvp_query(
+            db_path=db_path,
+            query=query,
+            dense=dense,
+            sparse=sparse,
+            limit=limit,
+            alpha=alpha,
+            beta=beta,
+            policy_id=policy.id,
+        )
 
     if dense_backend == "sqlite-native":
         return _native_hybrid_query(

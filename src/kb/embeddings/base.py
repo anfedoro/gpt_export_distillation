@@ -62,6 +62,10 @@ class DenseEmbeddingProvider(ABC):
     def token_count(self, text: str) -> int:
         raise RuntimeError(f"Provider {self.model_name} does not expose a reliable tokenizer.")
 
+    def fits_token_budget(self, text: str, budget: int) -> bool:
+        """Return whether text fits, without requiring a full unbounded tokenization."""
+        return self.token_count(text) <= budget
+
     def assert_fits(self, text: str, *, chunk_id: str, block_id: str, source_identity: str) -> int:
         if self.effective_max_sequence_length is None:
             raise RuntimeError(f"Provider {self.model_name} does not expose an effective max sequence length.")
@@ -112,6 +116,10 @@ class SparseEmbeddingProvider(ABC):
 
     def token_count(self, text: str) -> int:
         raise RuntimeError(f"Provider {self.model_name} does not expose a reliable tokenizer.")
+
+    def fits_token_budget(self, text: str, budget: int) -> bool:
+        """Return whether text fits, without requiring a full unbounded tokenization."""
+        return self.token_count(text) <= budget
 
     def assert_fits(self, text: str, *, chunk_id: str, block_id: str, source_identity: str) -> int:
         if self.effective_max_sequence_length is None:

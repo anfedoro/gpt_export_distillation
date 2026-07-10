@@ -23,6 +23,7 @@ from kb.block_chunk_audit import audit_block_chunks  # noqa: E402
 from kb.storage_audit import audit_storage  # noqa: E402
 from kb.storage.dense_native import DenseNativeError, NativeDenseSearchBackend, migrate_dense_native, serialize_float32  # noqa: E402
 from kb.storage.sparse_backend_spike import run_sparse_backend_spike, sparse_cosine  # noqa: E402
+from kb.storage.native_pre_mvp import CompactSparseSearchBackend, NativeBuildStore, NativePreMvpError  # noqa: E402
 from kb.canary.multilingual_dense import run_canary  # noqa: E402
 from kb.canary.real_data import _probe_metrics, _reject_unsafe_output_path, _validate_content_budget, load_or_create_manifest, validate_source_offsets  # noqa: E402
 from kb.fusion_eval import SNAPSHOT_SCHEMA, SnapshotRow, _load_probes, _lexical_overlap, _rescue_analysis, _score_variant, evaluate_raw_score_snapshot  # noqa: E402
@@ -199,6 +200,42 @@ def _static_sparse_terms(text: str) -> dict[str, float]:
 
 
 class KBMilestone1Tests(unittest.TestCase):
+    def test_clean_native_schema_compact_sparse_and_no_legacy_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "native.db"
+            with NativeBuildStore(db) as store:
+                store.conn.execute("INSERT INTO source_documents VALUES('src','/tmp/x','x.md','chat_md',NULL,'normal',NULL,NULL,'x.md','md','hash',NULL,NULL,'{}')")
+                store.conn.execute("INSERT INTO conversations VALUES('conv','src','c',NULL,NULL,NULL,NULL,1,0,1,10,0,NULL,NULL,'{}')")
+                store.conn.execute("INSERT INTO messages VALUES('msg','conv',1,'user','m',NULL,'alpha beta','{}')")
+                store.conn.execute("INSERT INTO blocks VALUES('block','msg',NULL,1,'prose',NULL,0,10,'{}')")
+                store.conn.executemany(
+                    "INSERT INTO retrieval_chunks VALUES(?,?,?,?,?,?,?,?,?)",
+                    [
+                        ('chunk-a','block',1,0,5,2,'alpha','policy','{}'),
+                        ('chunk-b','block',2,6,10,2,'beta','policy','{}'),
+                    ],
+                )
+                rows = store.conn.execute("SELECT id,block_id,text FROM retrieval_chunks ORDER BY id").fetchall()
+                store.write_embedding_batch(
+                    rows=rows,
+                    dense_vectors=[[1.0] + [0.0] * 1023, [0.0, 1.0] + [0.0] * 1022],
+                    sparse_vectors=[{'alpha': 1.0}, {'beta': 1.0}],
+                    dense_model='dense', dense_space='dense-space', sparse_model='sparse', sparse_space='sparse-space',
+                )
+                store.commit()
+                audit = store.audit()
+            self.assertEqual(audit['counts']['dense_vectors_native'], 2)
+            self.assertEqual(audit['counts']['sparse_vectors_compact'], 2)
+            self.assertEqual(audit['legacy_tables_present'], [])
+            with CompactSparseSearchBackend(db) as backend:
+                self.assertEqual([hit.chunk_id for hit in backend.search({'alpha': 1.0}, limit=2)], ['chunk-a', 'chunk-b'])
+                self.assertAlmostEqual(backend.search({'alpha': 1.0}, limit=1)[0].score, 1.0)
+                self.assertAlmostEqual(backend.search({'alpha': 1.0, 'oov': 1.0}, limit=1)[0].score, 1 / math.sqrt(2))
+            with sqlite3.connect(db) as conn:
+                conn.execute("CREATE TABLE sparse_terms (owner_id TEXT)")
+            with self.assertRaises(NativePreMvpError):
+                CompactSparseSearchBackend(db)
+
     def test_block_chunk_audit_reports_distribution_and_consistency(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "audit.db"
