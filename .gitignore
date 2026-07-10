@@ -32,6 +32,7 @@ benchmarks/block_chunk_audit/
 benchmarks/full_retrieval_eval/
 benchmarks/storage_audit/
 benchmarks/dense_native_migration/
+benchmarks/sparse_backend_spike/
 
 # Private local preflight manifests, probes, and filtered source samples
 .local/
