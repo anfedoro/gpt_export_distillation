@@ -21,7 +21,7 @@ from kb.benchmark import DirectRetrievalSession, RankingConfig, analyze_direct_r
 from kb.block_chunk_audit import audit_block_chunks  # noqa: E402
 from kb.canary.multilingual_dense import run_canary  # noqa: E402
 from kb.canary.real_data import _probe_metrics, _reject_unsafe_output_path, _validate_content_budget, load_or_create_manifest, validate_source_offsets  # noqa: E402
-from kb.fusion_eval import SNAPSHOT_SCHEMA, SnapshotRow, _lexical_overlap, _rescue_analysis, _score_variant, evaluate_raw_score_snapshot  # noqa: E402
+from kb.fusion_eval import SNAPSHOT_SCHEMA, SnapshotRow, _load_probes, _lexical_overlap, _rescue_analysis, _score_variant, evaluate_raw_score_snapshot  # noqa: E402
 from kb.ingest.chat_md_parser import parse_chat_file  # noqa: E402
 from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider  # noqa: E402
@@ -296,6 +296,34 @@ class KBMilestone1Tests(unittest.TestCase):
             sparse = next(item for item in report["variants"] if item["id"] == "sparse_only")
             self.assertEqual(sparse["metrics"]["message_recall_at"]["1"], 1.0)
             self.assertTrue(Path(report["report_json"]).exists())
+
+    def test_fusion_loader_accepts_unified_probe_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unified.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "kb.unified_retrieval_probes.v1",
+                        "probes": [
+                            {
+                                "probe_id": "p",
+                                "query": "private",
+                                "category": "exact_identifier",
+                                "query_language": "en",
+                                "expected_conversation_id": "c1",
+                                "expected_message_id": "m1",
+                                "expected_role": "user",
+                                "source_dataset": "gold",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            probe = _load_probes(path)[0]
+            self.assertEqual(probe.category, "exact_identifier")
+            self.assertEqual(probe.source_dataset, "gold")
+            self.assertEqual(probe.probe_type, "exact_identifier")
     def test_real_preflight_manifest_selection_is_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "export"
