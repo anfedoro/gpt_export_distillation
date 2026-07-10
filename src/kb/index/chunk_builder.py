@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from dataclasses import dataclass
 from statistics import median
 from typing import Any
@@ -14,6 +15,7 @@ CHUNK_POLICY_VERSION_V2 = "v2"
 DEFAULT_OVERLAP_RATIO = 0.15
 V2_FALLBACK_OVERLAP_DIVISOR = 16
 DEFAULT_SAFETY_RESERVE = 4
+OFFSET_TOKENIZATION_THRESHOLD_CHARS = 16_384
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,8 @@ def build_retrieval_chunks(
     chunks: list[RetrievalChunk] = []
     local_start = 0
     text_len = len(block_text)
+    token_offsets = _block_token_offsets(block_text, tokenizer_provider)
+    token_ends = [end for _, end in token_offsets] if token_offsets is not None else None
     ordinal = 1
     while local_start < text_len:
         local_end, split_reason = _max_end_for_budget(
@@ -112,6 +116,8 @@ def build_retrieval_chunks(
             policy.content_token_budget,
             tokenizer_provider,
             prefer_natural=policy.version == CHUNK_POLICY_VERSION_V2,
+            token_offsets=token_offsets,
+            token_ends=token_ends,
         )
         if local_end <= local_start:
             raise ValueError(f"Unable to create a fitting retrieval chunk for block {block_id} at char {local_start}.")
@@ -203,14 +209,24 @@ def _max_end_for_budget(
     provider: Any,
     *,
     prefer_natural: bool,
+    token_offsets: list[tuple[int, int]] | None = None,
+    token_ends: list[int] | None = None,
 ) -> tuple[int, str]:
+    offset_end = _max_end_from_token_offsets(
+        text, start, max_end, budget, provider, prefer_natural=prefer_natural, token_offsets=token_offsets, token_ends=token_ends,
+    )
+    if offset_end is not None:
+        return offset_end
+    # Most structural blocks already fit. Avoid a binary search with several
+    # tokenizer invocations when one exact, non-truncating check is sufficient.
+    if _fits_token_budget(provider, provider.embedding_input(text[start:max_end]), budget):
+        return max_end, "complete"
     lo = start + 1
     hi = max_end
     best = start
     while lo <= hi:
         mid = (lo + hi) // 2
-        count = provider.token_count(provider.embedding_input(text[start:mid]))
-        if count <= budget:
+        if _fits_token_budget(provider, provider.embedding_input(text[start:mid]), budget):
             best = mid
             lo = mid + 1
         else:
@@ -221,6 +237,46 @@ def _max_end_for_budget(
             return snapped, "complete"
         return snapped, "natural_boundary" if natural else "token_window_fallback"
     return best, "token_window_fallback" if best < max_end else "complete"
+
+
+def _fits_token_budget(provider: Any, text: str, budget: int) -> bool:
+    checker = getattr(provider, "fits_token_budget", None)
+    if checker is not None:
+        return bool(checker(text, budget))
+    return provider.token_count(text) <= budget
+
+
+def _max_end_from_token_offsets(
+    text: str, start: int, max_end: int, budget: int, provider: Any, *, prefer_natural: bool,
+    token_offsets: list[tuple[int, int]] | None,
+    token_ends: list[int] | None,
+) -> tuple[int, str] | None:
+    """Split exceptional long fragments from exact tokenizer offsets in one pass."""
+    if token_offsets is None:
+        return None
+    special_overhead = provider.token_count(provider.embedding_input(""))
+    content_tokens = max(1, budget - special_overhead)
+    if token_ends is None:
+        token_ends = [end for _, end in token_offsets]
+    first = bisect_right(token_ends, start)
+    if len(token_offsets) - first <= content_tokens:
+        return max_end, "complete"
+    last_token_end = token_offsets[first + content_tokens - 1][1]
+    # Legacy binary tokenization admitted whitespace after the last token because
+    # it does not increase token count. Preserve that exact boundary behavior.
+    next_token_start = token_offsets[first + content_tokens][0]
+    proposed = next_token_start if next_token_start > last_token_end else last_token_end
+    snapped, natural = _snap_end(text, start, proposed, max_end) if prefer_natural else (proposed, False)
+    if snapped > start and provider.token_count(provider.embedding_input(text[start:snapped])) <= budget:
+        return snapped, "natural_boundary" if natural else "token_window_fallback"
+    return proposed, "token_window_fallback"
+
+
+def _block_token_offsets(text: str, provider: Any) -> list[tuple[int, int]] | None:
+    if len(text) < OFFSET_TOKENIZATION_THRESHOLD_CHARS or getattr(provider, "document_prefix", ""):
+        return None
+    offsets_for = getattr(provider, "token_offsets", None)
+    return offsets_for(text) if offsets_for is not None else None
 
 
 def _snap_end(text: str, start: int, proposed: int, max_end: int) -> tuple[int, bool]:

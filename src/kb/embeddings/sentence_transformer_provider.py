@@ -105,6 +105,18 @@ class SentenceTransformerDenseProvider(DenseEmbeddingProvider):
         encoded = self._tokenizer(text, add_special_tokens=True, truncation=False)
         return len(encoded["input_ids"])
 
+    def fits_token_budget(self, text: str, budget: int) -> bool:
+        if self._tokenizer is None:
+            raise RuntimeError(f"Dense provider {self.model_name} does not expose a tokenizer.")
+        encoded = self._tokenizer(text, add_special_tokens=True, truncation=True, max_length=budget + 1)
+        return len(encoded["input_ids"]) <= budget
+
+    def token_offsets(self, text: str) -> list[tuple[int, int]]:
+        if self._tokenizer is None or not getattr(self._tokenizer, "is_fast", False):
+            raise RuntimeError(f"Dense provider {self.model_name} does not expose a fast tokenizer with offsets.")
+        encoded = self._tokenizer(text, add_special_tokens=False, truncation=False, return_offsets_mapping=True)
+        return [(int(start), int(end)) for start, end in encoded["offset_mapping"] if end > start]
+
 
 class SentenceTransformerSparseProvider(SparseEmbeddingProvider):
     def __init__(
@@ -228,6 +240,18 @@ class SentenceTransformerSparseProvider(SparseEmbeddingProvider):
             raise RuntimeError(f"Sparse provider {self.model_name} does not expose a tokenizer.")
         encoded = self._tokenizer(text, add_special_tokens=True, truncation=False)
         return len(encoded["input_ids"])
+
+    def fits_token_budget(self, text: str, budget: int) -> bool:
+        if self._tokenizer is None:
+            raise RuntimeError(f"Sparse provider {self.model_name} does not expose a tokenizer.")
+        encoded = self._tokenizer(text, add_special_tokens=True, truncation=True, max_length=budget + 1)
+        return len(encoded["input_ids"]) <= budget
+
+    def token_offsets(self, text: str) -> list[tuple[int, int]]:
+        if self._tokenizer is None or not getattr(self._tokenizer, "is_fast", False):
+            raise RuntimeError(f"Sparse provider {self.model_name} does not expose a fast tokenizer with offsets.")
+        encoded = self._tokenizer(text, add_special_tokens=False, truncation=False, return_offsets_mapping=True)
+        return [(int(start), int(end)) for start, end in encoded["offset_mapping"] if end > start]
 
 
 def _inference_mode():

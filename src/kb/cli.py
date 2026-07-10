@@ -22,6 +22,7 @@ from kb.block_chunk_audit import audit_block_chunks
 from kb.storage_audit import audit_storage
 from kb.storage.dense_native import audit_dense_native, migrate_dense_native, write_dense_native_report
 from kb.storage.sparse_backend_spike import run_sparse_backend_spike
+from kb.storage.native_pre_mvp import build_native_pre_mvp_db, write_native_pre_mvp_report
 from kb.index.chunk_builder import ChunkPolicy, build_chunk_policy
 from kb.index.edge_builder import build_similarity_edges
 from kb.index.semantic_node_builder import build_deterministic_nodes
@@ -171,6 +172,27 @@ def build_parser() -> argparse.ArgumentParser:
     sparse_spike_parser.add_argument("--chunks", type=int, default=15000)
     sparse_spike_parser.add_argument("--queries", type=int, default=32)
     sparse_spike_parser.add_argument("--top-k", type=int, default=20)
+
+    native_build = sub.add_parser(
+        "build-native-db",
+        help="Build a clean native retrieval DB directly from a raw export without legacy tables.",
+    )
+    native_build.add_argument("--export-path", required=True)
+    native_build.add_argument("--output-db", required=True)
+    native_build.add_argument("--dense-backend", choices=["sqlite-vec"], default="sqlite-vec")
+    native_build.add_argument("--sparse-backend", choices=["compact-blob"], default="compact-blob")
+    native_build.add_argument("--dense-model", default="BAAI/bge-m3")
+    native_build.add_argument("--sparse-model", default="opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1")
+    native_build.add_argument("--dense-device", default="mps")
+    native_build.add_argument("--sparse-device", default="mps")
+    native_build.add_argument("--dense-torch-dtype", choices=["auto", "float32", "float16", "bfloat16"], default="float16")
+    native_build.add_argument("--sparse-torch-dtype", choices=["auto", "float32", "float16", "bfloat16"], default="float16")
+    native_build.add_argument("--chunk-policy", choices=["canonical_token_chunks:v2"], default="canonical_token_chunks:v2")
+    native_build.add_argument("--chunk-content-budget", type=int, default=506)
+    native_build.add_argument("--sparse-top-k", type=int, default=128)
+    native_build.add_argument("--batch-size", type=int, default=16)
+    native_build.add_argument("--include-low-interest", action="store_true")
+    native_build.add_argument("--output-report")
 
     build_nodes = sub.add_parser("build-nodes", help="Build deterministic semantic nodes.")
     build_nodes.add_argument("--db", required=True)
@@ -330,6 +352,30 @@ def main() -> None:
             query_count=args.queries,
             top_k=args.top_k,
         )
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if args.command == "build-native-db":
+        if args.dense_backend != "sqlite-vec" or args.sparse_backend != "compact-blob":
+            raise ValueError("Only sqlite-vec dense and compact-blob sparse are supported by the clean native build.")
+        report = build_native_pre_mvp_db(
+            export_path=Path(args.export_path).expanduser(),
+            output_db=Path(args.output_db).expanduser(),
+            dense_model=args.dense_model,
+            sparse_model=args.sparse_model,
+            dense_device=args.dense_device,
+            sparse_device=args.sparse_device,
+            dense_torch_dtype=args.dense_torch_dtype,
+            sparse_torch_dtype=args.sparse_torch_dtype,
+            chunk_policy_version=_chunk_policy_version(args.chunk_policy),
+            chunk_content_budget=args.chunk_content_budget,
+            sparse_top_k=args.sparse_top_k,
+            batch_size=args.batch_size,
+            skip_low_interest=not args.include_low_interest,
+            progress=True,
+        )
+        if args.output_report:
+            write_native_pre_mvp_report(report, Path(args.output_report).expanduser())
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
         return
 
