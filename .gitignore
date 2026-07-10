@@ -21,7 +21,8 @@ wheels/
 # Local knowledge base artifacts
 *.db
 
-# Local benchmark run artifacts
+# Private benchmark fixtures and local run artifacts. Gold scenarios may contain
+# personal data and must never be committed to this public repository.
 benchmarks/gold/
 benchmarks/runs/
 benchmarks/real_data_preflight/

@@ -50,6 +50,17 @@ The current tool can:
 - use multithreaded parsing and export for better speed on large bundles
 - optionally enable a lightweight NLP naming layer for better project folder names
 
+## Public-repository data policy
+
+This is a public repository. Gold test scenarios, benchmark fixtures, probes,
+and evaluation outputs built from a personal export are private local data and
+must not be committed here, even when they are useful for reproducible local
+checks. Keep them under `benchmarks/gold/` or another ignored local path.
+
+Only synthetic, anonymized examples that contain no personal conversation
+content or identifiers may be added to the repository. Before committing a new
+benchmark artifact, verify that it meets that rule.
+
 ## Installation
 
 ### Requirements
