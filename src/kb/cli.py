@@ -20,6 +20,7 @@ from kb.embeddings.sentence_transformer_provider import (
 )
 from kb.block_chunk_audit import audit_block_chunks
 from kb.storage_audit import audit_storage
+from kb.storage.dense_native import audit_dense_native, migrate_dense_native, write_dense_native_report
 from kb.index.chunk_builder import ChunkPolicy, build_chunk_policy
 from kb.index.edge_builder import build_similarity_edges
 from kb.index.semantic_node_builder import build_deterministic_nodes
@@ -141,6 +142,24 @@ def build_parser() -> argparse.ArgumentParser:
     audit_storage_parser = sub.add_parser("audit-storage", help="Audit SQLite storage without mutating the DB.")
     audit_storage_parser.add_argument("--db", required=True)
     audit_storage_parser.add_argument("--output-dir", help="Report directory; defaults to benchmarks/storage_audit/<timestamp>.")
+
+    migrate_dense_native_parser = sub.add_parser(
+        "migrate-dense-native",
+        help="Copy a DB and migrate dense JSON vectors into sqlite-vec float32 storage.",
+    )
+    migrate_dense_native_parser.add_argument("--source-db", required=True)
+    migrate_dense_native_parser.add_argument("--target-db", required=True)
+    migrate_dense_native_parser.add_argument("--batch-size", type=int, default=256)
+    migrate_dense_native_parser.add_argument("--report-dir")
+
+    audit_dense_native_parser = sub.add_parser(
+        "audit-dense-native",
+        help="Audit an existing sqlite-vec dense migration without modifying it.",
+    )
+    audit_dense_native_parser.add_argument("--db", required=True)
+    audit_dense_native_parser.add_argument("--source-db")
+    audit_dense_native_parser.add_argument("--sample-size", type=int, default=1000)
+    audit_dense_native_parser.add_argument("--report-dir")
 
     build_nodes = sub.add_parser("build-nodes", help="Build deterministic semantic nodes.")
     build_nodes.add_argument("--db", required=True)
@@ -269,6 +288,27 @@ def main() -> None:
         )
         report = audit_storage(Path(args.db).expanduser(), output_dir)
         print(json.dumps({"output_dir": str(output_dir), **report["object_totals"], "dense": report["dense"], "sparse": report["sparse"], "recommendation": report["recommendation"]}, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if args.command == "migrate-dense-native":
+        report = migrate_dense_native(
+            source_db=Path(args.source_db).expanduser(),
+            target_db=Path(args.target_db).expanduser(),
+            batch_size=args.batch_size,
+            report_dir=Path(args.report_dir).expanduser() if args.report_dir else None,
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if args.command == "audit-dense-native":
+        report = audit_dense_native(
+            Path(args.db).expanduser(),
+            source_db=Path(args.source_db).expanduser() if args.source_db else None,
+            sample_size=args.sample_size,
+        )
+        if args.report_dir:
+            write_dense_native_report(report, Path(args.report_dir).expanduser())
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
         return
 
     if args.command == "embed":

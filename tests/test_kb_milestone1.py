@@ -9,6 +9,7 @@ from io import StringIO
 from pathlib import Path
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +21,7 @@ from kb.cli import _chunked_embedding_space_id, build_edges_command, build_nodes
 from kb.benchmark import DirectRetrievalSession, RankingConfig, analyze_direct_retrieval_evaluation, build_breakdowns, build_pairwise_queries, calculate_query_metrics, default_ranking_configs, evaluate_direct_retrieval_run, run_direct_retrieval_benchmark, validate_direct_retrieval_dataset  # noqa: E402
 from kb.block_chunk_audit import audit_block_chunks  # noqa: E402
 from kb.storage_audit import audit_storage  # noqa: E402
+from kb.storage.dense_native import DenseNativeError, NativeDenseSearchBackend, migrate_dense_native, serialize_float32  # noqa: E402
 from kb.canary.multilingual_dense import run_canary  # noqa: E402
 from kb.canary.real_data import _probe_metrics, _reject_unsafe_output_path, _validate_content_budget, load_or_create_manifest, validate_source_offsets  # noqa: E402
 from kb.fusion_eval import SNAPSHOT_SCHEMA, SnapshotRow, _load_probes, _lexical_overlap, _rescue_analysis, _score_variant, evaluate_raw_score_snapshot  # noqa: E402
@@ -30,7 +32,7 @@ from kb.embeddings.sentence_transformer_provider import _dense_embedding_space_i
 from kb.index.chunk_builder import build_chunk_policy, build_retrieval_chunks  # noqa: E402
 from kb.mcp.server import ServerConfig, build_parser as build_mcp_parser, handle_request  # noqa: E402
 from kb.retrieval.context_pack import ContextPackOptions, build_context_pack  # noqa: E402
-from kb.retrieval.hybrid_search import QUERY_RESULT_SCHEMA_VERSION, build_parser as build_search_parser, hybrid_query, main as kb_search_main  # noqa: E402
+from kb.retrieval.hybrid_search import QUERY_RESULT_SCHEMA_VERSION, _native_hybrid_query, build_parser as build_search_parser, hybrid_query, main as kb_search_main  # noqa: E402
 from kb.storage.sqlite_store import SQLiteStore, init_db  # noqa: E402
 
 
@@ -276,6 +278,70 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertEqual(db_path.stat().st_size, before)
             self.assertTrue((output_dir / "report.md").exists())
             self.assertTrue((output_dir / "report.json").exists())
+
+    def test_native_dense_migration_preserves_float32_and_uses_sqlite_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.db"
+            target = Path(tmp) / "target.db"
+            init_db(source)
+            vector_a = [1.0] + [0.0] * 1023
+            vector_b = [0.0, 1.0] + [0.0] * 1022
+            with sqlite3.connect(source) as conn:
+                conn.executescript(
+                    """
+                    INSERT INTO source_documents (id,path,relative_path,source_kind,file_name,extension,sha256) VALUES ('sd','x','x','chat','x','.md','h');
+                    INSERT INTO conversations (id,source_document_id,message_count,assistant_messages,user_messages,text_chars,estimated_code_blocks) VALUES ('c','sd',1,0,1,2,0);
+                    INSERT INTO messages (id,conversation_id,ordinal,role,raw_text) VALUES ('m','c',0,'user','x');
+                    INSERT INTO blocks (id,message_id,conversation_id,ordinal,block_type,raw_text,normalized_text,char_start,char_end) VALUES ('b','m','c',0,'prose','x','x',0,1);
+                    INSERT INTO retrieval_chunks (id,block_id,ordinal,source_char_start,source_char_end,token_count,text,chunk_policy_id) VALUES ('chunk-a','b',0,0,1,1,'x','policy'), ('chunk-b','b',1,0,1,1,'x','policy');
+                    """
+                )
+                for vector_id, chunk_id, vector in (("v-a", "chunk-a", vector_a), ("v-b", "chunk-b", vector_b)):
+                    conn.execute(
+                        "INSERT INTO dense_vectors(id,owner_type,owner_id,model_name,model_version,embedding_space_id,runtime_metadata_json,dim,vector_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (vector_id, "retrieval_chunk", chunk_id, "model", "space", "space", "{}", 1024, json.dumps(vector)),
+                    )
+            before = source.read_bytes()
+
+            report = migrate_dense_native(source_db=source, target_db=target, batch_size=1)
+
+            self.assertEqual(report["migration"]["migrated_vectors"], 2)
+            self.assertEqual(report["numeric_parity"]["sample_size"], 2)
+            self.assertEqual(source.read_bytes(), before)
+            with NativeDenseSearchBackend(target) as backend:
+                hits = backend.search(vector_a, limit=2, model_name="model", embedding_space_id="space")
+            self.assertEqual([hit.chunk_id for hit in hits], ["chunk-a", "chunk-b"])
+            self.assertAlmostEqual(hits[0].score, 1.0, places=6)
+            native_result = _native_hybrid_query(
+                db_path=target,
+                query="ignored",
+                limit=2,
+                alpha=1.0,
+                beta=0.0,
+                project=None,
+                include_low_interest=False,
+                dense=SimpleNamespace(model_name="model"),
+                sparse=None,
+                query_dense=vector_a,
+                query_sparse=None,
+                dense_space_id="space",
+                sparse_space_id=None,
+                policy_id="policy",
+                started=0.0,
+                provider_load_ms=0.0,
+                query_encoding_ms=0.0,
+                sparse_top_k=128,
+            )
+            self.assertEqual([item["chunk_id"] for item in native_result["results"]], ["chunk-a", "chunk-b"])
+
+    def test_native_dense_rejects_nonfinite_serialization_and_missing_schema(self) -> None:
+        with self.assertRaises(DenseNativeError):
+            serialize_float32([float("nan")])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "empty.db"
+            sqlite3.connect(path).close()
+            with self.assertRaises(DenseNativeError):
+                NativeDenseSearchBackend(path)
 
     def test_fusion_lexical_overlap_and_rescue_counts(self) -> None:
         from kb.canary.real_data import RealProbe

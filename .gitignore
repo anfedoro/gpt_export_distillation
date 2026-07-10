@@ -31,6 +31,7 @@ benchmarks/semantic_mismatch_eval/
 benchmarks/block_chunk_audit/
 benchmarks/full_retrieval_eval/
 benchmarks/storage_audit/
+benchmarks/dense_native_migration/
 
 # Private local preflight manifests, probes, and filtered source samples
 .local/
