@@ -23,7 +23,7 @@ from kb.block_chunk_audit import audit_block_chunks  # noqa: E402
 from kb.storage_audit import audit_storage  # noqa: E402
 from kb.storage.dense_native import DenseNativeError, NativeDenseSearchBackend, migrate_dense_native, serialize_float32  # noqa: E402
 from kb.storage.sparse_backend_spike import run_sparse_backend_spike, sparse_cosine  # noqa: E402
-from kb.storage.native_pre_mvp import CompactSparseSearchBackend, NativeBuildStore, NativePreMvpError  # noqa: E402
+from kb.storage.native_pre_mvp import CompactSparseSearchBackend, NativeBuildStore, NativePreMvpError, candidate_union, fuse_candidate_scores  # noqa: E402
 from kb.canary.multilingual_dense import run_canary  # noqa: E402
 from kb.canary.real_data import _probe_metrics, _reject_unsafe_output_path, _validate_content_budget, load_or_create_manifest, validate_source_offsets  # noqa: E402
 from kb.fusion_eval import SNAPSHOT_SCHEMA, SnapshotRow, _load_probes, _lexical_overlap, _rescue_analysis, _score_variant, evaluate_raw_score_snapshot  # noqa: E402
@@ -437,6 +437,32 @@ class KBMilestone1Tests(unittest.TestCase):
         scores = dict((row.chunk_id, score) for row, score in _score_variant(rows, {"kind": "raw", "dense_weight": 0.1, "sparse_weight": 0.9, "pool": None}))
         self.assertAlmostEqual(scores["sparse-hit"], 0.81)
         self.assertGreater(scores["sparse-hit"], scores["dense-hit"])
+
+    def test_native_candidate_union_is_order_independent_and_preserves_single_branch_hits(self) -> None:
+        self.assertEqual(candidate_union(["dense-only", "both"], ["sparse-only", "both"]), {"dense-only", "sparse-only", "both"})
+        self.assertEqual(candidate_union(["both", "dense-only"], ["both", "sparse-only"]), {"dense-only", "sparse-only", "both"})
+
+    def test_native_fusion_happens_after_union_with_zero_missing_score_and_stable_ties(self) -> None:
+        scores = fuse_candidate_scores(
+            {"sparse-only", "dense-only", "both", "tie-b"},
+            {"dense-only": 0.5, "both": 0.2, "tie-b": 0.2},
+            {"sparse-only": 0.5, "both": 0.2, "tie-b": 0.2},
+            alpha=0.65,
+            beta=0.35,
+        )
+        self.assertEqual([item[0] for item in scores], ["dense-only", "both", "tie-b", "sparse-only"])
+        self.assertAlmostEqual(dict(scores)["dense-only"], 0.325)
+        self.assertAlmostEqual(dict(scores)["sparse-only"], 0.175)
+
+    def test_native_candidate_pool_does_not_change_scores_inside_union(self) -> None:
+        dense = ["a", "b", "c"]
+        sparse = ["c", "b", "d"]
+        all_scores = dict(fuse_candidate_scores(candidate_union(dense, sparse), {"a": 0.9, "b": 0.8, "c": 0.7}, {"b": 0.6, "c": 0.5, "d": 0.4}, alpha=0.65, beta=0.35))
+        limited_scores = dict(fuse_candidate_scores(candidate_union(dense[:2], sparse[:2]), {"a": 0.9, "b": 0.8, "c": 0.7}, {"b": 0.6, "c": 0.5, "d": 0.4}, alpha=0.65, beta=0.35))
+        self.assertEqual({"a", "b", "c"}, set(limited_scores))
+        self.assertEqual(all_scores["a"], limited_scores["a"])
+        self.assertEqual(all_scores["b"], limited_scores["b"])
+        self.assertEqual(all_scores["c"], limited_scores["c"])
 
     def test_fusion_evaluation_is_file_only_and_message_max_aggregation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
