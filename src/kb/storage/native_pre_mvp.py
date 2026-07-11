@@ -498,6 +498,21 @@ def _release_batch_memory() -> None:
         return
 
 
+def candidate_union(dense_ids: Iterable[str], sparse_ids: Iterable[str]) -> set[str]:
+    """Build the fusion candidate set by stable chunk identity."""
+    return set(dense_ids) | set(sparse_ids)
+
+
+def fuse_candidate_scores(
+    candidates: Iterable[str], dense_scores: dict[str, float], sparse_scores: dict[str, float], *, alpha: float, beta: float,
+) -> list[tuple[str, float]]:
+    """Fuse only after union; missing branch scores are explicit zeroes."""
+    return sorted(
+        ((chunk_id, alpha * dense_scores.get(chunk_id, 0.0) + beta * sparse_scores.get(chunk_id, 0.0)) for chunk_id in candidates),
+        key=lambda item: (-item[1], item[0]),
+    )
+
+
 class CompactSparseSearchBackend:
     """Read-only flat CSR-like scorer backed only by compact BLOB tables."""
 
@@ -586,17 +601,20 @@ class NativePreMvpRetriever:
     def __exit__(self, *args: object) -> None:
         self.close()
 
-    def search(self, *, query_dense: list[float], query_sparse: dict[str, float], limit: int = 20, alpha: float = 0.65, beta: float = 0.35, dense_candidate_k: int = 100) -> list[NativeRetrievalHit]:
+    def search(self, *, query_dense: list[float], query_sparse: dict[str, float], limit: int = 20, alpha: float = 0.65, beta: float = 0.35, dense_candidate_k: int = 500, sparse_candidate_k: int = 500) -> list[NativeRetrievalHit]:
         if alpha < 0 or beta < 0 or alpha + beta == 0:
             raise NativePreMvpError("Fusion weights must be non-negative and non-zero.")
         dense_hits = self.dense.search(query_dense, limit=max(limit, dense_candidate_k), model_name=str(self.dense_model), embedding_space_id=str(self.dense_space))
         sparse_scores = self.sparse.score(query_sparse)
         self.last_sparse_scores = sparse_scores
-        nonzero = np.flatnonzero(sparse_scores > 0)
-        candidates = {hit.chunk_id for hit in dense_hits} | {str(self.sparse.chunk_ids[index]) for index in nonzero}
+        if dense_candidate_k <= 0 or sparse_candidate_k <= 0:
+            raise NativePreMvpError("Candidate pool sizes must be positive.")
+        sparse_order = np.lexsort((self.sparse.chunk_ids, -sparse_scores))[:sparse_candidate_k]
+        sparse_candidates = [index for index in sparse_order if sparse_scores[index] > 0]
+        candidates = candidate_union((hit.chunk_id for hit in dense_hits), (str(self.sparse.chunk_ids[index]) for index in sparse_candidates))
         dense_by_id = self.dense.scores_for_chunk_ids(query_dense, candidates, model_name=str(self.dense_model), embedding_space_id=str(self.dense_space))
-        sparse_by_id = {str(self.sparse.chunk_ids[index]): float(sparse_scores[index]) for index in nonzero}
-        ordered = sorted(candidates, key=lambda chunk_id: (-(alpha * dense_by_id.get(chunk_id, 0.0) + beta * sparse_by_id.get(chunk_id, 0.0)), chunk_id))[:limit]
+        sparse_by_id = {str(self.sparse.chunk_ids[index]): float(sparse_scores[index]) for index in sparse_candidates}
+        ordered = [chunk_id for chunk_id, _ in fuse_candidate_scores(candidates, dense_by_id, sparse_by_id, alpha=alpha, beta=beta)[:limit]]
         provenance = self._provenance(ordered)
         return [NativeRetrievalHit(chunk_id, dense_by_id.get(chunk_id, 0.0), sparse_by_id.get(chunk_id, 0.0), alpha * dense_by_id.get(chunk_id, 0.0) + beta * sparse_by_id.get(chunk_id, 0.0), provenance[chunk_id]) for chunk_id in ordered]
 
