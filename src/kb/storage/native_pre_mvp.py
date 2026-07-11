@@ -587,10 +587,19 @@ class NativePreMvpRetriever:
     """Native sqlite-vec dense, compact sparse, deterministic hybrid and provenance joins."""
 
     def __init__(self, db_path: Path) -> None:
+        started = time.perf_counter()
         self.dense = NativeDenseSearchBackend(db_path)
+        dense_ready = time.perf_counter()
         self.sparse = CompactSparseSearchBackend(db_path)
+        sparse_ready = time.perf_counter()
         self.conn = self.sparse.conn
         self.dense_model, self.dense_space = tuple(self.dense.conn.execute("SELECT model_name,embedding_space_id FROM dense_native_metadata LIMIT 1").fetchone())
+        self.load_timing_ms = {
+            "dense_backend_open": (dense_ready - started) * 1000,
+            "sparse_materialization": (sparse_ready - dense_ready) * 1000,
+            "total": (sparse_ready - started) * 1000,
+        }
+        self.last_search_timing_ms: dict[str, float] = {}
 
     def close(self) -> None:
         self.dense.close(); self.sparse.close()
@@ -602,20 +611,39 @@ class NativePreMvpRetriever:
         self.close()
 
     def search(self, *, query_dense: list[float], query_sparse: dict[str, float], limit: int = 20, alpha: float = 0.65, beta: float = 0.35, dense_candidate_k: int = 500, sparse_candidate_k: int = 500) -> list[NativeRetrievalHit]:
+        started = time.perf_counter()
         if alpha < 0 or beta < 0 or alpha + beta == 0:
             raise NativePreMvpError("Fusion weights must be non-negative and non-zero.")
         dense_hits = self.dense.search(query_dense, limit=max(limit, dense_candidate_k), model_name=str(self.dense_model), embedding_space_id=str(self.dense_space))
+        dense_search_finished = time.perf_counter()
         sparse_scores = self.sparse.score(query_sparse)
+        sparse_search_finished = time.perf_counter()
         self.last_sparse_scores = sparse_scores
         if dense_candidate_k <= 0 or sparse_candidate_k <= 0:
             raise NativePreMvpError("Candidate pool sizes must be positive.")
         sparse_order = np.lexsort((self.sparse.chunk_ids, -sparse_scores))[:sparse_candidate_k]
         sparse_candidates = [index for index in sparse_order if sparse_scores[index] > 0]
         candidates = candidate_union((hit.chunk_id for hit in dense_hits), (str(self.sparse.chunk_ids[index]) for index in sparse_candidates))
+        union_finished = time.perf_counter()
         dense_by_id = self.dense.scores_for_chunk_ids(query_dense, candidates, model_name=str(self.dense_model), embedding_space_id=str(self.dense_space))
+        dense_rescore_finished = time.perf_counter()
         sparse_by_id = {str(self.sparse.chunk_ids[index]): float(sparse_scores[index]) for index in sparse_candidates}
         ordered = [chunk_id for chunk_id, _ in fuse_candidate_scores(candidates, dense_by_id, sparse_by_id, alpha=alpha, beta=beta)[:limit]]
+        fusion_finished = time.perf_counter()
         provenance = self._provenance(ordered)
+        provenance_finished = time.perf_counter()
+        self.last_search_timing_ms = {
+            "dense_top_k": (dense_search_finished - started) * 1000,
+            "sparse_top_k": (sparse_search_finished - dense_search_finished) * 1000,
+            "candidate_union": (union_finished - sparse_search_finished) * 1000,
+            "dense_rescore": (dense_rescore_finished - union_finished) * 1000,
+            "fusion": (fusion_finished - dense_rescore_finished) * 1000,
+            "provenance": (provenance_finished - fusion_finished) * 1000,
+            "total": (provenance_finished - started) * 1000,
+            "dense_candidate_count": float(len(dense_hits)),
+            "sparse_candidate_count": float(len(sparse_candidates)),
+            "union_candidate_count": float(len(candidates)),
+        }
         return [NativeRetrievalHit(chunk_id, dense_by_id.get(chunk_id, 0.0), sparse_by_id.get(chunk_id, 0.0), alpha * dense_by_id.get(chunk_id, 0.0) + beta * sparse_by_id.get(chunk_id, 0.0), provenance[chunk_id]) for chunk_id in ordered]
 
     def _provenance(self, chunk_ids: list[str]) -> dict[str, dict[str, Any]]:
@@ -639,14 +667,18 @@ def native_pre_mvp_query(
     started = time.perf_counter()
     dense_space = _chunked_space(dense.embedding_space_id, policy_id)
     sparse_space = _chunked_space(sparse.embedding_space_id, policy_id)
+    preprocessing_finished = time.perf_counter()
     query_dense = dense.embed_query(query)
+    dense_query_finished = time.perf_counter()
     query_sparse = sparse.embed_query(query)
+    sparse_query_finished = time.perf_counter()
     with NativePreMvpRetriever(db_path) as retriever:
         if str(retriever.dense_model) != dense.model_name or str(retriever.dense_space) != dense_space:
             raise NativePreMvpError("Dense query provider is incompatible with clean native DB embedding space.")
         if retriever.sparse.model_name != sparse.model_name or retriever.sparse.embedding_space_id != sparse_space:
             raise NativePreMvpError("Sparse query provider is incompatible with clean native DB embedding space.")
         results = retriever.search(query_dense=query_dense, query_sparse=query_sparse, limit=limit, alpha=alpha, beta=beta)
+        search_timing = dict(retriever.last_search_timing_ms)
         sparse_scores = retriever.last_sparse_scores
         dense_count = int(retriever.dense.conn.execute("SELECT COUNT(*) FROM dense_native_metadata").fetchone()[0])
         sparse_count = len(retriever.sparse.chunk_ids)
@@ -677,7 +709,22 @@ def native_pre_mvp_query(
                        "nonzero_score_count": int(np.count_nonzero(sparse_scores)),
                        "max_score": float(sparse_scores.max()) if len(sparse_scores) else 0.0},
         },
-        "latency_ms": {"total": (time.perf_counter() - started) * 1000},
+        "latency_ms": {
+            "preprocessing": (preprocessing_finished - started) * 1000,
+            "dense_query_encoding": (dense_query_finished - preprocessing_finished) * 1000,
+            "sparse_query_encoding": (sparse_query_finished - dense_query_finished) * 1000,
+            "retriever_load": retriever.load_timing_ms["total"],
+            **search_timing,
+            "result_packaging": (time.perf_counter() - (sparse_query_finished + retriever.load_timing_ms["total"] / 1000)) * 1000,
+            "total": (time.perf_counter() - started) * 1000,
+        },
+        "runtime": {
+            "candidate_pool": 500,
+            "dense_calls": 1,
+            "sparse_calls": 1,
+            "fusion_calls": 1,
+            "sparse_materialized_bytes": int(retriever.sparse.indices.nbytes + retriever.sparse.weights.nbytes + retriever.sparse.offsets.nbytes + retriever.sparse.norms.nbytes + retriever.sparse.chunk_ids.nbytes),
+        },
     }
 
 
