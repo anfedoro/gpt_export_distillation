@@ -32,7 +32,7 @@ from kb.ingest.tree_walker import scan_tree  # noqa: E402
 from kb.embeddings.mock_provider import MockDenseProvider, MockSparseProvider  # noqa: E402
 from kb.embeddings.sentence_transformer_provider import _dense_embedding_space_id  # noqa: E402
 from kb.index.chunk_builder import build_chunk_policy, build_retrieval_chunks  # noqa: E402
-from kb.mcp.server import ServerConfig, build_parser as build_mcp_parser, handle_request  # noqa: E402
+from kb.mcp.server import ServerConfig, _context_tool, _search_tool, build_parser as build_mcp_parser, handle_request  # noqa: E402
 from kb.retrieval.context_pack import ContextPackOptions, build_context_pack  # noqa: E402
 from kb.retrieval.hybrid_search import QUERY_RESULT_SCHEMA_VERSION, _native_hybrid_query, build_parser as build_search_parser, hybrid_query, main as kb_search_main  # noqa: E402
 from kb.storage.sqlite_store import SQLiteStore, init_db  # noqa: E402
@@ -2595,7 +2595,7 @@ class KBMilestone1Tests(unittest.TestCase):
                 any(trace["path"] == "query -> node:semantic_group -> member block" for trace in payload["source_trace"])
             )
 
-    def test_mcp_server_exposes_only_context_pack_tool(self) -> None:
+    def test_mcp_tool_schemas_expose_broad_and_focused_native_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "export"
             chat_dir = root / "Projects" / "Project_17"
@@ -2612,35 +2612,12 @@ class KBMilestone1Tests(unittest.TestCase):
             )
             build_nodes_command(db_path=db, mode="deterministic", sparse_top_k=10)
             build_edges_command(db_path=db, scope="project", top_k=2)
-            config = ServerConfig(
-                db_path=db,
-                dense_provider="mock",
-                sparse_provider="mock",
-            )
-
-            tools = handle_request(config, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
-            self.assertEqual([tool["name"] for tool in tools["result"]["tools"]], ["build_context_pack"])
-
-            response = handle_request(
-                config,
-                {
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "build_context_pack",
-                        "arguments": {"query": "memory routing", "token_budget": 200},
-                    },
-                },
-            )
-
-            self.assertFalse(response["result"]["isError"])
-            payload = json.loads(response["result"]["content"][0]["text"])
-            self.assertIn("context_text", payload)
-            self.assertIn("source_references", payload)
-            self.assertEqual(payload["retrieval_strategy_used"], "basement")
-            self.assertIn("db_capabilities", payload)
-            self.assertGreaterEqual(len(payload["selected_blocks"]), 1)
+            tools = [_context_tool(), _search_tool()]
+            self.assertEqual([tool["name"] for tool in tools], ["construct_archive_context", "search_archive"])
+            self.assertEqual(tools[0]["inputSchema"]["required"], ["current_context"])
+            self.assertEqual(tools[1]["inputSchema"]["required"], ["query"])
+            self.assertIn("Never claim", tools[0]["description"])
+            self.assertEqual(tools[1]["inputSchema"]["properties"]["retrieval_mode"]["enum"], ["hybrid"])
 
 
 if __name__ == "__main__":

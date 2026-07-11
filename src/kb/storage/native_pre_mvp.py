@@ -652,12 +652,24 @@ class NativePreMvpRetriever:
         marks = ",".join("?" for _ in chunk_ids)
         rows = self.conn.execute(
             "SELECT rc.id AS chunk_id,rc.ordinal AS chunk_ordinal,rc.source_char_start,rc.source_char_end,rc.text,"
-            "b.id AS block_id,b.block_type,m.id AS message_id,m.message_id AS source_message_id,m.role,"
-            "c.id AS conversation_id,c.conversation_id AS dialogue_id,c.title AS conversation_title,c.project_id,sd.relative_path AS source_path "
+            "b.id AS block_id,b.block_type,m.id AS message_id,m.message_id AS source_message_id,m.role,m.ordinal AS message_ordinal,m.time_utc,"
+            "c.id AS conversation_id,c.conversation_id AS dialogue_id,c.title AS conversation_title,c.project_id,c.create_time_utc,c.update_time_utc,sd.relative_path AS source_path "
             "FROM retrieval_chunks rc JOIN blocks b ON b.id=rc.block_id JOIN messages m ON m.id=b.message_id "
             "JOIN conversations c ON c.id=m.conversation_id JOIN source_documents sd ON sd.id=c.source_document_id "
             "WHERE rc.id IN (" + marks + ")", chunk_ids).fetchall()
         return {str(row["chunk_id"]): dict(row) for row in rows}
+
+    def messages_for_windows(self, windows: dict[str, tuple[int, int]]) -> dict[str, list[dict[str, Any]]]:
+        """Return bounded chronological message windows keyed by conversation ID."""
+        result: dict[str, list[dict[str, Any]]] = {}
+        for conversation_id, (start, end) in windows.items():
+            rows = self.conn.execute(
+                "SELECT id,message_id,ordinal,role,time_utc,raw_text FROM messages "
+                "WHERE conversation_id=? AND ordinal BETWEEN ? AND ? ORDER BY ordinal",
+                (conversation_id, start, end),
+            ).fetchall()
+            result[conversation_id] = [dict(row) for row in rows]
+        return result
 
 
 def native_pre_mvp_query(
