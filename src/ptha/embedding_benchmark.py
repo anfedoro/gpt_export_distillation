@@ -17,7 +17,7 @@ import psutil
 from gpt_export_distillation.config import DEFAULT_CONFIG as DISTILL_CONFIG
 from gpt_export_distillation.loader import load_bundle
 from gpt_export_distillation.pipeline import build_documents, write_output
-from kb.embeddings.bge_m3_provider import build_bge_m3_providers
+from kb.embeddings.bge_m3_provider import build_bge_m3_providers, embed_joint_documents
 from kb.embeddings.sentence_transformer_provider import SentenceTransformerDenseProvider, SentenceTransformerSparseProvider
 from kb.index.chunk_builder import build_chunk_policy
 from kb.ingest.chat_md_parser import parse_chat_file
@@ -113,6 +113,21 @@ def run_benchmark(
     peak_rss = process.memory_info().rss
     peak_mps = 0
     with NativeBuildStore(output_db, create_schema=False) as store:
+        if backend == "unified":
+            joint_result, peak_rss, peak_mps = _run_joint_pass(
+                store, policy_id, dense, sparse, dense_space, sparse_space,
+                limit, batch_size, peak_rss, peak_mps,
+            )
+            store.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            return {
+                "schema_version": 1, "backend": backend, "chunks": joint_result["processed"],
+                "dense": {**joint_result, "shared_joint_pass": True},
+                "sparse": {**joint_result, "shared_joint_pass": True},
+                "joint": joint_result,
+                "total_seconds": joint_result["seconds"],
+                "peak_rss_bytes": peak_rss, "peak_mps_driver_bytes": peak_mps or None,
+                "database_size_bytes": output_db.stat().st_size,
+            }
         dense_result, peak_rss, peak_mps = _run_pass(
             store, policy_id, dense, "dense", dense_space, limit, batch_size, peak_rss, peak_mps,
         )
@@ -127,6 +142,41 @@ def run_benchmark(
         "peak_rss_bytes": peak_rss, "peak_mps_driver_bytes": peak_mps or None,
         "database_size_bytes": output_db.stat().st_size,
     }
+
+
+def _run_joint_pass(
+    store: NativeBuildStore, policy_id: str, dense: Any, sparse: Any,
+    dense_space: str, sparse_space: str, limit: int, batch_size: int,
+    peak_rss: int, peak_mps: int,
+) -> tuple[dict[str, Any], int, int]:
+    started = time.perf_counter()
+    processed = 0
+    selected = store.conn.execute(
+        "SELECT id,block_id,text,token_count FROM retrieval_chunks WHERE id IN ("
+        "SELECT id FROM retrieval_chunks WHERE chunk_policy_id=? ORDER BY id LIMIT ?) "
+        "ORDER BY token_count,id",
+        (policy_id, limit),
+    ).fetchall()
+    process = psutil.Process(os.getpid())
+    for start in range(0, len(selected), batch_size):
+        rows = selected[start:start + batch_size]
+        texts = [str(row["text"]) for row in rows]
+        dense_vectors, sparse_vectors = embed_joint_documents(dense, sparse, texts)
+        store.write_dense_batch(rows=rows, vectors=dense_vectors, model=dense.model_name, space=dense_space)
+        store.write_sparse_batch(rows=rows, vectors=sparse_vectors, model=sparse.model_name, space=sparse_space)
+        store.commit()
+        processed += len(rows)
+        peak_rss = max(peak_rss, process.memory_info().rss)
+        peak_mps = max(peak_mps, _mps_driver_memory())
+        if processed % (batch_size * 25) == 0:
+            _release_accelerator_cache()
+    seconds = time.perf_counter() - started
+    return {
+        "processed": processed,
+        "seconds": seconds,
+        "throughput": processed / seconds if seconds else 0.0,
+        "device": dense.runtime_metadata.get("device"),
+    }, peak_rss, peak_mps
 
 
 def _run_pass(

@@ -153,6 +153,25 @@ class BgeM3Backend:
             attention = inputs["attention_mask"].cpu()
         return [self._lexical(ids, values, mask) for ids, values, mask in zip(input_ids, weights, attention, strict=True)]
 
+    def joint_documents(self, texts: list[str]) -> tuple[list[list[float]], list[dict[str, float]]]:
+        """Compute dense and lexical representations from one backbone forward."""
+        import torch
+
+        inputs = self._inputs(texts)
+        with torch.inference_mode():
+            hidden = self.model(**inputs).last_hidden_state
+            dense = torch.nn.functional.normalize(hidden[:, 0], p=2, dim=-1)
+            sparse = torch.relu(self.sparse_linear(hidden)).squeeze(-1)
+        dense_vectors = dense.float().cpu().numpy().tolist()
+        weights = sparse.float().cpu()
+        input_ids = inputs["input_ids"].cpu()
+        attention = inputs["attention_mask"].cpu()
+        sparse_vectors = [
+            self._lexical(ids, values, mask)
+            for ids, values, mask in zip(input_ids, weights, attention, strict=True)
+        ]
+        return dense_vectors, sparse_vectors
+
     def token_count(self, text: str) -> int:
         return len(self.tokenizer(text, add_special_tokens=True, truncation=False)["input_ids"])
 
@@ -242,6 +261,20 @@ def build_bge_m3_providers(
         sparse_top_k=sparse_top_k,
     )
     return BgeM3DenseProvider(backend), BgeM3SparseProvider(backend)
+
+
+def embed_joint_documents(
+    dense_provider: Any,
+    sparse_provider: Any,
+    texts: list[str],
+) -> tuple[list[list[float]], list[dict[str, float]]]:
+    """Use one shared BGE-M3 forward while retaining separate provider outputs."""
+    dense_backend = getattr(dense_provider, "backend", None)
+    sparse_backend = getattr(sparse_provider, "backend", None)
+    if dense_backend is not None and dense_backend is sparse_backend and hasattr(dense_backend, "joint_documents"):
+        return dense_backend.joint_documents(texts)
+    # Keep synthetic and legacy provider implementations usable by maintenance tests.
+    return dense_provider.embed_documents(texts), sparse_provider.embed_documents(texts)
 
 
 def _resolve_dtype(value: str | None, device: str) -> Any:

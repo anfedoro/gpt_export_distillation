@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from kb.index.chunk_builder import StrictestTokenizer, build_chunk_policy
+from kb.embeddings.bge_m3_provider import embed_joint_documents
 from kb.storage.native_pre_mvp import NativeBuildStore, NativePreMvpRetriever, _chunked_space
 from ptha.config import PthaConfig
 from ptha.database import inspect_database
@@ -90,44 +91,41 @@ def _reindex(config: PthaConfig, *, force: bool, progress: Callable[[str], None]
             )
             store.commit()
             state = write_maintenance_state(config, state, phase="building_dense_and_sparse")
-            _stage(progress, "[3/6] Building dense index")
-            _stage(progress, "[4/6] Building sparse index")
+            _stage(progress, "[3/6] Building dense and sparse indexes (joint forward)")
+            _stage(progress, "[4/6] Publishing dense and sparse batches")
             dense_space = _chunked_space(dense.embedding_space_id, policy.id)
             sparse_space = _chunked_space(sparse.embedding_space_id, policy.id)
-            dense_started = time.perf_counter()
+            joint_started = time.perf_counter()
             dense_processed = 0
-            for rows in store.embedding_batches_by_length(policy_id=policy.id, batch_size=config.batch_size):
-                texts = [str(row["text"]) for row in rows]
-                dense_vectors = dense.embed_documents(texts)
-                store.write_dense_batch(rows=rows, vectors=dense_vectors, model=dense.model_name, space=dense_space)
-                store.commit()
-                dense_processed += len(rows)
-                if dense_processed % (config.batch_size * 25) == 0:
-                    from kb.storage.native_pre_mvp import _release_batch_memory
-                    _release_batch_memory()
-            dense_seconds = time.perf_counter() - dense_started
-            sparse_started = time.perf_counter()
             sparse_processed = 0
             for rows in store.embedding_batches_by_length(policy_id=policy.id, batch_size=config.batch_size):
                 texts = [str(row["text"]) for row in rows]
-                sparse_vectors = sparse.embed_documents(texts)
+                dense_vectors, sparse_vectors = embed_joint_documents(dense, sparse, texts)
+                store.write_dense_batch(rows=rows, vectors=dense_vectors, model=dense.model_name, space=dense_space)
                 store.write_sparse_batch(rows=rows, vectors=sparse_vectors, model=sparse.model_name, space=sparse_space)
                 store.commit()
+                dense_processed += len(rows)
                 sparse_processed += len(rows)
-                if sparse_processed % (config.batch_size * 25) == 0:
+                del dense_vectors, sparse_vectors, texts, rows
+                if dense_processed % (config.batch_size * 25) == 0:
                     from kb.storage.native_pre_mvp import _release_batch_memory
                     _release_batch_memory()
-            sparse_seconds = time.perf_counter() - sparse_started
+            joint_seconds = time.perf_counter() - joint_started
             audit = store.audit()
             audit["embedding_build"] = {
                 "chunks": chunk_audit["total_retrieval_chunks"],
-                "dense": {"processed": dense_processed, "seconds": dense_seconds,
-                          "throughput": dense_processed / dense_seconds if dense_seconds else 0.0,
-                          "device": getattr(dense, "runtime_metadata", {}).get("device")},
-                "sparse": {"processed": sparse_processed, "seconds": sparse_seconds,
-                           "throughput": sparse_processed / sparse_seconds if sparse_seconds else 0.0,
-                           "device": getattr(sparse, "runtime_metadata", {}).get("device")},
-                "total_seconds": dense_seconds + sparse_seconds,
+                "dense": {"processed": dense_processed, "seconds": joint_seconds,
+                          "throughput": dense_processed / joint_seconds if joint_seconds else 0.0,
+                          "device": getattr(dense, "runtime_metadata", {}).get("device"),
+                          "shared_joint_pass": True},
+                "sparse": {"processed": sparse_processed, "seconds": joint_seconds,
+                           "throughput": sparse_processed / joint_seconds if joint_seconds else 0.0,
+                           "device": getattr(sparse, "runtime_metadata", {}).get("device"),
+                           "shared_joint_pass": True},
+                "joint": {"processed": dense_processed, "seconds": joint_seconds,
+                           "throughput": dense_processed / joint_seconds if joint_seconds else 0.0,
+                           "device": getattr(dense, "runtime_metadata", {}).get("device")},
+                "total_seconds": joint_seconds,
             }
             contracts = {"dense": {"model": dense.model_name, "embedding_space_id": dense.embedding_space_id},
                          "sparse": {"model": sparse.model_name, "embedding_space_id": sparse.embedding_space_id},

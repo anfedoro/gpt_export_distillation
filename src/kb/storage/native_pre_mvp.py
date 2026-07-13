@@ -14,7 +14,7 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from kb.embeddings.bge_m3_provider import build_bge_m3_providers
+from kb.embeddings.bge_m3_provider import build_bge_m3_providers, embed_joint_documents
 from kb.index.chunk_builder import ChunkPolicy, StrictestTokenizer, build_chunk_policy, build_retrieval_chunks
 from kb.ingest.chat_md_parser import parse_chat_file
 from kb.ingest.tree_walker import scan_tree
@@ -522,50 +522,39 @@ def build_native_pre_mvp_db(
             store.commit()
             dense_space = _chunked_space(dense.embedding_space_id, policy.id)
             sparse_space = _chunked_space(sparse.embedding_space_id, policy.id)
-            dense_started = time.perf_counter()
+            joint_started = time.perf_counter()
             dense_processed = 0
-            for rows in store.embedding_batches_by_length(policy_id=policy.id, batch_size=batch_size):
-                texts = [str(row["text"]) for row in rows]
-                for row, text in zip(rows, texts, strict=True):
-                    dense.assert_fits(text, chunk_id=str(row["id"]), block_id=str(row["block_id"]), source_identity=str(row["block_id"]))
-                dense_vectors = dense.embed_documents(texts)
-                store.write_dense_batch(rows=rows, vectors=dense_vectors, model=dense.model_name, space=dense_space)
-                store.commit()
-                dense_processed += len(rows)
-                del dense_vectors, texts, rows
-                if dense_processed % (batch_size * 25) == 0:
-                    _release_batch_memory()
-                if progress and (dense_processed % (batch_size * 100) == 0):
-                    print(f"[native-build] dense_processed={dense_processed}", flush=True)
-            dense_seconds = time.perf_counter() - dense_started
-            _release_batch_memory()
-
-            sparse_started = time.perf_counter()
             sparse_processed = 0
             for rows in store.embedding_batches_by_length(policy_id=policy.id, batch_size=batch_size):
                 texts = [str(row["text"]) for row in rows]
                 for row, text in zip(rows, texts, strict=True):
+                    dense.assert_fits(text, chunk_id=str(row["id"]), block_id=str(row["block_id"]), source_identity=str(row["block_id"]))
                     sparse.assert_fits(text, chunk_id=str(row["id"]), block_id=str(row["block_id"]), source_identity=str(row["block_id"]))
-                sparse_vectors = sparse.embed_documents(texts)
+                dense_vectors, sparse_vectors = embed_joint_documents(dense, sparse, texts)
+                store.write_dense_batch(rows=rows, vectors=dense_vectors, model=dense.model_name, space=dense_space)
                 store.write_sparse_batch(rows=rows, vectors=sparse_vectors, model=sparse.model_name, space=sparse_space)
                 store.commit()
+                dense_processed += len(rows)
                 sparse_processed += len(rows)
-                del sparse_vectors, texts, rows
-                if sparse_processed % (batch_size * 25) == 0:
+                del dense_vectors, sparse_vectors, texts, rows
+                if dense_processed % (batch_size * 25) == 0:
                     _release_batch_memory()
-                if progress and (sparse_processed % (batch_size * 100) == 0):
-                    print(f"[native-build] sparse_processed={sparse_processed}", flush=True)
-            sparse_seconds = time.perf_counter() - sparse_started
+                if progress and (dense_processed % (batch_size * 100) == 0):
+                    print(f"[native-build] joint_processed={dense_processed}", flush=True)
+            joint_seconds = time.perf_counter() - joint_started
             _release_batch_memory()
             embedding_metrics = {
                 "chunks": chunk_audit["total_retrieval_chunks"],
-                "dense": {"processed": dense_processed, "seconds": dense_seconds,
-                          "throughput": dense_processed / dense_seconds if dense_seconds else 0.0,
-                          "device": dense.runtime_metadata.get("device")},
-                "sparse": {"processed": sparse_processed, "seconds": sparse_seconds,
-                           "throughput": sparse_processed / sparse_seconds if sparse_seconds else 0.0,
-                           "device": sparse.runtime_metadata.get("device")},
-                "total_seconds": dense_seconds + sparse_seconds,
+                "dense": {"processed": dense_processed, "seconds": joint_seconds,
+                          "throughput": dense_processed / joint_seconds if joint_seconds else 0.0,
+                          "device": dense.runtime_metadata.get("device"), "shared_joint_pass": True},
+                "sparse": {"processed": sparse_processed, "seconds": joint_seconds,
+                           "throughput": sparse_processed / joint_seconds if joint_seconds else 0.0,
+                           "device": sparse.runtime_metadata.get("device"), "shared_joint_pass": True},
+                "joint": {"processed": dense_processed, "seconds": joint_seconds,
+                           "throughput": dense_processed / joint_seconds if joint_seconds else 0.0,
+                           "device": dense.runtime_metadata.get("device")},
+                "total_seconds": joint_seconds,
             }
             audit = store.audit()
             audit.update({"schema_version": NATIVE_PRE_MVP_SCHEMA_VERSION, "export_path": str(export_path), "output_db": str(output_db),
