@@ -65,6 +65,7 @@ def run_diagnostics(
         "dense_tokenization_seconds": 0.0,
         "sparse_tokenization_seconds": 0.0,
         "dense_forward_seconds": 0.0,
+        "shared_backbone_forward_seconds": 0.0,
         "dense_pooling_normalization_seconds": 0.0,
         "sparse_forward_seconds": 0.0,
         "sparse_projection_seconds": 0.0,
@@ -124,48 +125,39 @@ def _measure_batch(
         except (AttributeError, RuntimeError):
             pass
 
-    started = time.perf_counter()
     token_started = time.perf_counter()
-    dense_inputs = backend._inputs(texts)
-    dense_tokenization_seconds = time.perf_counter() - token_started
-    timings["dense_tokenization_seconds"] += dense_tokenization_seconds
+    inputs = backend._inputs(texts)
+    tokenization_seconds = time.perf_counter() - token_started
+    timings["tokenization_seconds"] += tokenization_seconds
+    timings["dense_tokenization_seconds"] += tokenization_seconds
     sync()
     forward_started = time.perf_counter()
     with torch.inference_mode():
-        dense_hidden = backend.model(**dense_inputs).last_hidden_state
+        hidden = backend.model(**inputs).last_hidden_state
     sync()
-    timings["dense_forward_seconds"] += time.perf_counter() - forward_started
+    forward_seconds = time.perf_counter() - forward_started
+    timings["dense_forward_seconds"] += forward_seconds
+    timings["shared_backbone_forward_seconds"] += forward_seconds
     pool_started = time.perf_counter()
     with torch.inference_mode():
-        dense_vectors_tensor = torch.nn.functional.normalize(dense_hidden[:, 0], p=2, dim=-1)
+        dense_vectors_tensor = torch.nn.functional.normalize(hidden[:, 0], p=2, dim=-1)
     dense_vectors = dense_vectors_tensor.float().cpu().numpy().tolist()
     timings["dense_pooling_normalization_seconds"] += time.perf_counter() - pool_started
     dense_insert_started = time.perf_counter()
     store.write_dense_batch(rows=rows, vectors=dense_vectors, model=backend.model_name, space=dense_space)
     timings["dense_sqlite_insert_seconds"] += time.perf_counter() - dense_insert_started
-    del dense_hidden, dense_vectors_tensor, dense_vectors, dense_inputs
-
-    token_started = time.perf_counter()
-    sparse_inputs = backend._inputs(texts)
-    sparse_tokenization_seconds = time.perf_counter() - token_started
-    timings["sparse_tokenization_seconds"] += sparse_tokenization_seconds
-    sync()
-    forward_started = time.perf_counter()
-    with torch.inference_mode():
-        sparse_hidden = backend.model(**sparse_inputs).last_hidden_state
-    sync()
-    timings["sparse_forward_seconds"] += time.perf_counter() - forward_started
+    del dense_vectors_tensor, dense_vectors
     projection_started = time.perf_counter()
     with torch.inference_mode():
-        sparse_weights = torch.relu(backend.sparse_linear(sparse_hidden)).squeeze(-1)
+        sparse_weights = torch.relu(backend.sparse_linear(hidden)).squeeze(-1)
     sync()
     timings["sparse_projection_seconds"] += time.perf_counter() - projection_started
     head_started = time.perf_counter()
     weights_cpu = sparse_weights.float().cpu()
-    ids_cpu = sparse_inputs["input_ids"].cpu()
-    attention_cpu = sparse_inputs["attention_mask"].cpu()
-    timings["sparse_head_seconds"] += time.perf_counter() - head_started
-    timings["sparse_head_transfer_seconds"] += time.perf_counter() - head_started
+    ids_cpu = inputs["input_ids"].cpu()
+    attention_cpu = inputs["attention_mask"].cpu()
+    transfer_seconds = time.perf_counter() - head_started
+    timings["sparse_head_transfer_seconds"] += transfer_seconds
     decode_started = time.perf_counter()
     sparse_vectors = [
         backend._lexical(ids, values, mask)
@@ -175,12 +167,10 @@ def _measure_batch(
     sparse_insert_started = time.perf_counter()
     store.write_sparse_batch(rows=rows, vectors=sparse_vectors, model=backend.model_name, space=sparse_space)
     timings["sparse_sqlite_insert_seconds"] += time.perf_counter() - sparse_insert_started
-    timings["tokenization_seconds"] += dense_tokenization_seconds + sparse_tokenization_seconds
-    del sparse_hidden, sparse_weights, weights_cpu, ids_cpu, attention_cpu, sparse_inputs, sparse_vectors
+    del hidden, sparse_weights, weights_cpu, ids_cpu, attention_cpu, inputs, sparse_vectors
     timings["sparse_head_seconds"] = (
         timings["sparse_projection_seconds"] + timings["sparse_head_transfer_seconds"]
     )
-    _ = time.perf_counter() - started
 
 
 def _select_rows(path: Path, policy_id: str, limit: int) -> list[Any]:

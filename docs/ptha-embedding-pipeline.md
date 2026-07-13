@@ -15,16 +15,19 @@ only by the opt-in local comparison benchmark.
 
 ## Build order
 
-Index construction is deliberately sequential:
+Index construction is deliberately sequential at the batch level:
 
 1. create canonical retrieval chunks;
-2. generate and publish all dense vectors in batches;
-3. generate and publish all sparse vectors in batches;
-4. validate counts and publish the database atomically.
+2. run one BGE-M3 forward for a batch;
+3. derive dense and sparse representations from that hidden state;
+4. write the separate dense and sparse tables for that batch;
+5. validate counts and publish the database atomically.
 
-There are no concurrent dense/sparse workers. Both passes resolve one shared
-device and retain one model backbone. The database schema, dense/sparse
-candidate union, fusion weights, and MCP tools are unchanged.
+There are no concurrent dense/sparse workers and no second backbone forward.
+Both representations resolve one shared device and retain one model backbone.
+The database schema, dense/sparse candidate union, fusion weights, and MCP
+tools are unchanged. Dense and sparse rows remain separate and the complete
+database is still published atomically.
 
 The effective input limit is 512 tokens. Chunk construction checks the input
 against every active representation contract before inference. This avoids
@@ -43,6 +46,12 @@ export in 573.7 seconds. On a fixed 10,000-chunk subset with batch size 32:
 - hash-ID batching: dense 17.11 chunks/s, sparse 17.62 chunks/s, 1,152.1 seconds total;
 - length-bucketed batching: dense 68.30 chunks/s, sparse 56.49 chunks/s, 323.4 seconds total.
 
+After joint-forward inference, the same fixed 10,000-chunk length-bucketed
+diagnostic completed in 10.13 seconds (987.6 chunks/s) on MPS. The shared
+backbone forward took 7.22 seconds; dense pooling, sparse projection/transfer,
+decoding, and SQLite writes accounted for the remainder. The old measurements
+above are retained as the pre-joint baseline.
+
 Length bucketing is therefore part of the production build path. It changes
 only scheduling, not chunk identity or vector values. Batch size 128 improved a
 1,000-chunk probe by only about 12 percent while raising MPS driver allocation
@@ -58,8 +67,8 @@ Every native build reports the following privacy-safe metrics:
 ```text
 Embedding build
   Chunks
-  Dense: processed, seconds, throughput, device
-  Sparse: processed, seconds, throughput, device
+  Joint: processed, seconds, throughput, device
+  Dense/Sparse: processed, shared joint-pass seconds, throughput, device
   Total seconds
 ```
 
