@@ -1,0 +1,83 @@
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from ptha.cli import main
+from ptha.config import load_config
+from ptha.errors import DatabaseExistsError
+from ptha.importer import import_archive
+from ptha.paths import PthaPaths
+
+
+class PthaShellTests(unittest.TestCase):
+    def test_init_is_idempotent_and_preserves_existing_config(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            config = Path(root) / "config.toml"
+            self.assertEqual(main(["--config", str(config), "init"]), 0)
+            original = config.read_text(encoding="utf-8")
+            self.assertEqual(main(["--config", str(config), "init"]), 0)
+            self.assertEqual(config.read_text(encoding="utf-8"), original)
+
+    def test_environment_overrides_config(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            config = Path(root) / "config.toml"
+            config.write_text("config_version = 1\n[paths]\ndatabase = '/config.db'\n", encoding="utf-8")
+            with patch.dict(os.environ, {"PTHA_DB_PATH": str(Path(root) / "env.db")}):
+                self.assertEqual(load_config(config).database, Path(root) / "env.db")
+
+    def test_legacy_default_sparse_model_migrates_to_shared_bge_m3(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            config = Path(root) / "config.toml"
+            config.write_text(
+                'config_version = 1\n[models]\ndense_model = "BAAI/bge-m3"\n'
+                'sparse_model = "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1"\n',
+                encoding="utf-8",
+            )
+
+            loaded = load_config(config)
+
+            self.assertEqual(loaded.dense_model, "BAAI/bge-m3")
+            self.assertEqual(loaded.sparse_model, "BAAI/bge-m3")
+
+    def test_status_json_has_versioned_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as root, patch("sys.stdout") as stdout:
+            config = Path(root) / "config.toml"
+            main(["--config", str(config), "init"])
+            stdout.reset_mock()
+            self.assertEqual(main(["--config", str(config), "status", "--json"]), 0)
+            payload = json.loads("".join(call.args[0] + "\n" for call in stdout.write.call_args_list))
+            self.assertEqual(payload["schema_version"], 1)
+            self.assertEqual(payload["database"]["state"], "missing")
+
+    def test_import_refuses_to_replace_active_database(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            source = root_path / "export.zip"
+            source.touch()
+            config_file = root_path / "config.toml"
+            database = root_path / "active.db"
+            database.touch()
+            config_file.write_text(f"config_version = 1\n[paths]\ndatabase = '{database}'\n", encoding="utf-8")
+            with self.assertRaises(DatabaseExistsError):
+                import_archive(source, load_config(config_file))
+
+    def test_import_first_run_creates_config_without_explicit_init(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            paths = PthaPaths(root_path / "config", root_path / "data", root_path / "cache", root_path / "state",
+                              root_path / "logs", root_path / "run")
+            config_file = paths.config_file
+            with patch("ptha.config.platform_paths", return_value=paths):
+                self.assertEqual(main(["--config", str(config_file), "import", str(root_path / "missing.zip"), "--quiet"]), 6)
+            self.assertTrue(config_file.is_file())
+            self.assertTrue(paths.data_dir.is_dir())
+            self.assertTrue(paths.runtime_dir.is_dir())
+
+
+if __name__ == "__main__":
+    unittest.main()

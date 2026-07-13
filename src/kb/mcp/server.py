@@ -10,10 +10,10 @@ from typing import Any
 
 from kb.cli import _build_dense_provider, _build_sparse_provider
 from kb.mcp.archive import ArchiveConfig, ArchiveSession
+from kb.mcp.tools import TOOL_NAMES, archive_tools, construct_archive_context_tool, search_archive_tool
 
 
 PROTOCOL_VERSION = "2024-11-05"
-TOOL_NAMES = ("construct_archive_context", "search_archive")
 LOG = logging.getLogger("kb.mcp")
 
 
@@ -50,7 +50,7 @@ class MCPServer:
         if method == "ping":
             return _result(request_id, {})
         if method == "tools/list":
-            return _result(request_id, {"tools": [_context_tool(), _search_tool()]})
+            return _result(request_id, {"tools": archive_tools()})
         if method == "tools/call":
             params = request.get("params") or {}
             name, arguments = params.get("name"), params.get("arguments") or {}
@@ -123,11 +123,11 @@ def handle_request(config: ServerConfig, request: dict[str, Any]) -> dict[str, A
 
 
 def _context_tool() -> dict[str, Any]:
-    return {"name": "construct_archive_context", "description": "Use only when the user request may depend on their prior ChatGPT archive: a previous decision, project continuation, preference, old discussion, historical comparison, or a named entity likely discussed before. Do not use for general questions, when this conversation is sufficient, or when the user asks not to access the archive. Never claim that the archive contains something before calling this tool. Returns a compact, provenance-linked broad context package, not a raw archive dump.", "inputSchema": {"type": "object", "properties": {"current_context": {"type": "string"}, "max_tokens": {"type": "integer", "minimum": 100, "maximum": 6000}, "max_chars": {"type": "integer", "minimum": 400}, "project_hint": {"type": "string"}, "time_range": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}, "include_preferences": {"type": "boolean", "default": True}, "include_decisions": {"type": "boolean", "default": True}, "include_recent_related": {"type": "boolean", "default": True}, "timeout_ms": {"type": "integer", "minimum": 1}}, "required": ["current_context"], "additionalProperties": False}}
+    return construct_archive_context_tool()
 
 
 def _search_tool() -> dict[str, Any]:
-    return {"name": "search_archive", "description": "Use for a focused factual lookup in the user's prior ChatGPT archive: find a specific decision, project, person, issue, conversation, or exact historical evidence. Do not use for broad background synthesis; use construct_archive_context instead. Do not claim archive contents before this tool returns. Results contain bounded excerpts, optional chronological neighbours, scores, and source IDs.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 8}, "project": {"type": "string"}, "date_from": {"type": "string"}, "date_to": {"type": "string"}, "roles": {"type": "array", "items": {"type": "string", "enum": ["user", "assistant", "system", "tool"]}}, "conversation_id": {"type": "string"}, "retrieval_mode": {"type": "string", "enum": ["hybrid"], "default": "hybrid"}, "include_neighbors": {"type": "integer", "minimum": 0, "maximum": 4, "default": 1}, "max_tokens": {"type": "integer", "minimum": 100, "maximum": 6000}, "max_chars": {"type": "integer", "minimum": 400}, "timeout_ms": {"type": "integer", "minimum": 1}}, "required": ["query"], "additionalProperties": False}}
+    return search_archive_tool()
 
 
 def _result(request_id: Any, result: dict[str, Any]) -> dict[str, Any]:
