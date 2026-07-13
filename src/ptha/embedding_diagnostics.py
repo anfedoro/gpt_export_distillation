@@ -51,6 +51,9 @@ def run_diagnostics(
     backend = BgeM3Backend("BAAI/bge-m3", device=device, torch_dtype="auto", sparse_top_k=128)
     model_load_seconds = time.perf_counter() - load_started
     snapshot = backend.diagnostic_snapshot()
+    probe_inputs = backend._inputs(["PTHA runtime diagnostic probe"])
+    snapshot["observed_input_device"] = str(probe_inputs["input_ids"].device)
+    del probe_inputs
     policy_id = _policy_id(output_db)
     rows = _select_rows(output_db, policy_id, limit)
     if not rows:

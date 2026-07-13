@@ -65,6 +65,29 @@ Embedding build
 
 No source or retrieved text is included.
 
+## Runtime precision diagnostic
+
+The diagnostic-only harness checks the effective PyTorch runtime and separates
+tokenization, backbone forward, pooling/normalization, sparse projection,
+host transfer, decoding, and SQLite insertion. It does not modify the product
+import path and does not print chunk or retrieval content:
+
+```bash
+uv run python -m ptha.embedding_diagnostics \
+  --chunk-db .local/ptha-benchmark/chunks.db \
+  --output-db .local/ptha-benchmark/diagnostic-10k.db \
+  --limit 10000 --batch-size 32 --device auto
+```
+
+The report includes the effective `from_pretrained` dtype argument, model and
+layer dtypes, model/input/sparse-head devices, autocast state, and privacy-safe
+timing fields. The current BGE-M3 path loads `float16` weights on MPS, uses
+`model.eval()` plus `torch.inference_mode()`, and does not enable autocast.
+The XLM-R pooler module is present but unused: dense output is CLS pooling
+followed by L2 normalization. The sparse checkpoint is loaded as `float16`;
+conversion to `float32` occurs only when materializing CPU lexical weights for
+the existing storage contract.
+
 ## Fixed 10,000-chunk benchmark
 
 Prepare one deterministic chunk database from the explicitly authorized export:
