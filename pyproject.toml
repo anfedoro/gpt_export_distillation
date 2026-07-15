@@ -14,6 +14,7 @@ dependencies = [
     "platformdirs>=4.3.0",
     "psutil>=7.0.0",
     "sqlite-vec>=0.1.9",
+    "tqdm>=4.67.0",
     "transformers[sentencepiece]>=5.0.0,<5.13.0",
 ]
 

@@ -173,6 +173,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(json.dumps({"command": "ptha", "args": ["mcp", "serve"]}, indent=2))
             return 0
         raise PthaError("Command is not implemented.")
+    except KeyboardInterrupt:
+        if args.command == "import":
+            message = ("PTHA import interrupted.\n\n"
+                       "Incomplete staging data was removed; the active database was not changed.\n\n"
+                       "Next:\n"
+                       "  ptha import /path/to/chatgpt-export.zip")
+        elif args.command == "reindex":
+            message = ("PTHA reindex interrupted.\n\n"
+                       "The active database was not changed. Recovery state was preserved for inspection.\n\n"
+                       "Next:\n"
+                       "  ptha doctor\n"
+                       "  ptha reindex --force")
+        else:
+            message = "PTHA operation interrupted."
+        print(message, file=sys.stderr)
+        return 130
     except PthaError as exc:
         if getattr(args, "json", False):
             print(json.dumps({"schema_version": 1, "ok": False,

@@ -132,10 +132,11 @@ ptha mcp config --absolute
 
 The MCP client starts `ptha mcp serve`; it requires the retrieval service to be
 running first. Large personal archives typically need roughly 20–50 minutes
-after the model is cached; the import prints `joint_processed` progress while
-it writes dense and sparse indexes. See [PTHA first run](docs/first-run.md) for
-the complete copy-paste path, custom database placement, CLI validation, LM
-Studio setup, service shutdown, and common errors.
+after the model is cached; import uses phase-labelled progress bars while it
+builds search chunks and writes dense+sparse indexes. See
+[PTHA first run](docs/first-run.md) for the complete copy-paste path, custom
+database placement, CLI validation, LM Studio setup, service shutdown, and
+common errors.
 
 ## Quick start
 

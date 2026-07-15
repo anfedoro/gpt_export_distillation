@@ -93,8 +93,12 @@ local Hugging Face cache. The terminal prints stages such as:
 [1/7] Reading export
 [2/7] Distilling conversations
 [3/7] Importing canonical content
-[native-build] joint_processed=400
-[native-build] joint_processed=800
+[4/7] Parsing conversations
+Parsing conversations: 100%|...| 1,500/1,500 [00:...]
+[5/7] Building search chunks
+Building retrieval chunks: 100%|...| 42,000/42,000 [00:...]
+[6/7] Building dense+sparse search index
+Building dense+sparse index:  37%|...| 50,000/134,900 [20:...<34:...]
 [7/7] Validating database
 
 Import completed.
@@ -113,11 +117,10 @@ hardware. PTHA publishes the active database only after dense and sparse
 indexes pass validation; an interrupted build leaves the previous active DB
 unchanged. Run `ptha doctor` after completion for the database check.
 
-`joint_processed` is the number of retrieval chunks whose dense and sparse
-representations have both been written. With the default batch size of four it
-is reported every 400 chunks, so the terminal remains visibly active during a
-long build. To record your own wall-clock duration, prefix the command with
-`time`:
+The bars show the current user-facing phase, completed work, speed, and an ETA.
+`Building dense+sparse index` is the long step: each completed chunk has both
+search representations written to SQLite. To record your own wall-clock
+duration, prefix the command with `time`:
 
 ```bash
 time ptha import /absolute/path/to/chatgpt-export.zip
@@ -235,7 +238,14 @@ are available at <https://lmstudio.ai/docs/app/mcp>.
 ptha service stop
 ```
 
-## 9. Common errors
+## 9. Cancel or recover an import
+
+Press `Ctrl-C` in the import terminal to cancel a running import. PTHA removes
+the incomplete staging database and leaves an already-published database
+unchanged. The next `ptha import ...` starts a clean build; PTHA v1 does not
+resume a partial vector index.
+
+## 10. Common errors
 
 - **`PTHA database is not ready`**: run `ptha import /path/to/export.zip`.
 - **`PTHA service is not running` from MCP**: run `ptha service start` before
