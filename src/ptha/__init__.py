@@ -5,7 +5,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 def application_version() -> str:
     try:
-        return version("gpt-export-distillation")
+        return version("ptha")
     except PackageNotFoundError:
         return "0.0.0+unknown"
 

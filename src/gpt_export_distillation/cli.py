@@ -46,3 +46,7 @@ def main() -> None:
         print(
             f"{input_path.name}: conversations={len(documents)} -> {output_root}"
         )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,7 +1,7 @@
 [project]
-name = "gpt-export-distillation"
+name = "ptha"
 version = "0.2.15"
-description = "Distill ChatGPT exports into Markdown-only reviewable folders"
+description = "PTHA — Personal Thought Archive: local ChatGPT archive search and MCP server"
 readme = "README.md"
 authors = [
     { name = "anfedoro", email = "anfedoro@gmail.com" }
@@ -33,14 +33,11 @@ model-conversion = [
 
 [project.scripts]
 ptha = "ptha.cli:main"
-gpt-export-distillation = "gpt_export_distillation:main"
-kb-index = "kb.cli:main"
-kb-search = "kb.retrieval.hybrid_search:main"
-kb-mcp = "kb.mcp.server:main"
-kb-benchmark = "kb.benchmark:main"
-kb-model-canary = "kb.canary.multilingual_dense:main"
-kb-real-data-preflight = "kb.canary.real_data:main"
-kb-retrieval-fusion-eval = "kb.fusion_eval:main"
+
+[project.urls]
+Repository = "https://github.com/anfedoro/ptha"
+Documentation = "https://github.com/anfedoro/ptha/tree/main/docs"
+Issues = "https://github.com/anfedoro/ptha/issues"
 
 [build-system]
 requires = ["uv_build>=0.11.19,<0.12.0"]
