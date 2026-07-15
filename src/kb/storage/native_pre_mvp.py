@@ -445,13 +445,17 @@ class NativeBuildStore:
 
 
 def build_native_pre_mvp_db(
-    *, export_path: Path, output_db: Path, dense_model: str = "BAAI/bge-m3",
-    sparse_model: str = "BAAI/bge-m3",
-    dense_device: str = "mps", sparse_device: str = "mps", dense_torch_dtype: str = "float16",
-    sparse_torch_dtype: str = "float16", chunk_policy_version: str = "v2",
-    chunk_content_budget: int = 506, sparse_top_k: int = 128, batch_size: int = 16,
+    *, export_path: Path, output_db: Path, dense_model: str = "anfedoro/bge-m3-mlx-fp16",
+    sparse_model: str = "anfedoro/bge-m3-mlx-fp16", model_revision: str = "58e70901dbba8de8f3df91b5a313bcefcb151bae",
+    embedding_device: str = "gpu", embedding_dtype: str = "float16",
+    embedding_max_padded_tokens: int | None = None,
+    sparse_head: str = "sparse_linear.safetensors", colbert_head: str = "colbert_linear.safetensors",
+    model_cache: Path | None = None, chunk_policy_version: str = "v2",
+    chunk_content_budget: int = 506, sparse_top_k: int = 128, batch_size: int = 4,
     skip_low_interest: bool = True, progress: bool = True,
     dense_effective_max_seq_length: int = 512,
+    dense_device: str | None = None, sparse_device: str | None = None,
+    dense_torch_dtype: str | None = None, sparse_torch_dtype: str | None = None,
 ) -> dict[str, Any]:
     """Parse a raw export and create a clean DB without opening any legacy DB."""
     if output_db.exists():
@@ -470,15 +474,24 @@ def build_native_pre_mvp_db(
     started = time.perf_counter()
     if sparse_model != dense_model:
         raise NativePreMvpError("Native PTHA builds require one shared BGE-M3 model.")
-    requested = {value for value in (dense_device, sparse_device) if value not in {None, "auto"}}
-    if len(requested) > 1:
-        raise NativePreMvpError("Dense and sparse embeddings must use the same device.")
+    requested_devices = {value for value in (dense_device, sparse_device) if value not in {None, "auto", "mps"}}
+    if requested_devices:
+        embedding_device = next(iter(requested_devices))
+    requested_dtypes = {value for value in (dense_torch_dtype, sparse_torch_dtype) if value not in {None, "auto"}}
+    if requested_dtypes:
+        embedding_dtype = next(iter(requested_dtypes))
     dense, sparse = build_bge_m3_providers(
         dense_model,
-        device=next(iter(requested), "auto"),
-        torch_dtype=dense_torch_dtype,
+        model_revision=model_revision,
+        device=embedding_device,
+        dtype=embedding_dtype,
         max_seq_length=dense_effective_max_seq_length,
         sparse_top_k=sparse_top_k,
+        batch_size=batch_size,
+        max_padded_tokens=embedding_max_padded_tokens,
+        sparse_head=sparse_head,
+        colbert_head=colbert_head,
+        model_cache=model_cache,
     )
     policy = build_chunk_policy([dense, sparse], version=chunk_policy_version, content_budget_override=chunk_content_budget)
     contracts = {
@@ -525,12 +538,17 @@ def build_native_pre_mvp_db(
             joint_started = time.perf_counter()
             dense_processed = 0
             sparse_processed = 0
+            real_tokens = 0
+            padded_tokens = 0
             for rows in store.embedding_batches_by_length(policy_id=policy.id, batch_size=batch_size):
                 texts = [str(row["text"]) for row in rows]
                 for row, text in zip(rows, texts, strict=True):
                     dense.assert_fits(text, chunk_id=str(row["id"]), block_id=str(row["block_id"]), source_identity=str(row["block_id"]))
                     sparse.assert_fits(text, chunk_id=str(row["id"]), block_id=str(row["block_id"]), source_identity=str(row["block_id"]))
                 dense_vectors, sparse_vectors = embed_joint_documents(dense, sparse, texts)
+                batch_metrics = getattr(getattr(dense, "backend", None), "last_batch_metrics", {})
+                real_tokens += int(batch_metrics.get("real_tokens", 0))
+                padded_tokens += int(batch_metrics.get("padded_tokens", 0))
                 store.write_dense_batch(rows=rows, vectors=dense_vectors, model=dense.model_name, space=dense_space)
                 store.write_sparse_batch(rows=rows, vectors=sparse_vectors, model=sparse.model_name, space=sparse_space)
                 store.commit()
@@ -553,7 +571,11 @@ def build_native_pre_mvp_db(
                            "device": sparse.runtime_metadata.get("device"), "shared_joint_pass": True},
                 "joint": {"processed": dense_processed, "seconds": joint_seconds,
                            "throughput": dense_processed / joint_seconds if joint_seconds else 0.0,
-                           "device": dense.runtime_metadata.get("device")},
+                           "device": dense.runtime_metadata.get("device"),
+                           "real_tokens": real_tokens, "padded_tokens": padded_tokens,
+                           "padding_efficiency": real_tokens / padded_tokens if padded_tokens else 1.0,
+                           "tokens_per_second": real_tokens / joint_seconds if joint_seconds else 0.0,
+                           "chunks_per_second": dense_processed / joint_seconds if joint_seconds else 0.0},
                 "total_seconds": joint_seconds,
             }
             audit = store.audit()
@@ -595,12 +617,9 @@ def _chunked_space(space_id: str, policy_id: str) -> str:
 def _release_batch_memory() -> None:
     gc.collect()
     try:
-        import torch
+        import mlx.core as mx
 
-        if hasattr(torch, "mps") and torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        mx.clear_cache()
     except Exception:  # noqa: BLE001
         return
 
@@ -787,9 +806,9 @@ def native_pre_mvp_query(
     dense_space = _chunked_space(dense.embedding_space_id, policy_id)
     sparse_space = _chunked_space(sparse.embedding_space_id, policy_id)
     preprocessing_finished = time.perf_counter()
-    query_dense = dense.embed_query(query)
+    dense_rows, sparse_rows = embed_joint_documents(dense, sparse, [query])
+    query_dense, query_sparse = dense_rows[0], sparse_rows[0]
     dense_query_finished = time.perf_counter()
-    query_sparse = sparse.embed_query(query)
     sparse_query_finished = time.perf_counter()
     with NativePreMvpRetriever(db_path) as retriever:
         if str(retriever.dense_model) != dense.model_name or str(retriever.dense_space) != dense_space:

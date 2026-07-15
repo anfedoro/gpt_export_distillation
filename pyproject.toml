@@ -8,15 +8,26 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "huggingface-hub>=1.0.0",
+    "mlx>=0.31.1; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "mlx-embeddings @ git+https://github.com/anfedoro/mlx-embeddings.git@4a8277aa523eb34ff29a5a832fa3f3f654336b54; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "platformdirs>=4.3.0",
     "psutil>=7.0.0",
-    "sentence-transformers>=5.0.0",
     "sqlite-vec>=0.1.9",
+    "transformers[sentencepiece]>=5.0.0,<5.13.0",
 ]
 
 [project.optional-dependencies]
 nlp = [
     "pymorphy3>=2.0.4",
+]
+legacy-torch = [
+    "sentence-transformers>=5.0.0",
+]
+model-conversion = [
+    "torch>=2.12.0",
+    "safetensors>=0.6.0",
+    "huggingface-hub>=1.0.0",
 ]
 
 [project.scripts]

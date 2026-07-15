@@ -42,7 +42,8 @@ def reindex_database(config: PthaConfig, *, force: bool = False, batch_size: int
                      progress: Callable[[str], None] | None = None) -> dict[str, Any]:
     effective = replace(config, batch_size=batch_size or config.batch_size,
                         dense_device=dense_device or config.dense_device,
-                        sparse_device=sparse_device or config.sparse_device)
+                        sparse_device=sparse_device or config.sparse_device,
+                        embedding_device=(dense_device or sparse_device or config.embedding_device).replace("mps", "gpu"))
     with maintenance_lock(effective):
         return _reindex(effective, force=force, progress=progress)
 
@@ -98,9 +99,14 @@ def _reindex(config: PthaConfig, *, force: bool, progress: Callable[[str], None]
             joint_started = time.perf_counter()
             dense_processed = 0
             sparse_processed = 0
+            real_tokens = 0
+            padded_tokens = 0
             for rows in store.embedding_batches_by_length(policy_id=policy.id, batch_size=config.batch_size):
                 texts = [str(row["text"]) for row in rows]
                 dense_vectors, sparse_vectors = embed_joint_documents(dense, sparse, texts)
+                batch_metrics = getattr(getattr(dense, "backend", None), "last_batch_metrics", {})
+                real_tokens += int(batch_metrics.get("real_tokens", 0))
+                padded_tokens += int(batch_metrics.get("padded_tokens", 0))
                 store.write_dense_batch(rows=rows, vectors=dense_vectors, model=dense.model_name, space=dense_space)
                 store.write_sparse_batch(rows=rows, vectors=sparse_vectors, model=sparse.model_name, space=sparse_space)
                 store.commit()
@@ -123,8 +129,12 @@ def _reindex(config: PthaConfig, *, force: bool, progress: Callable[[str], None]
                            "device": getattr(sparse, "runtime_metadata", {}).get("device"),
                            "shared_joint_pass": True},
                 "joint": {"processed": dense_processed, "seconds": joint_seconds,
-                           "throughput": dense_processed / joint_seconds if joint_seconds else 0.0,
-                           "device": getattr(dense, "runtime_metadata", {}).get("device")},
+                          "throughput": dense_processed / joint_seconds if joint_seconds else 0.0,
+                          "device": getattr(dense, "runtime_metadata", {}).get("device"),
+                          "real_tokens": real_tokens, "padded_tokens": padded_tokens,
+                          "padding_efficiency": real_tokens / padded_tokens if padded_tokens else 1.0,
+                          "tokens_per_second": real_tokens / joint_seconds if joint_seconds else 0.0,
+                          "chunks_per_second": dense_processed / joint_seconds if joint_seconds else 0.0},
                 "total_seconds": joint_seconds,
             }
             contracts = {"dense": {"model": dense.model_name, "embedding_space_id": dense.embedding_space_id},

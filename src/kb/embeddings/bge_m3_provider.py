@@ -1,71 +1,95 @@
-"""Shared-backbone BGE-M3 dense and lexical embedding providers."""
+"""MLX BGE-M3 dense and lexical embedding providers."""
 
 from __future__ import annotations
 
 import math
-from typing import Any
+import time
+from pathlib import Path
+from typing import Any, Sequence
 
-from kb.embeddings.base import DenseEmbeddingProvider, EmbeddingProviderContract, SparseEmbeddingProvider
+from kb.embeddings.base import (
+    DenseEmbeddingProvider,
+    EmbeddingProvider,
+    EmbeddingProviderContract,
+    EmbeddingResult,
+    SparseEmbeddingProvider,
+)
 
-
-def resolve_embedding_device(requested: str | None) -> str:
-    """Resolve one device for every BGE-M3 representation."""
-    import torch
-
-    if requested and requested != "auto":
-        return requested
-    if torch.backends.mps.is_available():
-        return "mps"
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
+MLX_EMBEDDINGS_REVISION = "4a8277aa523eb34ff29a5a832fa3f3f654336b54"
 
 
-class BgeM3Backend:
-    """Load one BGE-M3 backbone and expose dense and lexical batch passes."""
+class MlxBgeM3Provider(EmbeddingProvider):
+    """Produce BGE-M3 dense and lexical vectors from one MLX forward."""
 
     def __init__(
         self,
-        model_name: str = "BAAI/bge-m3",
+        model_name: str,
         *,
-        device: str | None = None,
-        torch_dtype: str | None = None,
+        model_revision: str,
+        dtype: str = "float16",
+        device: str = "gpu",
         max_seq_length: int = 512,
         sparse_top_k: int = 128,
-        model: Any | None = None,
-        tokenizer: Any | None = None,
-        sparse_linear: Any | None = None,
+        batch_size: int = 4,
+        max_padded_tokens: int | None = None,
+        sparse_head: str = "sparse_linear.safetensors",
+        colbert_head: str = "colbert_linear.safetensors",
+        model_cache: Path | None = None,
     ) -> None:
-        import torch
+        if not model_revision:
+            raise ValueError("MLX model revision must be pinned to a Hugging Face commit SHA.")
+        if dtype != "float16":
+            raise ValueError("Production MLX BGE-M3 supports embedding_dtype=float16 only.")
+        if device != "gpu":
+            raise ValueError("Production MLX BGE-M3 supports embedding_device=gpu only.")
+        if batch_size <= 0:
+            raise ValueError("embedding_batch_size must be positive.")
+        if max_padded_tokens is not None and max_padded_tokens <= 0:
+            raise ValueError("embedding_max_padded_tokens must be positive when set.")
+
+        try:
+            import mlx.core as mx
+            from huggingface_hub import snapshot_download
+            from mlx_embeddings.sparse import load_sparse_linear
+            from mlx_embeddings.utils import load_model, load_tokenizer
+        except ImportError as exc:
+            raise RuntimeError("MLX embedding runtime is unavailable; install PTHA on Apple Silicon macOS.") from exc
+
+        if not hasattr(mx.fast, "scaled_dot_product_attention"):
+            raise RuntimeError("MLX fused scaled-dot-product attention is unavailable.")
+        mx.set_default_device(mx.gpu)
+        local_model = Path(model_name).expanduser()
+        snapshot = local_model.resolve() if local_model.is_dir() else Path(snapshot_download(
+            repo_id=model_name,
+            revision=model_revision,
+            cache_dir=str(model_cache) if model_cache else None,
+        ))
+        required = {
+            "model.safetensors",
+            sparse_head,
+            colbert_head,
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+        }
+        missing = sorted(name for name in required if not (snapshot / name).is_file())
+        if missing:
+            raise RuntimeError(f"MLX BGE-M3 artifact is incomplete; missing: {', '.join(missing)}")
 
         self.model_name = model_name
-        self.device = resolve_embedding_device(device)
+        self.model_revision = model_revision
+        self.model_path = snapshot
         self.max_seq_length = max_seq_length
         self.sparse_top_k = sparse_top_k
-        dtype = _resolve_dtype(torch_dtype, self.device)
-        self.from_pretrained_dtype = dtype
-        self.sparse_checkpoint_dtype = None
-        if model is None or tokenizer is None or sparse_linear is None:
-            from huggingface_hub import hf_hub_download
-            from transformers import AutoModel, AutoTokenizer
-
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
-            model = AutoModel.from_pretrained(model_name, dtype=dtype)
-            sparse_linear = torch.nn.Linear(model.config.hidden_size, 1, dtype=dtype)
-            sparse_path = hf_hub_download(model_name, "sparse_linear.pt")
-            state = torch.load(sparse_path, map_location="cpu", weights_only=True)
-            self.sparse_checkpoint_dtype = str(next(iter(state.values())).dtype).removeprefix("torch.")
-            sparse_linear.load_state_dict(state)
-        self.tokenizer = tokenizer
-        self.model = model.eval().to(self.device)
-        self.sparse_linear = sparse_linear.eval().to(self.device)
+        self.batch_size = batch_size
+        self.max_padded_tokens = max_padded_tokens
+        self.device = device
+        self.model = load_model(snapshot, path_to_repo=model_name)
+        self.tokenizer = load_tokenizer(snapshot)
+        self.sparse_weight, self.sparse_bias = load_sparse_linear(snapshot / sparse_head)
         self.dimension = int(self.model.config.hidden_size)
-        self.runtime_metadata = {
-            "backend": "transformers-bge-m3",
-            "device": self.device,
-            "torch_dtype": str(next(self.model.parameters()).dtype).removeprefix("torch."),
-            "shared_backbone": True,
-        }
+        self.forward_calls = 0
+        self.last_batch_metrics: dict[str, float | int] = {}
         self.special_ids = {
             value for value in (
                 self.tokenizer.cls_token_id,
@@ -74,144 +98,134 @@ class BgeM3Backend:
                 self.tokenizer.unk_token_id,
             ) if value is not None
         }
-
-    def diagnostic_snapshot(self) -> dict[str, Any]:
-        """Return runtime facts without exposing model weights or input content."""
-        import torch
-
-        def dtype_of(value: Any) -> str | None:
-            if isinstance(value, torch.dtype):
-                return str(value).removeprefix("torch.")
-            dtype = getattr(value, "dtype", None)
-            return str(dtype).removeprefix("torch.") if dtype is not None else None
-
-        def module_dtype(module: Any) -> str | None:
-            try:
-                return dtype_of(next(module.parameters()))
-            except (StopIteration, AttributeError, TypeError):
-                return None
-
-        embeddings = getattr(self.model, "embeddings", None)
-        encoder = getattr(self.model, "encoder", None)
-        layers = getattr(encoder, "layer", None)
-        transformer_layer = layers[0] if layers else None
-        dense_projection = getattr(self.model, "pooler", None)
-        autocast_enabled = bool(torch.is_autocast_enabled())
-        try:
-            autocast_enabled = autocast_enabled or bool(torch.is_autocast_enabled(self.device))
-        except (TypeError, RuntimeError):
-            pass
-        autocast_dtype = None
-        if autocast_enabled and hasattr(torch, "get_autocast_dtype"):
-            try:
-                autocast_dtype = dtype_of(torch.get_autocast_dtype(self.device))
-            except (TypeError, RuntimeError):
-                autocast_dtype = None
-        return {
-            "framework": "pytorch",
-            "device": self.device,
-            "model_device": str(next(self.model.parameters()).device),
-            "input_device": self.device,
-            "sparse_head_device": str(next(self.sparse_linear.parameters()).device),
-            "model_dtype": dtype_of(next(self.model.parameters())),
-            "from_pretrained_dtype": dtype_of(self.from_pretrained_dtype),
-            "from_pretrained_dtype_argument": "dtype",
-            "autocast_enabled": autocast_enabled,
-            "autocast_dtype": autocast_dtype,
-            "layers": {
-                "embeddings": module_dtype(embeddings),
-                "transformer_layer_0": module_dtype(transformer_layer),
-                "dense_projection": module_dtype(dense_projection),
-                "dense_projection_description": "none; CLS pooling + L2 normalization"
-                if dense_projection is None else type(dense_projection).__name__,
-                "dense_projection_used_by_pipeline": False,
-                "sparse_head": module_dtype(self.sparse_linear),
-            },
-            "sparse_checkpoint_dtype": self.sparse_checkpoint_dtype,
-            "model_eval": not self.model.training,
-            "sparse_head_eval": not self.sparse_linear.training,
-            "inference_mode_in_provider": True,
+        self._validate_runtime(mx)
+        self.runtime_metadata = {
+            "backend": "mlx-bge-m3",
+            "framework": "mlx",
+            "device": "gpu",
+            "dtype": "float16",
+            "attention": "fused-scaled-dot-product-attention",
+            "model_revision": model_revision,
+            "mlx_embeddings_revision": MLX_EMBEDDINGS_REVISION,
+            "shared_backbone": True,
+            "batch_size": batch_size,
+            "max_padded_tokens": max_padded_tokens,
         }
 
-    def dense_documents(self, texts: list[str]) -> list[list[float]]:
-        import torch
+    def _validate_runtime(self, mx: Any) -> None:
+        from mlx.utils import tree_flatten
 
-        inputs = self._inputs(texts)
-        with torch.inference_mode():
-            hidden = self.model(**inputs).last_hidden_state
-            vectors = torch.nn.functional.normalize(hidden[:, 0], p=2, dim=-1)
-        return vectors.float().cpu().numpy().tolist()
+        if self.dimension != 1024:
+            raise RuntimeError(f"Expected BGE-M3 hidden size 1024, received {self.dimension}.")
+        if tuple(self.sparse_weight.shape) != (self.dimension, 1) or self.sparse_bias.size != 1:
+            raise RuntimeError("Sparse head is incompatible with the BGE-M3 hidden size.")
+        parameters = [value for _, value in tree_flatten(self.model.parameters())]
+        if not parameters or any(value.dtype != mx.float16 for value in parameters):
+            raise RuntimeError("Configured FP16 MLX checkpoint contains non-FP16 or quantized backbone weights.")
+        if self.sparse_weight.dtype != mx.float16 or self.sparse_bias.dtype != mx.float16:
+            raise RuntimeError("Configured FP16 MLX checkpoint contains a non-FP16 sparse head.")
+        vocab_size = int(getattr(self.model.config, "vocab_size", 0))
+        tokenizer_size = len(getattr(self.tokenizer, "_tokenizer", self.tokenizer))
+        if vocab_size != tokenizer_size:
+            raise RuntimeError(f"Tokenizer vocabulary ({tokenizer_size}) does not match model ({vocab_size}).")
+        positions = int(getattr(self.model.config, "max_position_embeddings", 0))
+        if positions < self.max_seq_length:
+            raise RuntimeError(f"Model supports {positions} positions, below configured {self.max_seq_length}.")
 
-    def sparse_documents(self, texts: list[str]) -> list[dict[str, float]]:
-        import torch
+    def embed_batch(self, texts: Sequence[str]) -> Sequence[EmbeddingResult]:
+        import mlx.core as mx
+        from mlx_embeddings.sparse import sparse_token_weights
 
-        inputs = self._inputs(texts)
-        with torch.inference_mode():
-            hidden = self.model(**inputs).last_hidden_state
-            weights = torch.relu(self.sparse_linear(hidden)).squeeze(-1).float().cpu()
-            input_ids = inputs["input_ids"].cpu()
-            attention = inputs["attention_mask"].cpu()
-        return [self._lexical(ids, values, mask) for ids, values, mask in zip(input_ids, weights, attention, strict=True)]
-
-    def joint_documents(self, texts: list[str]) -> tuple[list[list[float]], list[dict[str, float]]]:
-        """Compute dense and lexical representations from one backbone forward."""
-        import torch
-
-        inputs = self._inputs(texts)
-        with torch.inference_mode():
-            hidden = self.model(**inputs).last_hidden_state
-            dense = torch.nn.functional.normalize(hidden[:, 0], p=2, dim=-1)
-            sparse = torch.relu(self.sparse_linear(hidden)).squeeze(-1)
-        dense_vectors = dense.float().cpu().numpy().tolist()
-        weights = sparse.float().cpu()
-        input_ids = inputs["input_ids"].cpu()
-        attention = inputs["attention_mask"].cpu()
-        sparse_vectors = [
-            self._lexical(ids, values, mask)
-            for ids, values, mask in zip(input_ids, weights, attention, strict=True)
+        if not texts:
+            return []
+        started = time.perf_counter()
+        encoded = [
+            self.tokenizer.encode(text, add_special_tokens=True, truncation=True, max_length=self.max_seq_length)
+            for text in texts
         ]
-        return dense_vectors, sparse_vectors
+        order = sorted(range(len(encoded)), key=lambda index: (len(encoded[index]), index))
+        restored: list[EmbeddingResult | None] = [None] * len(encoded)
+        real_tokens = padded_tokens = 0
+        cursor = 0
+        while cursor < len(order):
+            end = min(cursor + self.batch_size, len(order))
+            if self.max_padded_tokens is not None:
+                while end > cursor + 1:
+                    longest = len(encoded[order[end - 1]])
+                    if longest * (end - cursor) <= self.max_padded_tokens:
+                        break
+                    end -= 1
+            indices = order[cursor:end]
+            max_length = max(len(encoded[index]) for index in indices)
+            pad_id = int(self.tokenizer.pad_token_id)
+            ids = [encoded[index] + [pad_id] * (max_length - len(encoded[index])) for index in indices]
+            mask = [[1] * len(encoded[index]) + [0] * (max_length - len(encoded[index])) for index in indices]
+            input_ids = mx.array(ids, dtype=mx.int32)
+            attention_mask = mx.array(mask, dtype=mx.int32)
+            output = self.model(input_ids, attention_mask=attention_mask)
+            self.forward_calls += 1
+            hidden = output.last_hidden_state
+            dense = hidden[:, 0, :]
+            dense = dense / mx.maximum(mx.sqrt(mx.sum(dense * dense, axis=-1, keepdims=True)), mx.array(1e-12))
+            sparse = sparse_token_weights(hidden, self.sparse_weight, self.sparse_bias, attention_mask)
+            mx.eval(dense, sparse)
+            dense_values = dense.astype(mx.float32).tolist()
+            sparse_values = sparse.astype(mx.float32).tolist()
+            for local, original in enumerate(indices):
+                restored[original] = EmbeddingResult(
+                    dense=[float(value) for value in dense_values[local]],
+                    sparse=self._aggregate_sparse(
+                        encoded[original], sparse_values[local][: len(encoded[original])]
+                    ),
+                )
+            real_tokens += sum(len(encoded[index]) for index in indices)
+            padded_tokens += max_length * len(indices)
+            cursor = end
+        elapsed = time.perf_counter() - started
+        self.last_batch_metrics = {
+            "chunks": len(texts),
+            "real_tokens": real_tokens,
+            "padded_tokens": padded_tokens,
+            "padding_efficiency": real_tokens / padded_tokens if padded_tokens else 1.0,
+            "tokens_per_second": real_tokens / elapsed if elapsed else 0.0,
+            "chunks_per_second": len(texts) / elapsed if elapsed else 0.0,
+            "seconds": elapsed,
+        }
+        return [result for result in restored if result is not None]
 
-    def token_count(self, text: str) -> int:
-        return len(self.tokenizer(text, add_special_tokens=True, truncation=False)["input_ids"])
-
-    def fits_token_budget(self, text: str, budget: int) -> bool:
-        encoded = self.tokenizer(text, add_special_tokens=True, truncation=True, max_length=budget + 1)
-        return len(encoded["input_ids"]) <= budget
-
-    def _inputs(self, texts: list[str]) -> dict[str, Any]:
-        return self.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_seq_length,
-            return_tensors="pt",
-        ).to(self.device)
-
-    def _lexical(self, ids: Any, weights: Any, attention: Any) -> dict[str, float]:
+    def _aggregate_sparse(self, token_ids: Sequence[int], weights: Sequence[float]) -> dict[str, float]:
         by_id: dict[int, float] = {}
-        for token_id, weight, active in zip(ids.tolist(), weights.tolist(), attention.tolist(), strict=True):
-            if not active or token_id in self.special_ids or weight <= 0 or not math.isfinite(weight):
+        for token_id, weight in zip(token_ids, weights, strict=True):
+            if token_id in self.special_ids or weight <= 0 or not math.isfinite(weight):
                 continue
             by_id[token_id] = max(by_id.get(token_id, 0.0), float(weight))
         strongest = sorted(by_id.items(), key=lambda item: (-item[1], item[0]))[: self.sparse_top_k]
         return {self.tokenizer.convert_ids_to_tokens(token_id): weight for token_id, weight in strongest}
 
+    def token_count(self, text: str) -> int:
+        return len(self.tokenizer.encode(text, add_special_tokens=True))
+
+    def fits_token_budget(self, text: str, budget: int) -> bool:
+        return self.token_count(text) <= budget
+
+    def diagnostic_snapshot(self) -> dict[str, Any]:
+        return {**self.runtime_metadata, "model_dtype": "float16", "sparse_head_dtype": "float16"}
+
 
 class BgeM3DenseProvider(DenseEmbeddingProvider):
-    def __init__(self, backend: BgeM3Backend) -> None:
+    def __init__(self, backend: MlxBgeM3Provider) -> None:
         self.backend = backend
         self.model_name = backend.model_name
         self.effective_max_sequence_length = backend.max_seq_length
         self.embedding_space_id = (
-            f"bge-m3-dense;model={self.model_name};dim={backend.dimension};normalize=true;"
-            f"max_seq={backend.max_seq_length}"
+            f"bge-m3-dense;model={self.model_name};revision={backend.model_revision};dim={backend.dimension};"
+            f"normalize=true;max_seq={backend.max_seq_length}"
         )
         self.runtime_metadata = backend.runtime_metadata
         self.provider_contract = _contract(backend, embedding_dimension=backend.dimension)
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return self.backend.dense_documents(texts)
+        return [result.dense for result in self.backend.embed_batch(texts)]
 
     def token_count(self, text: str) -> int:
         return self.backend.token_count(text)
@@ -221,19 +235,19 @@ class BgeM3DenseProvider(DenseEmbeddingProvider):
 
 
 class BgeM3SparseProvider(SparseEmbeddingProvider):
-    def __init__(self, backend: BgeM3Backend) -> None:
+    def __init__(self, backend: MlxBgeM3Provider) -> None:
         self.backend = backend
         self.model_name = backend.model_name
         self.effective_max_sequence_length = backend.max_seq_length
         self.embedding_space_id = (
-            f"bge-m3-lexical;model={self.model_name};top_k={backend.sparse_top_k};"
-            f"max_seq={backend.max_seq_length}"
+            f"bge-m3-lexical;model={self.model_name};revision={backend.model_revision};"
+            f"top_k={backend.sparse_top_k};max_seq={backend.max_seq_length}"
         )
         self.runtime_metadata = backend.runtime_metadata
         self.provider_contract = _contract(backend, embedding_dimension=None)
 
     def embed_documents(self, texts: list[str]) -> list[dict[str, float]]:
-        return self.backend.sparse_documents(texts)
+        return [result.sparse for result in self.backend.embed_batch(texts)]
 
     def embed_query(self, query: str) -> dict[str, float]:
         return self.embed_documents([query])[0]
@@ -248,17 +262,29 @@ class BgeM3SparseProvider(SparseEmbeddingProvider):
 def build_bge_m3_providers(
     model_name: str,
     *,
-    device: str | None,
-    torch_dtype: str | None,
+    model_revision: str,
+    device: str = "gpu",
+    dtype: str = "float16",
     max_seq_length: int = 512,
     sparse_top_k: int = 128,
+    batch_size: int = 4,
+    max_padded_tokens: int | None = None,
+    sparse_head: str = "sparse_linear.safetensors",
+    colbert_head: str = "colbert_linear.safetensors",
+    model_cache: Path | None = None,
 ) -> tuple[BgeM3DenseProvider, BgeM3SparseProvider]:
-    backend = BgeM3Backend(
+    backend = MlxBgeM3Provider(
         model_name,
+        model_revision=model_revision,
         device=device,
-        torch_dtype=torch_dtype,
+        dtype=dtype,
         max_seq_length=max_seq_length,
         sparse_top_k=sparse_top_k,
+        batch_size=batch_size,
+        max_padded_tokens=max_padded_tokens,
+        sparse_head=sparse_head,
+        colbert_head=colbert_head,
+        model_cache=model_cache,
     )
     return BgeM3DenseProvider(backend), BgeM3SparseProvider(backend)
 
@@ -268,28 +294,20 @@ def embed_joint_documents(
     sparse_provider: Any,
     texts: list[str],
 ) -> tuple[list[list[float]], list[dict[str, float]]]:
-    """Use one shared BGE-M3 forward while retaining separate provider outputs."""
+    """Use one shared backend forward while retaining separate storage contracts."""
     dense_backend = getattr(dense_provider, "backend", None)
     sparse_backend = getattr(sparse_provider, "backend", None)
-    if dense_backend is not None and dense_backend is sparse_backend and hasattr(dense_backend, "joint_documents"):
-        return dense_backend.joint_documents(texts)
-    # Keep synthetic and legacy provider implementations usable by maintenance tests.
+    if dense_backend is not None and dense_backend is sparse_backend and hasattr(dense_backend, "embed_batch"):
+        results = dense_backend.embed_batch(texts)
+        return [result.dense for result in results], [result.sparse for result in results]
     return dense_provider.embed_documents(texts), sparse_provider.embed_documents(texts)
 
 
-def _resolve_dtype(value: str | None, device: str) -> Any:
-    import torch
-
-    if value and value != "auto":
-        return getattr(torch, value)
-    return torch.float16 if device in {"mps", "cuda"} else torch.float32
-
-
-def _contract(backend: BgeM3Backend, *, embedding_dimension: int | None) -> EmbeddingProviderContract:
+def _contract(backend: MlxBgeM3Provider, *, embedding_dimension: int | None) -> EmbeddingProviderContract:
     overhead = backend.token_count("")
     return EmbeddingProviderContract(
         model_name=backend.model_name,
-        model_revision=None,
+        model_revision=backend.model_revision,
         embedding_dimension=embedding_dimension,
         tokenizer_name=str(getattr(backend.tokenizer, "name_or_path", backend.model_name)),
         tokenizer_model_max_length=int(getattr(backend.tokenizer, "model_max_length", backend.max_seq_length)),

@@ -25,14 +25,16 @@ include_low_interest = false
 replace_existing = false
 
 [models]
-dense_model = "BAAI/bge-m3"
-sparse_model = "BAAI/bge-m3"
-dense_device = "auto"
-sparse_device = "auto"
-dense_dtype = "auto"
-sparse_dtype = "auto"
+embedding_backend = "mlx"
+embedding_model = "anfedoro/bge-m3-mlx-fp16"
+embedding_model_revision = "58e70901dbba8de8f3df91b5a313bcefcb151bae"
+embedding_dtype = "float16"
+embedding_device = "gpu"
+embedding_batch_size = 4
+embedding_max_padded_tokens = 0
+embedding_sparse_head = "sparse_linear.safetensors"
+embedding_colbert_head = "colbert_linear.safetensors"
 sparse_top_k = 128
-batch_size = 16
 
 [retrieval]
 candidate_pool = 500
@@ -62,14 +64,22 @@ class PthaConfig:
     database: Path
     working_dir: Path | None = None
     model_cache: Path | None = None
-    dense_model: str = "BAAI/bge-m3"
-    sparse_model: str = "BAAI/bge-m3"
-    dense_device: str = "auto"
-    sparse_device: str = "auto"
-    dense_dtype: str = "auto"
-    sparse_dtype: str = "auto"
+    embedding_backend: str = "mlx"
+    embedding_model: str = "anfedoro/bge-m3-mlx-fp16"
+    embedding_model_revision: str = "58e70901dbba8de8f3df91b5a313bcefcb151bae"
+    embedding_dtype: str = "float16"
+    embedding_device: str = "gpu"
+    embedding_sparse_head: str = "sparse_linear.safetensors"
+    embedding_colbert_head: str = "colbert_linear.safetensors"
+    embedding_max_padded_tokens: int | None = None
+    dense_model: str = "anfedoro/bge-m3-mlx-fp16"
+    sparse_model: str = "anfedoro/bge-m3-mlx-fp16"
+    dense_device: str = "gpu"
+    sparse_device: str = "gpu"
+    dense_dtype: str = "float16"
+    sparse_dtype: str = "float16"
     sparse_top_k: int = 128
-    batch_size: int = 16
+    batch_size: int = 4
     candidate_pool: int = 500
     default_output_tokens: int = 1800
     max_output_tokens: int = 6000
@@ -110,8 +120,12 @@ def load_config(path: Path | None = None, *, overrides: Mapping[str, Any] | None
     import_raw = raw.get("import", {})
     database = _path(os.environ.get("PTHA_DB_PATH") or path_raw.get("database")) or locations.database
     model_cache = _path(os.environ.get("PTHA_MODEL_CACHE_DIR") or path_raw.get("model_cache"))
-    dense_model = str(models.get("dense_model", PthaConfig.dense_model))
-    sparse_model = str(models.get("sparse_model", PthaConfig.sparse_model))
+    legacy_dense_model = str(models.get("dense_model", ""))
+    embedding_model = str(models.get("embedding_model") or (
+        PthaConfig.embedding_model if legacy_dense_model in {"", "BAAI/bge-m3"} else legacy_dense_model
+    ))
+    dense_model = embedding_model
+    sparse_model = embedding_model
     if sparse_model == "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1" and dense_model == "BAAI/bge-m3":
         sparse_model = dense_model
     cfg = PthaConfig(
@@ -120,14 +134,22 @@ def load_config(path: Path | None = None, *, overrides: Mapping[str, Any] | None
         database=database,
         working_dir=_path(path_raw.get("working_dir")),
         model_cache=model_cache,
+        embedding_backend=str(models.get("embedding_backend", "mlx")),
+        embedding_model=embedding_model,
+        embedding_model_revision=str(models.get("embedding_model_revision", PthaConfig.embedding_model_revision)),
+        embedding_dtype=str(models.get("embedding_dtype", models.get("dense_dtype", "float16"))),
+        embedding_device=str(models.get("embedding_device", models.get("dense_device", "gpu"))),
+        embedding_sparse_head=str(models.get("embedding_sparse_head", "sparse_linear.safetensors")),
+        embedding_colbert_head=str(models.get("embedding_colbert_head", "colbert_linear.safetensors")),
+        embedding_max_padded_tokens=(int(models["embedding_max_padded_tokens"]) if int(models.get("embedding_max_padded_tokens", 0)) > 0 else None),
         dense_model=dense_model,
         sparse_model=sparse_model,
-        dense_device=os.environ.get("PTHA_DENSE_DEVICE", str(models.get("dense_device", "auto"))),
-        sparse_device=os.environ.get("PTHA_SPARSE_DEVICE", str(models.get("sparse_device", "auto"))),
-        dense_dtype=str(models.get("dense_dtype", "auto")),
-        sparse_dtype=str(models.get("sparse_dtype", "auto")),
+        dense_device=os.environ.get("PTHA_DENSE_DEVICE", str(models.get("embedding_device", models.get("dense_device", "gpu")))),
+        sparse_device=os.environ.get("PTHA_SPARSE_DEVICE", str(models.get("embedding_device", models.get("sparse_device", "gpu")))),
+        dense_dtype=str(models.get("embedding_dtype", models.get("dense_dtype", "float16"))),
+        sparse_dtype=str(models.get("embedding_dtype", models.get("sparse_dtype", "float16"))),
         sparse_top_k=int(models.get("sparse_top_k", 128)),
-        batch_size=int(models.get("batch_size", 16)),
+        batch_size=int(models.get("embedding_batch_size", models.get("batch_size", 4))),
         candidate_pool=int(retrieval.get("candidate_pool", 500)),
         default_output_tokens=int(retrieval.get("default_output_tokens", 1800)),
         max_output_tokens=int(retrieval.get("max_output_tokens", 6000)),
