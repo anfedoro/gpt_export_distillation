@@ -19,6 +19,7 @@ from kb.storage.native_pre_mvp import NativeBuildStore, NativePreMvpRetriever, _
 from ptha.config import PthaConfig
 from ptha.database import inspect_database
 from ptha.errors import PthaError
+from ptha.incremental import embedding_contract_fingerprint
 from ptha.lifecycle import service_status
 from ptha.operations import (
     clear_maintenance_state,
@@ -141,7 +142,13 @@ def _reindex(config: PthaConfig, *, force: bool, progress: Callable[[str], None]
                          "sparse": {"model": sparse.model_name, "embedding_space_id": sparse.embedding_space_id},
                          "chunk_policy": policy.id, "dense_embedding_space_id": dense_space,
                          "sparse_embedding_space_id": sparse_space}
+            embedding_contract, embedding_contract_digest = embedding_contract_fingerprint(dense=dense, sparse=sparse)
+            contracts["embedding_contract"] = embedding_contract
+            contracts["embedding_contract_fingerprint"] = embedding_contract_digest
             audit.update({"chunk_audit": chunk_audit, "contracts": contracts, "reindexed": True})
+            manifest = store.write_generation_manifest(embedding_contract_fingerprint=embedding_contract_digest)
+            if manifest is not None:
+                audit["generation_manifest"] = manifest
             store.conn.execute("UPDATE native_build_audit SET export_path=?,status='completed',finished_at=?,contracts_json=?,audit_json=? WHERE id=1",
                                ("<reindexed-from-database>", _utc_now(), _json(contracts), _json(audit)))
             store.commit()

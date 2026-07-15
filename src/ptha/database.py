@@ -12,6 +12,10 @@ REQUIRED_TABLES = {
     "source_documents", "conversations", "messages", "blocks", "retrieval_chunks",
     "dense_native_metadata", "sparse_vector_metadata", "sparse_vectors_compact", "native_build_audit",
 }
+INCREMENTAL_TABLES = {
+    "source_entity_identities", "source_entity_revisions", "conversation_source_lineage",
+    "message_source_lineage", "block_source_lineage", "chunk_incremental_metadata", "generation_manifests",
+}
 
 
 def inspect_database(path: Path, *, integrity: bool = False) -> dict[str, Any]:
@@ -33,6 +37,22 @@ def inspect_database(path: Path, *, integrity: bool = False) -> dict[str, Any]:
                 counts[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
             audit = conn.execute("SELECT schema_version,status,started_at,finished_at,contracts_json FROM native_build_audit WHERE id=1").fetchone()
             result["counts"] = counts
+            result["sqlite_user_version"] = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            incremental_available = INCREMENTAL_TABLES <= names
+            result["incremental_metadata"] = {"available": incremental_available}
+            if incremental_available:
+                manifest = conn.execute(
+                    "SELECT generation_id,manifest_schema_version,created_at,canonicalizer_version,block_builder_version,"
+                    "chunker_version,embedding_contract_fingerprint,database_content_fingerprint "
+                    "FROM generation_manifests ORDER BY created_at DESC,generation_id DESC LIMIT 1"
+                ).fetchone()
+                if manifest:
+                    result["incremental_metadata"]["generation"] = {
+                        "id": manifest[0], "manifest_schema_version": manifest[1], "created_at": manifest[2],
+                        "canonicalizer_version": manifest[3], "block_builder_version": manifest[4],
+                        "chunker_version": manifest[5], "embedding_contract_fingerprint": manifest[6],
+                        "database_content_fingerprint": manifest[7],
+                    }
             if audit:
                 result.update({"schema_version": audit[0], "build_status": audit[1], "imported": audit[3]})
                 try:

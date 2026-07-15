@@ -252,6 +252,11 @@ def _status(config: Any, *, json_output: bool) -> int:
         print("PTHA status")
         print(f"\nConfiguration:\n  {config.config_file}")
         print(f"\nDatabase:\n  {config.database}\n  State: {database['state']}\n  Conversations: {counts.get('conversations', 0)}\n  Messages: {counts.get('messages', 0)}\n  Retrieval chunks: {counts.get('retrieval_chunks', 0)}")
+        incremental = database.get("incremental_metadata", {})
+        generation = incremental.get("generation", {}) if isinstance(incremental, dict) else {}
+        print(f"\nIncremental metadata:\n  {'available' if incremental.get('available') else 'unavailable for this legacy generation'}")
+        if generation.get("id"):
+            print(f"  Generation: {generation['id']}")
         print(f"\nModels:\n  Dense: {config.dense_model}\n  Sparse: {config.sparse_model}\n  Cache: {payload['models']['cache']}")
         print(f"\nService:\n  State: {service['state']}\n  Socket: {config.paths.socket}")
     return 0
