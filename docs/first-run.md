@@ -21,13 +21,13 @@ Every `ptha init` invocation prints the actual paths selected on that machine.
 Install from a built wheel:
 
 ```bash
-uv tool install /absolute/path/to/gpt_export_distillation-0.2.15-py3-none-any.whl
+uv tool install /absolute/path/to/ptha-0.2.15-py3-none-any.whl
 ```
 
 Or install the current repository version:
 
 ```bash
-uv tool install git+https://github.com/anfedoro/gpt_export_distillation
+uv tool install git+https://github.com/anfedoro/ptha
 ```
 
 Confirm that the installed console command is available:
