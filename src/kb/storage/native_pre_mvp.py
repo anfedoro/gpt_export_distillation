@@ -6,6 +6,7 @@ import os
 import gc
 import sqlite3
 import struct
+import sys
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
+from tqdm import tqdm
 
 from kb.embeddings.bge_m3_provider import build_bge_m3_providers, embed_joint_documents
 from kb.index.chunk_builder import ChunkPolicy, StrictestTokenizer, build_chunk_policy, build_retrieval_chunks
@@ -248,39 +250,47 @@ class NativeBuildStore:
             "JOIN messages m ON m.id=b.message_id JOIN conversations c ON c.id=m.conversation_id "
             "JOIN source_documents sd ON sd.id=c.source_document_id WHERE " + where + " ORDER BY b.id"
         )
+        total_blocks = int(self.conn.execute(
+            "SELECT COUNT(*) FROM blocks b JOIN messages m ON m.id=b.message_id "
+            "JOIN conversations c ON c.id=m.conversation_id "
+            "JOIN source_documents sd ON sd.id=c.source_document_id WHERE " + where
+        ).fetchone()[0])
         token_counts: list[int] = []
         total_source_characters = covered_unique_characters = 0
         blocks_with_coverage_gaps = chunks_with_overlap = overlap_token_count_total = 0
         chunks_split_on_natural_boundary = chunks_split_by_token_fallback = total_chunks = 0
         pending: list[tuple[str, str, int, int, int, int, str, str, str]] = []
-        for row in block_rows:
-            text = str(row["raw_text"])[int(row["source_char_start"]):int(row["source_char_end"])]
-            chunks = build_retrieval_chunks(
-                block_id=str(row["id"]), block_text=text, block_char_start=int(row["source_char_start"]),
-                policy=policy, tokenizer_provider=tokenizer_provider,
-            )
-            block_start, block_end = int(row["source_char_start"]), int(row["source_char_end"])
-            total_source_characters += block_end - block_start
-            covered = _covered_length([(chunk.source_char_start, chunk.source_char_end) for chunk in chunks])
-            covered_unique_characters += covered
-            if covered != block_end - block_start:
-                blocks_with_coverage_gaps += 1
-            for chunk in chunks:
-                pending.append((chunk.id, chunk.block_id, chunk.ordinal, chunk.source_char_start, chunk.source_char_end,
-                                chunk.token_count, chunk.text, chunk.chunk_policy_id,
-                                _json({"split_reason": chunk.split_reason, "overlap_token_count": chunk.overlap_token_count})))
-                token_counts.append(chunk.token_count)
-                total_chunks += 1
-                chunks_with_overlap += int(chunk.overlap_token_count > 0)
-                overlap_token_count_total += chunk.overlap_token_count
-                chunks_split_by_token_fallback += int(chunk.split_reason == "token_window_fallback")
-                chunks_split_on_natural_boundary += int(chunk.split_reason != "token_window_fallback")
-            if len(pending) >= 1024:
-                self.conn.executemany("INSERT INTO retrieval_chunks(id,block_id,ordinal,source_char_start,source_char_end,token_count,text,chunk_policy_id,metadata_json) VALUES(?,?,?,?,?,?,?,?,?)", pending)
-                self.conn.commit()
-                pending.clear()
-                if progress and total_chunks % 10_000 < 1024:
-                    print(f"[native-build] retrieval_chunks={total_chunks}", flush=True)
+        with tqdm(total=total_blocks, desc="Building retrieval chunks", unit="block", file=sys.stderr,
+                  dynamic_ncols=True, disable=not progress) as bar:
+            for row in block_rows:
+                text = str(row["raw_text"])[int(row["source_char_start"]):int(row["source_char_end"])]
+                chunks = build_retrieval_chunks(
+                    block_id=str(row["id"]), block_text=text, block_char_start=int(row["source_char_start"]),
+                    policy=policy, tokenizer_provider=tokenizer_provider,
+                )
+                block_start, block_end = int(row["source_char_start"]), int(row["source_char_end"])
+                total_source_characters += block_end - block_start
+                covered = _covered_length([(chunk.source_char_start, chunk.source_char_end) for chunk in chunks])
+                covered_unique_characters += covered
+                if covered != block_end - block_start:
+                    blocks_with_coverage_gaps += 1
+                for chunk in chunks:
+                    pending.append((chunk.id, chunk.block_id, chunk.ordinal, chunk.source_char_start, chunk.source_char_end,
+                                    chunk.token_count, chunk.text, chunk.chunk_policy_id,
+                                    _json({"split_reason": chunk.split_reason, "overlap_token_count": chunk.overlap_token_count})))
+                    token_counts.append(chunk.token_count)
+                    total_chunks += 1
+                    chunks_with_overlap += int(chunk.overlap_token_count > 0)
+                    overlap_token_count_total += chunk.overlap_token_count
+                    chunks_split_by_token_fallback += int(chunk.split_reason == "token_window_fallback")
+                    chunks_split_on_natural_boundary += int(chunk.split_reason != "token_window_fallback")
+                if len(pending) >= 1024:
+                    self.conn.executemany("INSERT INTO retrieval_chunks(id,block_id,ordinal,source_char_start,source_char_end,token_count,text,chunk_policy_id,metadata_json) VALUES(?,?,?,?,?,?,?,?,?)", pending)
+                    self.conn.commit()
+                    pending.clear()
+                    bar.set_postfix(chunks=total_chunks)
+                bar.update(1)
+            bar.set_postfix(chunks=total_chunks)
         if pending:
             self.conn.executemany("INSERT INTO retrieval_chunks(id,block_id,ordinal,source_char_start,source_char_end,token_count,text,chunk_policy_id,metadata_json) VALUES(?,?,?,?,?,?,?,?,?)", pending)
         values = np.asarray(token_counts, dtype=np.int64)
@@ -506,23 +516,31 @@ def build_native_pre_mvp_db(
                 (NATIVE_PRE_MVP_SCHEMA_VERSION, str(export_path), "running", datetime.now(UTC).isoformat(), _json(contracts)),
             )
             scanned = parsed = failed = 0
-            for item in scan_tree(export_path):
-                scanned += 1
-                source_id = store.insert_source_document(export_path, item)
-                if item.detected_kind != "chat_md":
-                    continue
-                try:
-                    parsed_chat = parse_chat_file(export_path / item.relative_path, source_document_id=source_id, project_id=item.project_path, folder_kind=item.folder_kind)
-                    store.insert_parsed_chat(parsed_chat)
-                    parsed += 1
-                except Exception as exc:  # noqa: BLE001
-                    failed += 1
-                    raise NativePreMvpError(f"Raw export parse failed path={item.relative_path}: {exc}") from exc
-                if parsed % 100 == 0:
-                    store.commit()
-                    if progress:
-                        print(f"[native-build] parsed_chats={parsed} scanned={scanned}", flush=True)
+            items = list(scan_tree(export_path))
+            total_chats = sum(item.detected_kind == "chat_md" for item in items)
+            if progress:
+                print("[4/7] Parsing conversations", file=sys.stderr, flush=True)
+            with tqdm(total=total_chats, desc="Parsing conversations", unit="chat", file=sys.stderr,
+                      dynamic_ncols=True, disable=not progress) as bar:
+                for item in items:
+                    scanned += 1
+                    source_id = store.insert_source_document(export_path, item)
+                    if item.detected_kind != "chat_md":
+                        continue
+                    try:
+                        parsed_chat = parse_chat_file(export_path / item.relative_path, source_document_id=source_id, project_id=item.project_path, folder_kind=item.folder_kind)
+                        store.insert_parsed_chat(parsed_chat)
+                        parsed += 1
+                    except Exception as exc:  # noqa: BLE001
+                        failed += 1
+                        raise NativePreMvpError(f"Raw export parse failed path={item.relative_path}: {exc}") from exc
+                    if parsed % 100 == 0:
+                        store.commit()
+                        bar.set_postfix(scanned=scanned)
+                    bar.update(1)
             store.commit()
+            if progress:
+                print("[5/7] Building search chunks", file=sys.stderr, flush=True)
             chunk_audit = store.create_chunks(
                 policy=policy,
                 tokenizer_provider=StrictestTokenizer([dense, sparse]),
@@ -540,25 +558,29 @@ def build_native_pre_mvp_db(
             sparse_processed = 0
             real_tokens = 0
             padded_tokens = 0
-            for rows in store.embedding_batches_by_length(policy_id=policy.id, batch_size=batch_size):
-                texts = [str(row["text"]) for row in rows]
-                for row, text in zip(rows, texts, strict=True):
-                    dense.assert_fits(text, chunk_id=str(row["id"]), block_id=str(row["block_id"]), source_identity=str(row["block_id"]))
-                    sparse.assert_fits(text, chunk_id=str(row["id"]), block_id=str(row["block_id"]), source_identity=str(row["block_id"]))
-                dense_vectors, sparse_vectors = embed_joint_documents(dense, sparse, texts)
-                batch_metrics = getattr(getattr(dense, "backend", None), "last_batch_metrics", {})
-                real_tokens += int(batch_metrics.get("real_tokens", 0))
-                padded_tokens += int(batch_metrics.get("padded_tokens", 0))
-                store.write_dense_batch(rows=rows, vectors=dense_vectors, model=dense.model_name, space=dense_space)
-                store.write_sparse_batch(rows=rows, vectors=sparse_vectors, model=sparse.model_name, space=sparse_space)
-                store.commit()
-                dense_processed += len(rows)
-                sparse_processed += len(rows)
-                del dense_vectors, sparse_vectors, texts, rows
-                if dense_processed % (batch_size * 25) == 0:
-                    _release_batch_memory()
-                if progress and (dense_processed % (batch_size * 100) == 0):
-                    print(f"[native-build] joint_processed={dense_processed}", flush=True)
+            total_chunks = chunk_audit["total_retrieval_chunks"]
+            if progress:
+                print("[6/7] Building dense+sparse search index", file=sys.stderr, flush=True)
+            with tqdm(total=total_chunks, desc="Building dense+sparse index", unit="chunk", file=sys.stderr,
+                      dynamic_ncols=True, disable=not progress) as bar:
+                for rows in store.embedding_batches_by_length(policy_id=policy.id, batch_size=batch_size):
+                    texts = [str(row["text"]) for row in rows]
+                    for row, text in zip(rows, texts, strict=True):
+                        dense.assert_fits(text, chunk_id=str(row["id"]), block_id=str(row["block_id"]), source_identity=str(row["block_id"]))
+                        sparse.assert_fits(text, chunk_id=str(row["id"]), block_id=str(row["block_id"]), source_identity=str(row["block_id"]))
+                    dense_vectors, sparse_vectors = embed_joint_documents(dense, sparse, texts)
+                    batch_metrics = getattr(getattr(dense, "backend", None), "last_batch_metrics", {})
+                    real_tokens += int(batch_metrics.get("real_tokens", 0))
+                    padded_tokens += int(batch_metrics.get("padded_tokens", 0))
+                    store.write_dense_batch(rows=rows, vectors=dense_vectors, model=dense.model_name, space=dense_space)
+                    store.write_sparse_batch(rows=rows, vectors=sparse_vectors, model=sparse.model_name, space=sparse_space)
+                    store.commit()
+                    dense_processed += len(rows)
+                    sparse_processed += len(rows)
+                    del dense_vectors, sparse_vectors, texts, rows
+                    if dense_processed % (batch_size * 25) == 0:
+                        _release_batch_memory()
+                    bar.update(len(rows))
             joint_seconds = time.perf_counter() - joint_started
             _release_batch_memory()
             embedding_metrics = {

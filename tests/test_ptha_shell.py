@@ -90,6 +90,23 @@ class PthaShellTests(unittest.TestCase):
             self.assertEqual(server["command"], "/opt/ptha/bin/ptha")
             self.assertEqual(server["args"], ["--config", str(config.resolve()), "mcp", "serve"])
 
+    def test_interrupted_import_returns_clean_cancellation_message(self) -> None:
+        with tempfile.TemporaryDirectory() as root, patch("sys.stderr") as stderr:
+            config = Path(root) / "config.toml"
+            with patch("ptha.importer.import_archive", side_effect=KeyboardInterrupt):
+                self.assertEqual(main(["--config", str(config), "import", str(Path(root) / "export.zip"), "--quiet"]), 130)
+            output = "".join(call.args[0] for call in stderr.write.call_args_list)
+            self.assertIn("Incomplete staging data was removed", output)
+
+    def test_interrupted_reindex_preserves_recovery_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as root, patch("sys.stderr") as stderr:
+            config = Path(root) / "config.toml"
+            with patch("ptha.reindex.reindex_database", side_effect=KeyboardInterrupt):
+                self.assertEqual(main(["--config", str(config), "reindex", "--quiet"]), 130)
+            output = "".join(call.args[0] for call in stderr.write.call_args_list)
+            self.assertIn("The active database was not changed", output)
+            self.assertIn("ptha reindex --force", output)
+
     def test_import_refuses_to_replace_active_database(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             root_path = Path(root)
