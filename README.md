@@ -17,6 +17,10 @@ Attachments are preserved only where the import pipeline can recover them;
 attachment content is not indexed by the PTHA v1 retrieval database. There is
 no supported CUDA or remote-service path in this release.
 
+The planned attachment-artifact direction keeps documents separate from
+conversation memory and requires an explicit read before their content is
+used. See [docs/product-radar.md](docs/product-radar.md).
+
 ## Install
 
 Requirements: macOS on Apple Silicon, Python 3.13+, and [uv](https://docs.astral.sh/uv/).
