@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
+from typing import Sequence
 
 
 @dataclass(frozen=True)
@@ -132,3 +133,19 @@ class SparseEmbeddingProvider(ABC):
                 f"allowed_tokens={self.effective_max_sequence_length}"
             )
         return count
+
+
+@dataclass(frozen=True)
+class EmbeddingResult:
+    """Backend-neutral dense and lexical representations for one input."""
+
+    dense: list[float]
+    sparse: dict[str, float]
+
+
+class EmbeddingProvider(ABC):
+    """Joint embedding boundary used by production indexing backends."""
+
+    @abstractmethod
+    def embed_batch(self, texts: Sequence[str]) -> Sequence[EmbeddingResult]:
+        raise NotImplementedError

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from kb.embeddings.bge_m3_provider import embed_joint_documents
 from kb.index.chunk_builder import build_chunk_policy
 from kb.storage.native_pre_mvp import NativePreMvpError, NativePreMvpRetriever, _chunked_space
 
@@ -69,8 +70,8 @@ class ArchiveSession:
             raise ValueError("Only retrieval_mode='hybrid' is available in the clean native pre-MVP.")
         started = time.monotonic()
         with self.lock:
-            dense = self.dense.embed_query(query)
-            sparse = self.sparse.embed_query(query)
+            dense_rows, sparse_rows = embed_joint_documents(self.dense, self.sparse, [query])
+            dense, sparse = dense_rows[0], sparse_rows[0]
             if timeout_ms and (time.monotonic() - started) * 1000 > timeout_ms:
                 raise TimeoutError("Query encoding exceeded timeout_ms.")
             hits = self.retriever.search(

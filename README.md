@@ -1,10 +1,14 @@
-# gpt-export-distillation
+# PTHA — Personal Thought Archive
 
-`gpt-export-distillation` is a CLI tool that converts a raw ChatGPT export into a structured Markdown archive.
+PTHA is a local-first CLI and MCP server for importing a ChatGPT export into a
+private SQLite knowledge archive and searching it from an MCP client.
 
 It is designed for the situation where you export your ChatGPT data, receive a large ZIP file with many JSON files, `.dat` attachments, and loose metadata, and then have no practical way to review, filter, or reuse that material.
 
-The tool turns that raw export into a sorted set of Markdown chat files, grouped folders, attachment copies, and summary indexes that are much easier to inspect, clean up, archive, and reuse in future project workflows.
+PTHA builds a local SQLite database with dense and sparse search indexes, then
+serves two read-only MCP tools: `search_archive` and
+`construct_archive_context`. The database, model cache, and service socket
+remain on the user's machine.
 
 ![ChatGPT Export Data Screen](docs/assets/chatgpt-export-data-screen.png)
 
@@ -71,7 +75,7 @@ benchmark artifact, verify that it meets that rule.
 ### Local development install
 
 ```bash
-cd /path/to/gpt_export_distillation
+cd /path/to/ptha
 uv venv
 uv sync
 ```
@@ -79,66 +83,95 @@ uv sync
 ### Install optional NLP support
 
 ```bash
-cd /path/to/gpt_export_distillation
+cd /path/to/ptha
 uv sync --extra nlp
 ```
 
 This installs optional dependencies used only when the NLP mode is explicitly enabled in config.
 
-### Knowledge base dependencies
+### PTHA runtime dependencies
 
-Sentence Transformers support is installed by default because the published `kb-index`, `kb-search`, and `kb-mcp` console scripts use local dense and sparse embedding providers.
+On Apple Silicon, PTHA uses MLX with the pinned FP16 BGE-M3 artifact for local
+dense and sparse retrieval. PyTorch and SentenceTransformers are not required
+for the normal PTHA import, service, or MCP path.
 
 Future extension: Sentence Transformers also supports multimodal models. A later knowledge-base phase can add image or visual attachment indexing for screenshots, diagrams, and rendered pages while preserving `attachment_id`, page, slide, and source-file traceability. This is intentionally outside the text-first MVP and should not be mixed into the current text vector policy without an explicit scoring contract.
 
 ### Install as a tool from a local checkout
 
 ```bash
-uv tool install /path/to/gpt_export_distillation
+uv tool install /path/to/ptha
 ```
 
 Reinstall after local changes:
 
 ```bash
-uv tool install --reinstall /path/to/gpt_export_distillation
+uv tool install --reinstall /path/to/ptha
 ```
 
 ### Install as a tool directly from GitHub
 
 ```bash
-uv tool install git+https://github.com/anfedoro/gpt_export_distillation
+uv tool install git+https://github.com/anfedoro/ptha
 ```
 
 Reinstall from GitHub:
 
 ```bash
-uv tool install --reinstall git+https://github.com/anfedoro/gpt_export_distillation
+uv tool install --reinstall git+https://github.com/anfedoro/ptha
 ```
 
-## Quick start
+## PTHA local archive and MCP quick start
+
+PTHA imports a ChatGPT export into a local SQLite archive, runs retrieval in a
+local background service, and exposes two read-only MCP tools:
+`search_archive` and `construct_archive_context`.
+
+```bash
+ptha init
+time ptha import /path/to/chatgpt-export.zip
+ptha service start
+ptha mcp config --absolute
+```
+
+The MCP client starts `ptha mcp serve`; it requires the retrieval service to be
+running first. Large personal archives typically need roughly 20–50 minutes
+after the model is cached; import uses phase-labelled progress bars while it
+builds search chunks and writes dense+sparse indexes. See
+[PTHA first run](docs/first-run.md) for the complete copy-paste path, custom
+database placement, CLI validation, LM Studio setup, service shutdown, and
+common errors.
+
+## Legacy Markdown distillation implementation
+
+The repository retains the original Markdown-distillation implementation as an
+internal library while PTHA is the supported installed tool. It is not exposed
+as a second console command in the PTHA wheel.
+
+## Legacy developer reference
 
 ### Run with the default config in the current directory
 
 ```bash
-gpt-export-distillation
+uv run python -m gpt_export_distillation.cli
 ```
 
 ### Run against an explicit ZIP export
 
 ```bash
-gpt-export-distillation --input /path/to/chatgpt-export.zip
+uv run python -m gpt_export_distillation.cli --input /path/to/chatgpt-export.zip
 ```
 
 ### Run against an extracted export directory
 
 ```bash
-gpt-export-distillation --input /path/to/export-directory
+uv run python -m gpt_export_distillation.cli --input /path/to/export-directory
 ```
 
 ### Write output into a chosen destination
 
 ```bash
-gpt-export-distillation \
+uv run python -m gpt_export_distillation.cli \
   --input /path/to/chatgpt-export.zip \
   --output-dir /path/to/output-folder
 ```
@@ -146,7 +179,7 @@ gpt-export-distillation \
 ### Use a custom config file
 
 ```bash
-gpt-export-distillation \
+uv run python -m gpt_export_distillation.cli \
   --config /path/to/custom-config.toml \
   --input /path/to/chatgpt-export.zip
 ```
@@ -602,7 +635,7 @@ Current NLP support is intentionally lightweight. It improves token normalizatio
 A practical workflow looks like this:
 
 1. Export your ChatGPT data.
-2. Run `gpt-export-distillation` on the ZIP file.
+2. Run the legacy developer command on the ZIP file, or use the supported PTHA import path above.
 3. Review `SUMMARY.md` and `PROPOSED_PROJECT_NAMES.md`.
 4. Inspect `Common/potential_trash/` for chats that can likely be discarded.
 5. Keep useful project and pinned chat Markdown files.

@@ -648,6 +648,17 @@ class KBMilestone1Tests(unittest.TestCase):
         self.assertEqual(contract["configured_effective_max_seq_length"], 32)
         self.assertEqual(contract["computed_content_budget"], 28)
 
+    def test_strictest_tokenizer_requires_text_to_fit_every_provider(self) -> None:
+        from kb.index.chunk_builder import StrictestTokenizer
+
+        dense = StaticDenseProvider()
+        sparse = StaticSparseProvider()
+        sparse.token_count = lambda text: len(text) * 2  # type: ignore[method-assign]
+        tokenizer = StrictestTokenizer([dense, sparse])
+
+        self.assertFalse(tokenizer.fits_token_budget("x" * 17, 32))
+        self.assertEqual(tokenizer.token_count("x" * 17), 34)
+
     def test_max_sequence_override_is_explicit_in_embedding_space_identity(self) -> None:
         default_id = _dense_embedding_space_id(
             "example/model",

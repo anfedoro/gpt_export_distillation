@@ -59,6 +59,8 @@ class SentenceTransformerDenseProvider(DenseEmbeddingProvider):
         self._tokenizer = getattr(self._model, "tokenizer", None)
         st_max_seq_length = int(getattr(self._model, "max_seq_length", 256) or 256)
         self.effective_max_sequence_length = int(effective_max_seq_length or st_max_seq_length)
+        if effective_max_seq_length is not None:
+            self._model.max_seq_length = self.effective_max_sequence_length
         if hasattr(self._model, "get_embedding_dimension"):
             output_dim = self._model.get_embedding_dimension()
         else:

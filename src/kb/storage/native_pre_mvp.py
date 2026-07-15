@@ -6,6 +6,7 @@ import os
 import gc
 import sqlite3
 import struct
+import sys
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -13,12 +14,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
+from tqdm import tqdm
 
-from kb.embeddings.sentence_transformer_provider import (
-    SentenceTransformerDenseProvider,
-    SentenceTransformerSparseProvider,
-)
-from kb.index.chunk_builder import ChunkPolicy, build_chunk_policy, build_retrieval_chunks
+from kb.embeddings.bge_m3_provider import build_bge_m3_providers, embed_joint_documents
+from kb.index.chunk_builder import ChunkPolicy, StrictestTokenizer, build_chunk_policy, build_retrieval_chunks
 from kb.ingest.chat_md_parser import parse_chat_file
 from kb.ingest.tree_walker import scan_tree
 from kb.model.entities import Block, Conversation, Message, ParsedChat
@@ -162,7 +161,7 @@ def create_clean_native_schema(conn: sqlite3.Connection, *, dimension: int = 102
 class NativeBuildStore:
     """Write-only canonical and native-representation store for one clean build."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, create_schema: bool = True) -> None:
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
@@ -170,8 +169,24 @@ class NativeBuildStore:
         self.conn.execute("PRAGMA busy_timeout = 60000")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA cache_size = -32768")
-        create_clean_native_schema(self.conn)
+        if create_schema:
+            create_clean_native_schema(self.conn)
+        else:
+            load_sqlite_vec(self.conn)
         self._term_ids: dict[str, int] = {}
+        self._dense_rowid = 0
+        self._sparse_rowid = 0
+
+    def reset_derived(self) -> None:
+        """Delete only reproducible retrieval structures from an existing clean DB."""
+        self.conn.execute("DELETE FROM dense_vectors_native")
+        self.conn.execute("DELETE FROM dense_native_metadata")
+        self.conn.execute("DELETE FROM sparse_vectors_compact")
+        self.conn.execute("DELETE FROM sparse_vector_metadata")
+        self.conn.execute("DELETE FROM sparse_vocabulary")
+        self.conn.execute("DELETE FROM retrieval_chunks")
+        self.conn.commit()
+        self._term_ids.clear()
         self._dense_rowid = 0
         self._sparse_rowid = 0
 
@@ -235,39 +250,47 @@ class NativeBuildStore:
             "JOIN messages m ON m.id=b.message_id JOIN conversations c ON c.id=m.conversation_id "
             "JOIN source_documents sd ON sd.id=c.source_document_id WHERE " + where + " ORDER BY b.id"
         )
+        total_blocks = int(self.conn.execute(
+            "SELECT COUNT(*) FROM blocks b JOIN messages m ON m.id=b.message_id "
+            "JOIN conversations c ON c.id=m.conversation_id "
+            "JOIN source_documents sd ON sd.id=c.source_document_id WHERE " + where
+        ).fetchone()[0])
         token_counts: list[int] = []
         total_source_characters = covered_unique_characters = 0
         blocks_with_coverage_gaps = chunks_with_overlap = overlap_token_count_total = 0
         chunks_split_on_natural_boundary = chunks_split_by_token_fallback = total_chunks = 0
         pending: list[tuple[str, str, int, int, int, int, str, str, str]] = []
-        for row in block_rows:
-            text = str(row["raw_text"])[int(row["source_char_start"]):int(row["source_char_end"])]
-            chunks = build_retrieval_chunks(
-                block_id=str(row["id"]), block_text=text, block_char_start=int(row["source_char_start"]),
-                policy=policy, tokenizer_provider=tokenizer_provider,
-            )
-            block_start, block_end = int(row["source_char_start"]), int(row["source_char_end"])
-            total_source_characters += block_end - block_start
-            covered = _covered_length([(chunk.source_char_start, chunk.source_char_end) for chunk in chunks])
-            covered_unique_characters += covered
-            if covered != block_end - block_start:
-                blocks_with_coverage_gaps += 1
-            for chunk in chunks:
-                pending.append((chunk.id, chunk.block_id, chunk.ordinal, chunk.source_char_start, chunk.source_char_end,
-                                chunk.token_count, chunk.text, chunk.chunk_policy_id,
-                                _json({"split_reason": chunk.split_reason, "overlap_token_count": chunk.overlap_token_count})))
-                token_counts.append(chunk.token_count)
-                total_chunks += 1
-                chunks_with_overlap += int(chunk.overlap_token_count > 0)
-                overlap_token_count_total += chunk.overlap_token_count
-                chunks_split_by_token_fallback += int(chunk.split_reason == "token_window_fallback")
-                chunks_split_on_natural_boundary += int(chunk.split_reason != "token_window_fallback")
-            if len(pending) >= 1024:
-                self.conn.executemany("INSERT INTO retrieval_chunks(id,block_id,ordinal,source_char_start,source_char_end,token_count,text,chunk_policy_id,metadata_json) VALUES(?,?,?,?,?,?,?,?,?)", pending)
-                self.conn.commit()
-                pending.clear()
-                if progress and total_chunks % 10_000 < 1024:
-                    print(f"[native-build] retrieval_chunks={total_chunks}", flush=True)
+        with tqdm(total=total_blocks, desc="Building retrieval chunks", unit="block", file=sys.stderr,
+                  dynamic_ncols=True, disable=not progress) as bar:
+            for row in block_rows:
+                text = str(row["raw_text"])[int(row["source_char_start"]):int(row["source_char_end"])]
+                chunks = build_retrieval_chunks(
+                    block_id=str(row["id"]), block_text=text, block_char_start=int(row["source_char_start"]),
+                    policy=policy, tokenizer_provider=tokenizer_provider,
+                )
+                block_start, block_end = int(row["source_char_start"]), int(row["source_char_end"])
+                total_source_characters += block_end - block_start
+                covered = _covered_length([(chunk.source_char_start, chunk.source_char_end) for chunk in chunks])
+                covered_unique_characters += covered
+                if covered != block_end - block_start:
+                    blocks_with_coverage_gaps += 1
+                for chunk in chunks:
+                    pending.append((chunk.id, chunk.block_id, chunk.ordinal, chunk.source_char_start, chunk.source_char_end,
+                                    chunk.token_count, chunk.text, chunk.chunk_policy_id,
+                                    _json({"split_reason": chunk.split_reason, "overlap_token_count": chunk.overlap_token_count})))
+                    token_counts.append(chunk.token_count)
+                    total_chunks += 1
+                    chunks_with_overlap += int(chunk.overlap_token_count > 0)
+                    overlap_token_count_total += chunk.overlap_token_count
+                    chunks_split_by_token_fallback += int(chunk.split_reason == "token_window_fallback")
+                    chunks_split_on_natural_boundary += int(chunk.split_reason != "token_window_fallback")
+                if len(pending) >= 1024:
+                    self.conn.executemany("INSERT INTO retrieval_chunks(id,block_id,ordinal,source_char_start,source_char_end,token_count,text,chunk_policy_id,metadata_json) VALUES(?,?,?,?,?,?,?,?,?)", pending)
+                    self.conn.commit()
+                    pending.clear()
+                    bar.set_postfix(chunks=total_chunks)
+                bar.update(1)
+            bar.set_postfix(chunks=total_chunks)
         if pending:
             self.conn.executemany("INSERT INTO retrieval_chunks(id,block_id,ordinal,source_char_start,source_char_end,token_count,text,chunk_policy_id,metadata_json) VALUES(?,?,?,?,?,?,?,?,?)", pending)
         values = np.asarray(token_counts, dtype=np.int64)
@@ -304,6 +327,23 @@ class NativeBuildStore:
             if not rows:
                 return
             yield rows
+            after_id = str(rows[-1]["id"])
+
+    def embedding_batches_by_length(self, *, policy_id: str, batch_size: int) -> Iterable[list[sqlite3.Row]]:
+        """Yield deterministic length buckets to minimize transformer padding."""
+        after_tokens = -1
+        after_id = ""
+        while True:
+            rows = self.conn.execute(
+                "SELECT id,block_id,text,token_count FROM retrieval_chunks "
+                "WHERE chunk_policy_id=? AND (token_count>? OR (token_count=? AND id>?)) "
+                "ORDER BY token_count,id LIMIT ?",
+                (policy_id, after_tokens, after_tokens, after_id, batch_size),
+            ).fetchall()
+            if not rows:
+                return
+            yield rows
+            after_tokens = int(rows[-1]["token_count"])
             after_id = str(rows[-1]["id"])
 
     def write_embedding_batch(
@@ -344,6 +384,50 @@ class NativeBuildStore:
                 (self._sparse_rowid, _pack_uint32(term for term, _ in pairs), _pack_float32(weight for _, weight in pairs)),
             )
 
+    def write_dense_batch(
+        self, *, rows: list[sqlite3.Row], vectors: list[list[float]], model: str, space: str,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        for row, vector in zip(rows, vectors, strict=True):
+            chunk_id = str(row["id"])
+            if len(vector) != 1024 or not all(math.isfinite(float(value)) for value in vector):
+                raise NativePreMvpError(f"Non-finite or invalid dense vector chunk_id={chunk_id} block_id={row['block_id']}.")
+            self._dense_rowid += 1
+            self.conn.execute(
+                "INSERT INTO dense_native_metadata(rowid,chunk_id,model_name,embedding_space_id,dim,dtype,created_at) VALUES(?,?,?,?,?,?,?)",
+                (self._dense_rowid, chunk_id, model, space, 1024, NATIVE_DTYPE, now),
+            )
+            self.conn.execute("INSERT INTO dense_vectors_native(rowid,embedding) VALUES(?,?)", (self._dense_rowid, serialize_float32(vector)))
+
+    def write_sparse_batch(
+        self, *, rows: list[sqlite3.Row], vectors: list[dict[str, float]], model: str, space: str,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        for row, vector in zip(rows, vectors, strict=True):
+            chunk_id = str(row["id"])
+            pairs: list[tuple[int, float]] = []
+            for token, weight in sorted(vector.items()):
+                numeric = self._term_ids.get(token)
+                if numeric is None:
+                    numeric = len(self._term_ids) + 1
+                    self._term_ids[token] = numeric
+                    self.conn.execute("INSERT INTO sparse_vocabulary(term_id,token_text) VALUES(?,?)", (numeric, token))
+                pairs.append((numeric, float(weight)))
+            if not pairs or not all(math.isfinite(weight) for _, weight in pairs):
+                raise NativePreMvpError(f"Invalid sparse vector chunk_id={chunk_id} block_id={row['block_id']}.")
+            norm = math.sqrt(sum(weight * weight for _, weight in pairs))
+            if not math.isfinite(norm) or norm == 0:
+                raise NativePreMvpError(f"Invalid sparse norm chunk_id={chunk_id} block_id={row['block_id']}.")
+            self._sparse_rowid += 1
+            self.conn.execute(
+                "INSERT INTO sparse_vector_metadata(rowid,chunk_id,model_name,embedding_space_id,term_count,norm,dtype,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (self._sparse_rowid, chunk_id, model, space, len(pairs), norm, "uint32-float32-le", now),
+            )
+            self.conn.execute(
+                "INSERT INTO sparse_vectors_compact(rowid,indices_blob,weights_blob) VALUES(?,?,?)",
+                (self._sparse_rowid, _pack_uint32(term for term, _ in pairs), _pack_float32(weight for _, weight in pairs)),
+            )
+
     def audit(self) -> dict[str, Any]:
         counts = {table: int(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in CANONICAL_TABLES}
         counts["dense_vectors_native"] = int(self.conn.execute("SELECT COUNT(*) FROM dense_vectors_native").fetchone()[0])
@@ -371,12 +455,17 @@ class NativeBuildStore:
 
 
 def build_native_pre_mvp_db(
-    *, export_path: Path, output_db: Path, dense_model: str = "BAAI/bge-m3",
-    sparse_model: str = "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1",
-    dense_device: str = "mps", sparse_device: str = "mps", dense_torch_dtype: str = "float16",
-    sparse_torch_dtype: str = "float16", chunk_policy_version: str = "v2",
-    chunk_content_budget: int = 506, sparse_top_k: int = 128, batch_size: int = 16,
+    *, export_path: Path, output_db: Path, dense_model: str = "anfedoro/bge-m3-mlx-fp16",
+    sparse_model: str = "anfedoro/bge-m3-mlx-fp16", model_revision: str = "58e70901dbba8de8f3df91b5a313bcefcb151bae",
+    embedding_device: str = "gpu", embedding_dtype: str = "float16",
+    embedding_max_padded_tokens: int | None = None,
+    sparse_head: str = "sparse_linear.safetensors", colbert_head: str = "colbert_linear.safetensors",
+    model_cache: Path | None = None, chunk_policy_version: str = "v2",
+    chunk_content_budget: int = 506, sparse_top_k: int = 128, batch_size: int = 4,
     skip_low_interest: bool = True, progress: bool = True,
+    dense_effective_max_seq_length: int = 512,
+    dense_device: str | None = None, sparse_device: str | None = None,
+    dense_torch_dtype: str | None = None, sparse_torch_dtype: str | None = None,
 ) -> dict[str, Any]:
     """Parse a raw export and create a clean DB without opening any legacy DB."""
     if output_db.exists():
@@ -393,8 +482,27 @@ def build_native_pre_mvp_db(
         raise NativePreMvpError(f"Export directory does not exist: {export_path}")
     output_db.parent.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
-    dense = SentenceTransformerDenseProvider(dense_model, device=dense_device, torch_dtype=dense_torch_dtype)
-    sparse = SentenceTransformerSparseProvider(sparse_model, device=sparse_device, torch_dtype=sparse_torch_dtype, top_k=sparse_top_k)
+    if sparse_model != dense_model:
+        raise NativePreMvpError("Native PTHA builds require one shared BGE-M3 model.")
+    requested_devices = {value for value in (dense_device, sparse_device) if value not in {None, "auto", "mps"}}
+    if requested_devices:
+        embedding_device = next(iter(requested_devices))
+    requested_dtypes = {value for value in (dense_torch_dtype, sparse_torch_dtype) if value not in {None, "auto"}}
+    if requested_dtypes:
+        embedding_dtype = next(iter(requested_dtypes))
+    dense, sparse = build_bge_m3_providers(
+        dense_model,
+        model_revision=model_revision,
+        device=embedding_device,
+        dtype=embedding_dtype,
+        max_seq_length=dense_effective_max_seq_length,
+        sparse_top_k=sparse_top_k,
+        batch_size=batch_size,
+        max_padded_tokens=embedding_max_padded_tokens,
+        sparse_head=sparse_head,
+        colbert_head=colbert_head,
+        model_cache=model_cache,
+    )
     policy = build_chunk_policy([dense, sparse], version=chunk_policy_version, content_budget_override=chunk_content_budget)
     contracts = {
         "dense": {"model": dense.model_name, "embedding_space_id": dense.embedding_space_id, "runtime": dense.runtime_metadata, "provider": dense.contract_dict()},
@@ -408,52 +516,95 @@ def build_native_pre_mvp_db(
                 (NATIVE_PRE_MVP_SCHEMA_VERSION, str(export_path), "running", datetime.now(UTC).isoformat(), _json(contracts)),
             )
             scanned = parsed = failed = 0
-            for item in scan_tree(export_path):
-                scanned += 1
-                source_id = store.insert_source_document(export_path, item)
-                if item.detected_kind != "chat_md":
-                    continue
-                try:
-                    parsed_chat = parse_chat_file(export_path / item.relative_path, source_document_id=source_id, project_id=item.project_path, folder_kind=item.folder_kind)
-                    store.insert_parsed_chat(parsed_chat)
-                    parsed += 1
-                except Exception as exc:  # noqa: BLE001
-                    failed += 1
-                    raise NativePreMvpError(f"Raw export parse failed path={item.relative_path}: {exc}") from exc
-                if parsed % 100 == 0:
-                    store.commit()
-                    if progress:
-                        print(f"[native-build] parsed_chats={parsed} scanned={scanned}", flush=True)
+            items = list(scan_tree(export_path))
+            total_chats = sum(item.detected_kind == "chat_md" for item in items)
+            if progress:
+                print("[4/7] Parsing conversations", file=sys.stderr, flush=True)
+            with tqdm(total=total_chats, desc="Parsing conversations", unit="chat", file=sys.stderr,
+                      dynamic_ncols=True, disable=not progress) as bar:
+                for item in items:
+                    scanned += 1
+                    source_id = store.insert_source_document(export_path, item)
+                    if item.detected_kind != "chat_md":
+                        continue
+                    try:
+                        parsed_chat = parse_chat_file(export_path / item.relative_path, source_document_id=source_id, project_id=item.project_path, folder_kind=item.folder_kind)
+                        store.insert_parsed_chat(parsed_chat)
+                        parsed += 1
+                    except Exception as exc:  # noqa: BLE001
+                        failed += 1
+                        raise NativePreMvpError(f"Raw export parse failed path={item.relative_path}: {exc}") from exc
+                    if parsed % 100 == 0:
+                        store.commit()
+                        bar.set_postfix(scanned=scanned)
+                    bar.update(1)
             store.commit()
-            chunk_audit = store.create_chunks(policy=policy, tokenizer_provider=min((dense, sparse), key=lambda provider: provider.effective_max_sequence_length or 0), skip_low_interest=skip_low_interest, progress=progress)
+            if progress:
+                print("[5/7] Building search chunks", file=sys.stderr, flush=True)
+            chunk_audit = store.create_chunks(
+                policy=policy,
+                tokenizer_provider=StrictestTokenizer([dense, sparse]),
+                skip_low_interest=skip_low_interest,
+                progress=progress,
+            )
             required_chunk_conditions = {key: chunk_audit[key] == 0 for key in ("uncovered_characters", "chunks_over_limit", "truncated_chunks", "blocks_with_coverage_gaps")}
             if not all(required_chunk_conditions.values()):
                 raise NativePreMvpError(f"Chunk audit failed: {required_chunk_conditions}")
             store.commit()
             dense_space = _chunked_space(dense.embedding_space_id, policy.id)
             sparse_space = _chunked_space(sparse.embedding_space_id, policy.id)
-            embedded = 0
-            for rows in store.embedding_batches(policy_id=policy.id, batch_size=batch_size):
-                texts = [str(row["text"]) for row in rows]
-                for row, text in zip(rows, texts, strict=True):
-                    dense.assert_fits(text, chunk_id=str(row["id"]), block_id=str(row["block_id"]), source_identity=str(row["block_id"]))
-                    sparse.assert_fits(text, chunk_id=str(row["id"]), block_id=str(row["block_id"]), source_identity=str(row["block_id"]))
-                dense_vectors = dense.embed_documents(texts)
-                sparse_vectors = sparse.embed_documents(texts)
-                store.write_embedding_batch(rows=rows, dense_vectors=dense_vectors, sparse_vectors=sparse_vectors,
-                                           dense_model=dense.model_name, dense_space=dense_space,
-                                           sparse_model=sparse.model_name, sparse_space=sparse_space)
-                store.commit()
-                embedded += len(rows)
-                # Persisted representations no longer need their batch tensors or Python materialization.
-                del dense_vectors, sparse_vectors, texts, rows
-                _release_batch_memory()
-                if progress and (embedded % (batch_size * 100) == 0):
-                    print(f"[native-build] embedded_chunks={embedded}", flush=True)
+            joint_started = time.perf_counter()
+            dense_processed = 0
+            sparse_processed = 0
+            real_tokens = 0
+            padded_tokens = 0
+            total_chunks = chunk_audit["total_retrieval_chunks"]
+            if progress:
+                print("[6/7] Building dense+sparse search index", file=sys.stderr, flush=True)
+            with tqdm(total=total_chunks, desc="Building dense+sparse index", unit="chunk", file=sys.stderr,
+                      dynamic_ncols=True, disable=not progress) as bar:
+                for rows in store.embedding_batches_by_length(policy_id=policy.id, batch_size=batch_size):
+                    texts = [str(row["text"]) for row in rows]
+                    for row, text in zip(rows, texts, strict=True):
+                        dense.assert_fits(text, chunk_id=str(row["id"]), block_id=str(row["block_id"]), source_identity=str(row["block_id"]))
+                        sparse.assert_fits(text, chunk_id=str(row["id"]), block_id=str(row["block_id"]), source_identity=str(row["block_id"]))
+                    dense_vectors, sparse_vectors = embed_joint_documents(dense, sparse, texts)
+                    batch_metrics = getattr(getattr(dense, "backend", None), "last_batch_metrics", {})
+                    real_tokens += int(batch_metrics.get("real_tokens", 0))
+                    padded_tokens += int(batch_metrics.get("padded_tokens", 0))
+                    store.write_dense_batch(rows=rows, vectors=dense_vectors, model=dense.model_name, space=dense_space)
+                    store.write_sparse_batch(rows=rows, vectors=sparse_vectors, model=sparse.model_name, space=sparse_space)
+                    store.commit()
+                    dense_processed += len(rows)
+                    sparse_processed += len(rows)
+                    del dense_vectors, sparse_vectors, texts, rows
+                    if dense_processed % (batch_size * 25) == 0:
+                        _release_batch_memory()
+                    bar.update(len(rows))
+            joint_seconds = time.perf_counter() - joint_started
+            _release_batch_memory()
+            embedding_metrics = {
+                "chunks": chunk_audit["total_retrieval_chunks"],
+                "dense": {"processed": dense_processed, "seconds": joint_seconds,
+                          "throughput": dense_processed / joint_seconds if joint_seconds else 0.0,
+                          "device": dense.runtime_metadata.get("device"), "shared_joint_pass": True},
+                "sparse": {"processed": sparse_processed, "seconds": joint_seconds,
+                           "throughput": sparse_processed / joint_seconds if joint_seconds else 0.0,
+                           "device": sparse.runtime_metadata.get("device"), "shared_joint_pass": True},
+                "joint": {"processed": dense_processed, "seconds": joint_seconds,
+                           "throughput": dense_processed / joint_seconds if joint_seconds else 0.0,
+                           "device": dense.runtime_metadata.get("device"),
+                           "real_tokens": real_tokens, "padded_tokens": padded_tokens,
+                           "padding_efficiency": real_tokens / padded_tokens if padded_tokens else 1.0,
+                           "tokens_per_second": real_tokens / joint_seconds if joint_seconds else 0.0,
+                           "chunks_per_second": dense_processed / joint_seconds if joint_seconds else 0.0},
+                "total_seconds": joint_seconds,
+            }
             audit = store.audit()
             audit.update({"schema_version": NATIVE_PRE_MVP_SCHEMA_VERSION, "export_path": str(export_path), "output_db": str(output_db),
                           "scanned_source_documents": scanned, "parsed_chats": parsed, "failed_chats": failed,
-                          "chunk_audit": chunk_audit, "contracts": {**contracts, "dense_embedding_space_id": dense_space, "sparse_embedding_space_id": sparse_space},
+                          "chunk_audit": chunk_audit, "embedding_build": embedding_metrics,
+                          "contracts": {**contracts, "dense_embedding_space_id": dense_space, "sparse_embedding_space_id": sparse_space},
                           "timing_ms": {"total": (time.perf_counter() - started) * 1000}})
             conditions = {
                 **required_chunk_conditions,
@@ -488,12 +639,9 @@ def _chunked_space(space_id: str, policy_id: str) -> str:
 def _release_batch_memory() -> None:
     gc.collect()
     try:
-        import torch
+        import mlx.core as mx
 
-        if hasattr(torch, "mps") and torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        mx.clear_cache()
     except Exception:  # noqa: BLE001
         return
 
@@ -680,9 +828,9 @@ def native_pre_mvp_query(
     dense_space = _chunked_space(dense.embedding_space_id, policy_id)
     sparse_space = _chunked_space(sparse.embedding_space_id, policy_id)
     preprocessing_finished = time.perf_counter()
-    query_dense = dense.embed_query(query)
+    dense_rows, sparse_rows = embed_joint_documents(dense, sparse, [query])
+    query_dense, query_sparse = dense_rows[0], sparse_rows[0]
     dense_query_finished = time.perf_counter()
-    query_sparse = sparse.embed_query(query)
     sparse_query_finished = time.perf_counter()
     with NativePreMvpRetriever(db_path) as retriever:
         if str(retriever.dense_model) != dense.model_name or str(retriever.dense_space) != dense_space:

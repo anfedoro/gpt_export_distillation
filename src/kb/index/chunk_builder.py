@@ -42,6 +42,27 @@ class RetrievalChunk:
     overlap_token_count: int = 0
 
 
+class StrictestTokenizer:
+    """Apply every active provider tokenizer when constructing shared chunks."""
+
+    document_prefix = ""
+
+    def __init__(self, providers: list[Any]) -> None:
+        self.providers = providers
+
+    def embedding_input(self, text: str) -> str:
+        return text
+
+    def token_count(self, text: str) -> int:
+        return max(provider.token_count(provider.embedding_input(text)) for provider in self.providers)
+
+    def fits_token_budget(self, text: str, budget: int) -> bool:
+        return all(
+            _fits_token_budget(provider, provider.embedding_input(text), budget)
+            for provider in self.providers
+        )
+
+
 def build_chunk_policy(
     providers: list[Any],
     *,
