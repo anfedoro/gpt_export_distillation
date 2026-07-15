@@ -4,7 +4,7 @@ version = "0.2.15"
 description = "PTHA — Personal Thought Archive: local ChatGPT archive search and MCP server"
 readme = "README.md"
 authors = [
-    { name = "anfedoro", email = "anfedoro@gmail.com" }
+    { name = "anfedoro", email = "anfedoro@users.noreply.github.com" }
 ]
 requires-python = ">=3.13"
 dependencies = [

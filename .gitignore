@@ -20,6 +20,17 @@ wheels/
 
 # Local knowledge base artifacts
 *.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Credentials and local model/artifact directories
+.env
+.env.*
+.cache/
+models/
+artifacts/
+benchmarks/output/
 
 # Private benchmark fixtures and local run artifacts. Gold scenarios may contain
 # personal data and must never be committed to this public repository.
