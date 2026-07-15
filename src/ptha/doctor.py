@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import platform
 import shutil
 import sqlite3
 import sys
@@ -180,7 +181,10 @@ def _dependency_checks() -> list[Check]:
     checks = [_check("runtime.python", "pass" if sys.version_info >= (3, 13) else "fail",
                      "Python version is supported.", {"version": sys.version.split()[0]}, "Install Python 3.13 or newer."),
               Check("runtime.package", "pass", "PTHA package metadata is available.", {"version": application_version()})]
-    for module in ("platformdirs", "psutil", "sqlite_vec", "sentence_transformers"):
+    runtime_modules = ["platformdirs", "psutil", "sqlite_vec", "huggingface_hub", "transformers"]
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        runtime_modules.extend(("mlx", "mlx_embeddings"))
+    for module in runtime_modules:
         try:
             importlib.import_module(module)
             status = "pass"

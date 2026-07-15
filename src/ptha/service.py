@@ -239,17 +239,25 @@ def build_archive_session(config: PthaConfig) -> ArchiveSession:
 
 
 def build_providers(config: PthaConfig) -> tuple[Any, Any]:
+    if config.embedding_backend != "mlx":
+        raise RuntimeError("PTHA v1 production embeddings require embedding_backend=mlx.")
     if config.sparse_model != config.dense_model:
         raise RuntimeError("PTHA requires one shared BGE-M3 model for dense and sparse embeddings.")
     requested = {value for value in (config.dense_device, config.sparse_device) if value != "auto"}
     if len(requested) > 1:
         raise RuntimeError("Dense and sparse embeddings must use the same device.")
     return build_bge_m3_providers(
-        config.dense_model,
-        device=next(iter(requested), "auto"),
-        torch_dtype=config.dense_dtype,
+        config.embedding_model,
+        model_revision=config.embedding_model_revision,
+        device=config.embedding_device,
+        dtype=config.embedding_dtype,
         max_seq_length=512,
         sparse_top_k=config.sparse_top_k,
+        batch_size=config.batch_size,
+        max_padded_tokens=config.embedding_max_padded_tokens,
+        sparse_head=config.embedding_sparse_head,
+        colbert_head=config.embedding_colbert_head,
+        model_cache=config.model_cache,
     )
 
 

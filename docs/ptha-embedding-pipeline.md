@@ -1,138 +1,119 @@
 # PTHA embedding pipeline
 
-PTHA uses one `BAAI/bge-m3` backbone for both retrieval representations:
+PTHA uses one project-owned MLX FP16 BGE-M3 artifact for both retrieval
+representations:
 
 ```text
-BAAI/bge-m3
+BAAI/bge-m3 (pinned source revision)
+  -> anfedoro/bge-m3-mlx-fp16 (pinned converted revision)
   -> normalized 1024-dimensional CLS dense vectors
-  -> lexical weights from the official sparse_linear.pt head
+  -> lexical weights from sparse_linear.safetensors
 ```
 
-The sparse head belongs to the same Hugging Face model repository. PTHA does
-not load or download a second sparse encoder in normal import, reindex,
-service, or doctor workflows. The legacy OpenSearch `SparseEncoder` is retained
-only by the opt-in local comparison benchmark.
+The artifact also contains `colbert_linear.safetensors` for complete BGE-M3
+provenance, although PTHA v1 does not expose a ColBERT retrieval path. No
+additional training is performed. The conversion metadata and model card record
+the upstream revision, conversion date, script, FP16 dtype, head provenance,
+and upstream MIT license.
 
-## Build order
+## Runtime contract
 
-Index construction is deliberately sequential at the batch level:
+Apple Silicon with the MLX GPU backend is the supported production runtime.
+There is no silent CPU or CUDA fallback in this release. Startup validates the
+model revision, required files, 1024 hidden size, vocabulary, position limit,
+FP16 backbone and sparse head, and availability of fused scaled dot-product
+attention.
 
-1. create canonical retrieval chunks;
-2. run one BGE-M3 forward for a batch;
-3. derive dense and sparse representations from that hidden state;
-4. write the separate dense and sparse tables for that batch;
-5. validate counts and publish the database atomically.
+The pinned `mlx-embeddings` fork revision is
+`4a8277aa523eb34ff29a5a832fa3f3f654336b54`. It provides fused
+`mx.fast.scaled_dot_product_attention` for XLM-RoBERTa and exposes
+`last_hidden_state` for the official BGE-M3 sparse projection.
 
-There are no concurrent dense/sparse workers and no second backbone forward.
-Both representations resolve one shared device and retain one model backbone.
-The database schema, dense/sparse candidate union, fusion weights, and MCP
-tools are unchanged. Dense and sparse rows remain separate and the complete
-database is still published atomically.
+For every length-aware batch PTHA tokenizes without global padding, pads only to
+the local maximum, executes the backbone once, derives normalized dense vectors
+and sparse token weights, materializes both with `mx.eval()`, restores original
+input order, and writes the existing dense and compact sparse storage formats.
+Repeated sparse token IDs use their maximum weight; padding, special tokens,
+zeroes, and non-finite weights are excluded. Chunking, schema, candidate union,
+fusion weights, ranking, and MCP contracts are unchanged.
 
-The effective input limit is 512 tokens. Chunk construction checks the input
-against every active representation contract before inference. This avoids
-quadratic 8K-token attention allocations on Apple Silicon.
+Default configuration:
 
-## Hardware and measurements
-
-Apple Silicon with MPS is the preferred local runtime. CPU remains a supported
-fallback but is expected to be materially slower. A cold two-text M4 Max smoke
-run used approximately 4 GiB peak RSS and completed in 22.4 seconds, including
-model load. This is a smoke measurement, not an initial-import estimate.
-
-The real 2026-07-13 M4 Max benchmark prepared 131,717 chunks from the authorized
-export in 573.7 seconds. On a fixed 10,000-chunk subset with batch size 32:
-
-- hash-ID batching: dense 17.11 chunks/s, sparse 17.62 chunks/s, 1,152.1 seconds total;
-- length-bucketed batching: dense 68.30 chunks/s, sparse 56.49 chunks/s, 323.4 seconds total.
-
-After joint-forward inference, the same fixed 10,000-chunk length-bucketed
-diagnostic completed in 10.13 seconds (987.6 chunks/s) on MPS. The shared
-backbone forward took 7.22 seconds; dense pooling, sparse projection/transfer,
-decoding, and SQLite writes accounted for the remainder. The old measurements
-above are retained as the pre-joint baseline.
-
-Length bucketing is therefore part of the production build path. It changes
-only scheduling, not chunk identity or vector values. Batch size 128 improved a
-1,000-chunk probe by only about 12 percent while raising MPS driver allocation
-substantially, so 32 remains the conservative default recommendation. The
-length-bucketed result extrapolates to roughly 70 minutes for embeddings over
-the complete real archive, plus about 10 minutes for distillation/chunking. It
-does not reproduce the historical 20-minute claim; that older run is not
-comparable until its exact chunk count, sequence-length distribution, model
-heads, and publication work are recovered.
-
-Every native build reports the following privacy-safe metrics:
-
-```text
-Embedding build
-  Chunks
-  Joint: processed, seconds, throughput, device
-  Dense/Sparse: processed, shared joint-pass seconds, throughput, device
-  Total seconds
+```toml
+[models]
+embedding_backend = "mlx"
+embedding_model = "anfedoro/bge-m3-mlx-fp16"
+embedding_model_revision = "58e70901dbba8de8f3df91b5a313bcefcb151bae"
+embedding_dtype = "float16"
+embedding_device = "gpu"
+embedding_batch_size = 4
+embedding_max_padded_tokens = 0
+embedding_sparse_head = "sparse_linear.safetensors"
+embedding_colbert_head = "colbert_linear.safetensors"
 ```
 
-No source or retrieved text is included.
+## Conversion
 
-## Runtime precision diagnostic
-
-The diagnostic-only harness checks the effective PyTorch runtime and separates
-tokenization, backbone forward, pooling/normalization, sparse projection,
-host transfer, decoding, and SQLite insertion. It does not modify the product
-import path and does not print chunk or retrieval content:
+PyTorch is not a default dependency and is not imported by production indexing
+or service startup. It is used only by the offline converter and the reference
+benchmark:
 
 ```bash
-uv run python -m ptha.embedding_diagnostics \
-  --chunk-db .local/ptha-benchmark/chunks.db \
-  --output-db .local/ptha-benchmark/diagnostic-10k.db \
-  --limit 10000 --batch-size 32 --device auto
+uv run --extra model-conversion python scripts/convert_bge_m3_to_mlx_fp16.py \
+  --source-revision 5617a9f61b028005a4858fdac845db406aefb181 \
+  --output .local/bge-m3-mlx-fp16 \
+  --upload-repo anfedoro/bge-m3-mlx-fp16
 ```
 
-The report includes the effective `from_pretrained` dtype argument, model and
-layer dtypes, model/input/sparse-head devices, autocast state, and privacy-safe
-timing fields. The current BGE-M3 path loads `float16` weights on MPS, uses
-`model.eval()` plus `torch.inference_mode()`, and does not enable autocast.
-The XLM-R pooler module is present but unused: dense output is CLS pooling
-followed by L2 normalization. The sparse checkpoint is loaded as `float16`;
-conversion to `float32` occurs only when materializing CPU lexical weights for
-the existing storage contract.
+The tool accepts a local source snapshot or downloads the requested revision,
+converts the backbone and both heads to FP16 safetensors, copies tokenizer
+assets, validates saved shapes and dtypes, and optionally uploads the directory.
+Runtime never converts `.pt` files.
 
-## Fixed 10,000-chunk benchmark
+## Measurements
 
-Prepare one deterministic chunk database from the explicitly authorized export:
+The framework-isolated Apple M4 Max synthetic comparison measured approximately:
+
+| Runtime | Precision | Batch | Throughput |
+|---|---|---:|---:|
+| MLX fused SDPA | FP16 | 4 | 43.5 chunks/s |
+| PyTorch MPS SDPA | FP16 | 4 | 34 chunks/s |
+| MLX | 8-bit | 4 | 37 chunks/s |
+
+These values are not a full-import estimate. The committed synthetic harnesses
+report median wall time, chunks/s, real tokens/s, padded tokens, and padding
+efficiency for fixed and mixed lengths. Peak GPU memory is omitted because the
+frameworks do not expose equivalent measurements.
+
+The migrated provider was remeasured on 2026-07-14 with MLX 0.32.0,
+`mlx-embeddings` 0.1.1 at the pinned fork commit, and Transformers 5.12.1.
+For 1,000 fixed 200-word synthetic chunks, batch 4, joint dense+sparse, and
+tokenization included, the three-run median was 22.982 seconds: 43.51 chunks/s,
+15,186 real tokens/s, and padding efficiency 1.0. Model load took 0.710 seconds.
+
+## Numerical regression
+
+A synthetic multilingual/code fixture compared the official Torch FP16 source
+with the converted MLX FP16 artifact. The observed minimum dense cosine was
+`0.9999955`, sparse token-ID Jaccard was `1.0`, and maximum common sparse-weight
+absolute delta was `0.00211`. The accepted safety bounds are dense cosine
+`>= 0.999`, sparse token-ID Jaccard `>= 0.99`, and sparse common-weight absolute
+delta `<= 0.01`.
+
+A separate synthetic six-topic hybrid fixture produced top-5 and top-10 overlap
+of `1.0`; Recall@5, Recall@10, and MRR were all `1.0` for both backends. Five of
+six complete rank lists were identical. The regression failure thresholds are
+top-5/top-10 overlap below `0.95`, any Recall@5/Recall@10 decrease, or MRR loss
+greater than `0.01`. Bitwise equality is not required.
+
+## Import
+
+Production chunking remains unchanged. Run the full import explicitly after the
+model repository and revision are configured:
 
 ```bash
-uv run python -m ptha.embedding_benchmark prepare \
-  --source /path/to/chatgpt-export.zip \
-  --output .local/ptha-benchmark/chunks.db
+ptha import /path/to/chatgpt-export.zip --replace --batch-size 4
 ```
 
-Run the unified backend:
-
-```bash
-uv run python -m ptha.embedding_benchmark run \
-  --chunk-db .local/ptha-benchmark/chunks.db \
-  --output-db .local/ptha-benchmark/unified.db \
-  --backend unified \
-  --limit 10000 \
-  --batch-size 32 \
-  --device mps
-```
-
-For a one-time historical comparison, run `--backend legacy` into a separate
-output database. That mode intentionally uses the old second sparse model and
-must not be treated as the PTHA product configuration. Keep all benchmark DBs
-and reports under ignored `.local/`; real archive derivatives must never be
-committed.
-
-## Full import
-
-After selecting the benchmarked batch size:
-
-```bash
-ptha import /path/to/chatgpt-export.zip --replace --batch-size 32
-```
-
-PTHA removes staging database, WAL, and SHM files from dead import processes
-before a new import. It never removes files owned by a live PID or follows a
-symlink during cleanup.
+PTHA removes staging DB/WAL/SHM files from proven dead import processes before a
+new import. It never follows symlinks or removes files owned by a live process.

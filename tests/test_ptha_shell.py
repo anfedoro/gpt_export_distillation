@@ -30,7 +30,7 @@ class PthaShellTests(unittest.TestCase):
             with patch.dict(os.environ, {"PTHA_DB_PATH": str(Path(root) / "env.db")}):
                 self.assertEqual(load_config(config).database, Path(root) / "env.db")
 
-    def test_legacy_default_sparse_model_migrates_to_shared_bge_m3(self) -> None:
+    def test_legacy_bge_m3_models_migrate_to_pinned_mlx_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             config = Path(root) / "config.toml"
             config.write_text(
@@ -41,8 +41,11 @@ class PthaShellTests(unittest.TestCase):
 
             loaded = load_config(config)
 
-            self.assertEqual(loaded.dense_model, "BAAI/bge-m3")
-            self.assertEqual(loaded.sparse_model, "BAAI/bge-m3")
+            self.assertEqual(loaded.embedding_backend, "mlx")
+            self.assertEqual(loaded.embedding_model, "anfedoro/bge-m3-mlx-fp16")
+            self.assertEqual(loaded.embedding_model_revision, "58e70901dbba8de8f3df91b5a313bcefcb151bae")
+            self.assertEqual(loaded.dense_model, loaded.embedding_model)
+            self.assertEqual(loaded.sparse_model, loaded.embedding_model)
 
     def test_status_json_has_versioned_schema(self) -> None:
         with tempfile.TemporaryDirectory() as root, patch("sys.stdout") as stdout:

@@ -54,12 +54,15 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--output-db", type=Path, required=True)
     run.add_argument("--backend", choices=("legacy", "unified"), required=True)
     run.add_argument("--limit", type=int, default=10_000)
-    run.add_argument("--batch-size", type=int, default=32)
-    run.add_argument("--device", default="auto")
+    run.add_argument("--batch-size", type=int, default=4)
+    run.add_argument("--device", default="gpu")
+    run.add_argument("--model", default="anfedoro/bge-m3-mlx-fp16")
+    run.add_argument("--model-revision", default="58e70901dbba8de8f3df91b5a313bcefcb151bae")
     args = parser.parse_args(argv)
     report = prepare_chunks(args.source, args.output) if args.command == "prepare" else run_benchmark(
         args.chunk_db, args.output_db, backend=args.backend, limit=args.limit,
-        batch_size=args.batch_size, device=args.device,
+        batch_size=args.batch_size, device=args.device, model=args.model,
+        model_revision=args.model_revision,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
@@ -93,12 +96,16 @@ def prepare_chunks(source: Path, output: Path) -> dict[str, Any]:
 
 def run_benchmark(
     chunk_db: Path, output_db: Path, *, backend: str, limit: int, batch_size: int, device: str,
+    model: str = "anfedoro/bge-m3-mlx-fp16", model_revision: str = "58e70901dbba8de8f3df91b5a313bcefcb151bae",
 ) -> dict[str, Any]:
     if output_db.exists():
         raise FileExistsError(output_db)
     shutil.copy2(chunk_db, output_db)
     if backend == "unified":
-        dense, sparse = build_bge_m3_providers("BAAI/bge-m3", device=device, torch_dtype="auto", sparse_top_k=128)
+        dense, sparse = build_bge_m3_providers(
+            model, model_revision=model_revision, device=device,
+            batch_size=batch_size, sparse_top_k=128,
+        )
     else:
         resolved = None if device == "auto" else device
         dense = SentenceTransformerDenseProvider("BAAI/bge-m3", device=resolved, effective_max_seq_length=512)
@@ -216,11 +223,8 @@ def _release_accelerator_cache() -> None:
     import gc
     gc.collect()
     try:
-        import torch
-        if torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        import mlx.core as mx
+        mx.clear_cache()
     except Exception:
         pass
 
@@ -235,8 +239,8 @@ def _policy_id(path: Path) -> str:
 
 def _mps_driver_memory() -> int:
     try:
-        import torch
-        return int(torch.mps.driver_allocated_memory()) if torch.backends.mps.is_available() else 0
+        import mlx.core as mx
+        return int(mx.get_peak_memory())
     except Exception:
         return 0
 
