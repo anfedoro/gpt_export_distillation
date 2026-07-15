@@ -1,6 +1,6 @@
 [project]
 name = "ptha"
-version = "0.4.3"
+version = "0.4.4"
 description = "PTHA — Personal Thought Archive: local ChatGPT archive search and MCP server"
 readme = "README.md"
 authors = [

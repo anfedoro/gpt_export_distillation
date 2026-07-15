@@ -12,6 +12,16 @@ from typing import Any
 
 from kb.embeddings.bge_m3_provider import embed_joint_documents
 from kb.index.chunk_builder import build_chunk_policy
+from kb.mcp.result_assembly import (
+    MAX_GROUPS_PER_CONVERSATION,
+    MAX_POST_RETRIEVAL_CANDIDATES,
+    build_compact_items,
+    diversify_groups,
+    estimate_tokens,
+    filter_low_information_groups,
+    group_overlapping_hits,
+    rerank_hits,
+)
 from kb.storage.native_pre_mvp import NativePreMvpError, NativePreMvpRetriever, _chunked_space
 
 
@@ -96,9 +106,31 @@ class ArchiveSession:
         budget = self._budget(arguments)
         rows = self.search(query, limit=max(limit * 4, 20), mode=str(arguments.get("retrieval_mode", "hybrid")), timeout_ms=arguments.get("timeout_ms"))
         rows = _filter(rows, arguments)
-        selected = _dedupe_messages(rows, limit=limit, max_per_conversation=self.config.max_messages_per_conversation)
-        items = self._assemble(selected, neighbors=neighbors, budget=budget)
-        return _payload("focused", items, budget, self, warnings=[] if items else ["No relevant archive memory found."])
+        reranked = rerank_hits(rows, query)[:min(MAX_POST_RETRIEVAL_CANDIDATES, max(limit * 6, 24))]
+        groups, dropped_duplicates = group_overlapping_hits(reranked)
+        candidate_messages = self._messages_for_groups(groups, neighbors=max(1, min(neighbors, 2)))
+        groups, dropped_low_information = filter_low_information_groups(
+            groups,
+            context_text=lambda group: self._group_context_text(group, candidate_messages),
+        )
+        selected = diversify_groups(groups, limit=limit, max_per_conversation=MAX_GROUPS_PER_CONVERSATION)
+        items, budget_limited = build_compact_items(
+            selected,
+            neighbors=neighbors,
+            budget_tokens=budget,
+            messages_by_conversation=candidate_messages,
+        )
+        return _focused_payload(
+            items,
+            budget,
+            self,
+            raw_hit_count=len(rows),
+            evidence_group_count=len(selected),
+            post_rerank_candidate_count=len(reranked),
+            dropped_duplicate_count=dropped_duplicates,
+            dropped_low_information_count=dropped_low_information,
+            budget_limited=budget_limited,
+        )
 
     def construct_archive_context(self, arguments: dict[str, Any]) -> dict[str, Any]:
         context = _required_text(arguments, "current_context")
@@ -161,6 +193,27 @@ class ArchiveSession:
             used += item_tokens
         return items
 
+    def _messages_for_groups(self, groups: list[dict[str, Any]], *, neighbors: int) -> dict[str, list[dict[str, Any]]]:
+        windows: dict[str, tuple[int, int]] = {}
+        for group in groups:
+            row = group["representative"]
+            ordinal = int(row["message_ordinal"])
+            conversation = str(row["conversation_id"])
+            prior = windows.get(conversation, (ordinal, ordinal))
+            windows[conversation] = (min(prior[0], ordinal - neighbors), max(prior[1], ordinal + neighbors))
+        return self.retriever.messages_for_windows(windows) if windows else {}
+
+    @staticmethod
+    def _group_context_text(group: dict[str, Any], messages_by_conversation: dict[str, list[dict[str, Any]]]) -> str:
+        row = group["representative"]
+        ordinal = int(row["message_ordinal"])
+        conversation = str(row["conversation_id"])
+        return "\n".join(
+            str(message.get("raw_text") or "")
+            for message in messages_by_conversation.get(conversation, [])
+            if int(message["ordinal"]) != ordinal and abs(int(message["ordinal"]) - ordinal) <= 1
+        )
+
 
 def _payload(mode: str, items: list[dict[str, Any]], budget: int, session: ArchiveSession, *, warnings: list[str]) -> dict[str, Any]:
     return {"schema_version": "kb.mcp.memory.v1", "mode": mode, "summary": _summary(items), "items": items,
@@ -168,6 +221,59 @@ def _payload(mode: str, items: list[dict[str, Any]], budget: int, session: Archi
                          "estimated_tokens": sum(_estimate_tokens(item["text"]) for item in items), "budget_tokens": budget},
             "warnings": warnings, "runtime": {"candidate_pool": session.config.candidate_pool, "session_calls": session.calls,
                                                    "sparse_materialized_once": True}}
+
+
+def _focused_payload(
+    items: list[dict[str, Any]],
+    budget: int,
+    session: ArchiveSession,
+    *,
+    raw_hit_count: int,
+    evidence_group_count: int,
+    post_rerank_candidate_count: int,
+    dropped_duplicate_count: int,
+    dropped_low_information_count: int,
+    budget_limited: bool,
+) -> dict[str, Any]:
+    conversation_count = len({item["conversation_id"] for item in items})
+    warnings: list[str] = []
+    if not items:
+        warnings.append("No relevant archive memory found.")
+    if dropped_duplicate_count >= max(2, raw_hit_count // 2):
+        warnings.append("Several near-duplicate excerpts were collapsed.")
+    if len(items) > 1 and conversation_count == 1:
+        warnings.append("Results are concentrated in one conversation.")
+    if budget_limited:
+        warnings.append("Retrieved evidence was limited by the requested output budget.")
+    return {
+        "schema_version": "kb.mcp.memory.v1",
+        "mode": "focused",
+        "summary": _focused_summary(items, conversation_count),
+        "items": items,
+        "coverage": {
+            "raw_hit_count": raw_hit_count,
+            "evidence_group_count": evidence_group_count,
+            "post_rerank_candidate_count": post_rerank_candidate_count,
+            "conversation_count": conversation_count,
+            "item_count": len(items),
+            "dropped_duplicate_count": dropped_duplicate_count,
+            "dropped_low_information_count": dropped_low_information_count,
+            "estimated_tokens": sum(estimate_tokens(str(item["text"])) + sum(estimate_tokens(str(context["text"])) for context in item["supporting_context"]) for item in items),
+            "budget_tokens": budget,
+        },
+        "warnings": warnings,
+        "runtime": {
+            "candidate_pool": session.config.candidate_pool,
+            "session_calls": session.calls,
+            "sparse_materialized_once": True,
+        },
+    }
+
+
+def _focused_summary(items: list[dict[str, Any]], conversation_count: int) -> str:
+    if not items:
+        return "No supported archive context was found."
+    return f"Retrieved {len(items)} distinct evidence group(s) from {conversation_count} conversation(s)."
 
 
 def _summary(items: list[dict[str, Any]]) -> str:
