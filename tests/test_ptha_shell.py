@@ -73,9 +73,12 @@ class PthaShellTests(unittest.TestCase):
     def test_status_json_has_versioned_schema(self) -> None:
         with tempfile.TemporaryDirectory() as root, patch("sys.stdout") as stdout:
             config = Path(root) / "config.toml"
-            main(["--config", str(config), "init"])
-            stdout.reset_mock()
-            self.assertEqual(main(["--config", str(config), "status", "--json"]), 0)
+            paths = PthaPaths(Path(root) / "config-dir", Path(root) / "data", Path(root) / "cache",
+                              Path(root) / "state", Path(root) / "logs", Path(root) / "run")
+            with patch("ptha.config.platform_paths", return_value=paths):
+                main(["--config", str(config), "init"])
+                stdout.reset_mock()
+                self.assertEqual(main(["--config", str(config), "status", "--json"]), 0)
             payload = json.loads("".join(call.args[0] + "\n" for call in stdout.write.call_args_list))
             self.assertEqual(payload["schema_version"], 1)
             self.assertEqual(payload["database"]["state"], "missing")
@@ -96,7 +99,7 @@ class PthaShellTests(unittest.TestCase):
             with patch("ptha.importer.import_archive", side_effect=KeyboardInterrupt):
                 self.assertEqual(main(["--config", str(config), "import", str(Path(root) / "export.zip"), "--quiet"]), 130)
             output = "".join(call.args[0] for call in stderr.write.call_args_list)
-            self.assertIn("Incomplete staging data was removed", output)
+            self.assertIn("Checkpoint data was preserved", output)
 
     def test_interrupted_reindex_preserves_recovery_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as root, patch("sys.stderr") as stderr:

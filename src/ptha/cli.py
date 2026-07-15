@@ -37,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_command.add_argument("--working-dir", type=Path)
     import_command.add_argument("--keep-distilled", action="store_true")
     import_command.add_argument("--replace", action="store_true")
+    import_command.add_argument("--discard-failed", action="store_true", help="Discard a failed resumable import and start fresh.")
     import_command.add_argument("--include-low-interest", action="store_true")
     import_command.add_argument("--dense-device")
     import_command.add_argument("--sparse-device")
@@ -106,6 +107,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             report = import_archive(args.source, config, replace=args.replace,
                                     keep_distilled=args.keep_distilled,
                                     include_low_interest=args.include_low_interest,
+                                    discard_failed=args.discard_failed,
                                     progress=None if args.quiet or args.json else lambda value: print(value, file=sys.stderr))
             if args.json:
                 print(json.dumps({"schema_version": 1, **report}, ensure_ascii=False, indent=2, sort_keys=True))
@@ -176,9 +178,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         if args.command == "import":
             message = ("PTHA import interrupted.\n\n"
-                       "Incomplete staging data was removed; the active database was not changed.\n\n"
+                       "Checkpoint data was preserved; the active database was not changed.\n\n"
                        "Next:\n"
-                       "  ptha import /path/to/chatgpt-export.zip")
+                       "  ptha import /path/to/chatgpt-export.zip\n"
+                       "\nTo discard the checkpoint and start over:\n"
+                       "  ptha import /path/to/chatgpt-export.zip --discard-failed")
         elif args.command == "reindex":
             message = ("PTHA reindex interrupted.\n\n"
                        "The active database was not changed. Recovery state was preserved for inspection.\n\n"

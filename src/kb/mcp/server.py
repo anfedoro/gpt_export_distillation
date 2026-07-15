@@ -46,7 +46,7 @@ class MCPServer:
         if request_id is None:
             return None
         if method == "initialize":
-            return _result(request_id, {"protocolVersion": PROTOCOL_VERSION, "serverInfo": {"name": "gpt-export-distillation-kb", "version": "0.3.0"}, "capabilities": {"tools": {}}})
+            return _result(request_id, {"protocolVersion": PROTOCOL_VERSION, "serverInfo": {"name": "gpt-export-distillation-kb", "version": "0.4.1"}, "capabilities": {"tools": {}}})
         if method == "ping":
             return _result(request_id, {})
         if method == "tools/list":

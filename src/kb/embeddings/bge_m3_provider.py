@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import sys
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -16,6 +17,34 @@ from kb.embeddings.base import (
 )
 
 MLX_EMBEDDINGS_REVISION = "4a8277aa523eb34ff29a5a832fa3f3f654336b54"
+
+
+def _cached_snapshot(
+    repo_id: str,
+    revision: str,
+    required: set[str],
+    *,
+    cache_dir: Path | None,
+    try_to_load_from_cache: Any,
+) -> Path | None:
+    """Return a complete cached snapshot without invoking Hub download logic."""
+    cached_paths: list[Path] = []
+    for filename in sorted(required):
+        cached = try_to_load_from_cache(
+            repo_id=repo_id,
+            filename=filename,
+            revision=revision,
+            cache_dir=str(cache_dir) if cache_dir else None,
+        )
+        if not isinstance(cached, (str, Path)):
+            return None
+        path = Path(cached)
+        if not path.is_file():
+            return None
+        cached_paths.append(path)
+    if not cached_paths or any(path.parent != cached_paths[0].parent for path in cached_paths):
+        return None
+    return cached_paths[0].parent
 
 
 class MlxBgeM3Provider(EmbeddingProvider):
@@ -49,7 +78,8 @@ class MlxBgeM3Provider(EmbeddingProvider):
 
         try:
             import mlx.core as mx
-            from huggingface_hub import snapshot_download
+            from huggingface_hub import snapshot_download, try_to_load_from_cache
+            from huggingface_hub.utils import disable_progress_bars
             from mlx_embeddings.sparse import load_sparse_linear
             from mlx_embeddings.utils import load_model, load_tokenizer
         except ImportError as exc:
@@ -58,12 +88,6 @@ class MlxBgeM3Provider(EmbeddingProvider):
         if not hasattr(mx.fast, "scaled_dot_product_attention"):
             raise RuntimeError("MLX fused scaled-dot-product attention is unavailable.")
         mx.set_default_device(mx.gpu)
-        local_model = Path(model_name).expanduser()
-        snapshot = local_model.resolve() if local_model.is_dir() else Path(snapshot_download(
-            repo_id=model_name,
-            revision=model_revision,
-            cache_dir=str(model_cache) if model_cache else None,
-        ))
         required = {
             "model.safetensors",
             sparse_head,
@@ -72,6 +96,32 @@ class MlxBgeM3Provider(EmbeddingProvider):
             "tokenizer.json",
             "tokenizer_config.json",
         }
+        local_model = Path(model_name).expanduser()
+        if local_model.is_dir():
+            snapshot = local_model.resolve()
+            source = "local model directory"
+            self._announce_model(model_name, model_revision, source, snapshot)
+        else:
+            snapshot = _cached_snapshot(
+                model_name,
+                model_revision,
+                required,
+                cache_dir=model_cache,
+                try_to_load_from_cache=try_to_load_from_cache,
+            )
+            if snapshot is not None:
+                source = "local Hugging Face cache"
+                self._announce_model(model_name, model_revision, source, snapshot)
+            else:
+                self._announce_model(model_name, model_revision, "Hugging Face Hub", None, downloading=True)
+                # The application owns the single indexing progress bar. Hugging Face's
+                # per-file bars otherwise interleave with it and create broken terminal output.
+                disable_progress_bars()
+                snapshot = Path(snapshot_download(
+                    repo_id=model_name,
+                    revision=model_revision,
+                    cache_dir=str(model_cache) if model_cache else None,
+                ))
         missing = sorted(name for name in required if not (snapshot / name).is_file())
         if missing:
             raise RuntimeError(f"MLX BGE-M3 artifact is incomplete; missing: {', '.join(missing)}")
@@ -99,6 +149,16 @@ class MlxBgeM3Provider(EmbeddingProvider):
             ) if value is not None
         }
         self._validate_runtime(mx)
+        print(
+            "  status: ready\n"
+            f"  dimension: {self.dimension}\n"
+            "  precision: float16\n"
+            "  quantization: none\n"
+            "  attention: fused scaled-dot-product\n"
+            "  representations: dense + sparse from one backbone forward",
+            file=sys.stderr,
+            flush=True,
+        )
         self.runtime_metadata = {
             "backend": "mlx-bge-m3",
             "framework": "mlx",
@@ -111,6 +171,27 @@ class MlxBgeM3Provider(EmbeddingProvider):
             "batch_size": batch_size,
             "max_padded_tokens": max_padded_tokens,
         }
+
+    @staticmethod
+    def _announce_model(
+        model_name: str,
+        model_revision: str,
+        source: str,
+        snapshot: Path | None,
+        *,
+        downloading: bool = False,
+    ) -> None:
+        print(
+            "PTHA embedding model\n"
+            f"  repository: {model_name}\n"
+            f"  revision: {model_revision}\n"
+            f"  source: {source}\n"
+            f"  cache: {'not found' if downloading else 'found'}\n"
+            f"  action: {'downloading model artifacts' if downloading else 'using installed model'}"
+            + (f"\n  path: {snapshot}" if snapshot is not None else ""),
+            file=sys.stderr,
+            flush=True,
+        )
 
     def _validate_runtime(self, mx: Any) -> None:
         from mlx.utils import tree_flatten

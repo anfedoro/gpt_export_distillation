@@ -21,7 +21,7 @@ Every `ptha init` invocation prints the actual paths selected on that machine.
 Install from a built wheel:
 
 ```bash
-uv tool install /absolute/path/to/ptha-0.2.15-py3-none-any.whl
+uv tool install /absolute/path/to/ptha-0.4.1-py3-none-any.whl
 ```
 
 Or install the current repository version:
@@ -132,6 +132,28 @@ number and length of messages, available memory, model download, and local
 storage speed all affect it. Do not start a second import while the first is
 running.
 
+### Interrupted import and resume
+
+PTHA commits the staging SQLite database after each embedding batch. If the
+process receives Ctrl-C or fails during indexing, the active database is not
+changed and the checkpoint workspace is kept. Run the same command again:
+
+```bash
+ptha import /absolute/path/to/chatgpt-export.zip
+```
+
+The retry reuses the completed distillation and chunk phases and skips chunks
+that already have both dense and sparse vectors. A retry with a different
+source is refused while the old checkpoint exists. To intentionally discard
+the checkpoint and start from zero:
+
+```bash
+ptha import /absolute/path/to/chatgpt-export.zip --discard-failed
+```
+
+The checkpoint is local state under the configured state/working directories;
+it is never published as the active database until final validation succeeds.
+
 ## 4. Check the database and start the service
 
 ```bash
@@ -240,10 +262,11 @@ ptha service stop
 
 ## 9. Cancel or recover an import
 
-Press `Ctrl-C` in the import terminal to cancel a running import. PTHA removes
-the incomplete staging database and leaves an already-published database
-unchanged. The next `ptha import ...` starts a clean build; PTHA v1 does not
-resume a partial vector index.
+Press `Ctrl-C` in the import terminal to cancel a running import. PTHA leaves
+the active database unchanged and preserves a checkpoint containing the
+distilled workspace and committed embedding batches. Re-run the same import
+command to resume. Use `--discard-failed` only when you intentionally want a
+clean rebuild.
 
 ## 10. Common errors
 

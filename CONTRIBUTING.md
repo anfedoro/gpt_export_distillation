@@ -11,6 +11,14 @@ uv build
 The default runtime is MLX FP16 on Apple Silicon. PyTorch is optional and is
 used only by the offline model-conversion extra and reference benchmarks.
 
+## Versioning
+
+PTHA is pre-1.0. Every change that affects runtime behavior, the CLI, storage,
+configuration, or the user workflow must increment the minor version at least.
+For example, the current `0.3.x` line moves to `0.4.0` after such a change.
+Do not leave a new user-visible build under the previous version number. Update
+`pyproject.toml`, rebuild the wheel, and verify `ptha --version` before handoff.
+
 ## Repository boundaries
 
 - `src/ptha/` contains the product CLI, service lifecycle, IPC, MCP adapter,

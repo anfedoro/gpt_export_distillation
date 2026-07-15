@@ -3,10 +3,12 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 from kb.embeddings.base import EmbeddingResult
-from kb.embeddings.bge_m3_provider import MlxBgeM3Provider, embed_joint_documents
+from kb.embeddings.bge_m3_provider import MlxBgeM3Provider, _cached_snapshot, embed_joint_documents
 
 
 class _Tokenizer:
@@ -29,6 +31,31 @@ class _Wrapper:
 
 
 class MlxBgeM3ProviderTests(unittest.TestCase):
+    def test_cached_snapshot_requires_all_artifacts_in_one_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            snapshot = Path(root) / "snapshots" / "revision"
+            snapshot.mkdir(parents=True)
+            required = {"config.json", "model.safetensors"}
+            for name in required:
+                (snapshot / name).write_text("fixture", encoding="utf-8")
+
+            def cached(**kwargs):
+                return snapshot / kwargs["filename"]
+
+            self.assertEqual(
+                _cached_snapshot("owner/model", "revision", required, cache_dir=None,
+                                 try_to_load_from_cache=cached),
+                snapshot,
+            )
+
+            def incomplete(**kwargs):
+                return snapshot / kwargs["filename"] if kwargs["filename"] == "config.json" else None
+
+            self.assertIsNone(
+                _cached_snapshot("owner/model", "revision", required, cache_dir=None,
+                                 try_to_load_from_cache=incomplete)
+            )
+
     def test_sparse_aggregation_uses_positive_bias_semantics_and_max_per_token(self) -> None:
         provider = MlxBgeM3Provider.__new__(MlxBgeM3Provider)
         provider.special_ids = {0, 1, 2, 3}

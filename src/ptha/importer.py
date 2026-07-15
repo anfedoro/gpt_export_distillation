@@ -36,11 +36,12 @@ def import_archive(
     replace: bool = False,
     keep_distilled: bool = False,
     include_low_interest: bool = False,
+    discard_failed: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     with maintenance_lock(config):
         return _import_archive(config=config, source=source, replace=replace, keep_distilled=keep_distilled,
-                               include_low_interest=include_low_interest, progress=progress)
+                               include_low_interest=include_low_interest, discard_failed=discard_failed, progress=progress)
 
 
 def _import_archive(
@@ -50,6 +51,7 @@ def _import_archive(
     replace: bool,
     keep_distilled: bool,
     include_low_interest: bool,
+    discard_failed: bool,
     progress: Callable[[str], None] | None,
 ) -> dict[str, Any]:
     source = source.expanduser().resolve()
@@ -67,28 +69,59 @@ def _import_archive(
         raise DatabaseExistsError(f"Database already exists: {active}. Use --replace to rebuild it safely.")
     active.parent.mkdir(parents=True, exist_ok=True)
     config.paths.state_dir.mkdir(parents=True, exist_ok=True)
-    removed_orphans = cleanup_orphan_import_files(active)
+    state_file = config.paths.state_dir / "import-state.json"
+    previous_state = _read_state(state_file)
+    source_identity = _source_identity(source)
+    resume_state = None
+    if previous_state and previous_state.get("status") in {"failed", "interrupted", "running"}:
+        if previous_state.get("source_identity") == source_identity and previous_state.get("workspace"):
+            resume_state = previous_state
+        elif not discard_failed:
+            raise ImportFailedError(
+                "An incomplete import exists for another source. "
+                "Resume that import or rerun with --discard-failed to remove its staging data."
+            )
+    if discard_failed and previous_state:
+        _discard_state_files(previous_state)
+        state_file.unlink(missing_ok=True)
+        previous_state = None
+    protected = []
+    if resume_state and resume_state.get("staging"):
+        protected.extend(_staging_family(Path(str(resume_state["staging"]))))
+    removed_orphans = cleanup_orphan_import_files(active, protected=protected)
     if removed_orphans:
         _stage(progress, f"Removed {removed_orphans} stale import files.")
     started_at = datetime.now(UTC)
     started = time.perf_counter()
-    staging = active.with_name(f".{active.name}.{os.getpid()}.staging")
-    state_file = config.paths.state_dir / "import-state.json"
-    workspace_parent = config.working_dir
-    if workspace_parent:
+    resume = resume_state is not None
+    if resume:
+        staging = Path(str(resume_state["staging"]))
+        workspace = Path(str(resume_state["workspace"]))
+        if not workspace.exists():
+            raise ImportFailedError("Import checkpoint workspace is missing; rerun with --discard-failed.")
+    else:
+        staging = active.with_name(f".{active.name}.{os.getpid()}.staging")
+        workspace_parent = config.working_dir or (config.paths.state_dir / "imports")
         workspace_parent.mkdir(parents=True, exist_ok=True)
-    workspace = Path(tempfile.mkdtemp(prefix="ptha-import-", dir=workspace_parent))
+        workspace = Path(tempfile.mkdtemp(prefix="ptha-import-", dir=workspace_parent))
     distilled = workspace / "distilled"
     kept_path: Path | None = None
-    _write_state(state_file, "running", "reading_export", started_at)
+    _write_state(state_file, "running", "reading_export", started_at, source_identity=source_identity,
+                 staging=staging, workspace=workspace, distilled=distilled)
     try:
-        _stage(progress, "[1/7] Reading export")
-        bundle = load_bundle(source)
-        _stage(progress, "[2/7] Distilling conversations")
-        documents = build_documents(bundle, DISTILL_CONFIG)
-        distilled_root = write_output(bundle, documents, DISTILL_CONFIG, str(distilled))
-        _write_state(state_file, "running", "building_native_database", started_at)
-        _stage(progress, "[3/7] Importing canonical content")
+        distilled_root = distilled
+        if resume and distilled.exists():
+            _stage(progress, "[resume] Reusing completed distillation workspace")
+        else:
+            _stage(progress, "[1/7] Reading export")
+            bundle = load_bundle(source)
+            _stage(progress, "[2/7] Distilling conversations")
+            documents = build_documents(bundle, DISTILL_CONFIG)
+            distilled_root = Path(write_output(bundle, documents, DISTILL_CONFIG, str(distilled)))
+        _write_state(state_file, "running", "building_native_database", started_at,
+                     source_identity=source_identity, staging=staging, workspace=workspace, distilled=distilled)
+        resume_build = resume and staging.with_name(staging.name + ".building").exists()
+        _stage(progress, "[resume] Reusing canonical/chunk checkpoint" if resume_build else "[3/7] Importing canonical content")
         audit = build_native_pre_mvp_db(
             export_path=distilled_root,
             output_db=staging,
@@ -105,6 +138,7 @@ def _import_archive(
             batch_size=config.batch_size,
             skip_low_interest=not include_low_interest,
             progress=progress is not None,
+            resume=resume_build,
         )
         with closing(sqlite3.connect(staging)) as conn:
             conn.execute("UPDATE native_build_audit SET export_path=? WHERE id=1", (source.name,))
@@ -116,6 +150,7 @@ def _import_archive(
         if validation.get("state") != "ready" or validation.get("integrity_check") != "ok":
             raise ImportFailedError("The replacement database failed validation.")
         os.replace(staging, active)
+        published = True
         os.chmod(active, 0o600)
         completed_at = datetime.now(UTC)
         metadata = {
@@ -145,20 +180,29 @@ def _import_archive(
         state_file.unlink(missing_ok=True)
         return {"metadata": metadata, "database": str(active), "size_bytes": active.stat().st_size,
                 "duration_seconds": round(time.perf_counter() - started, 3),
-                "distilled_archive": str(kept_path) if kept_path else None}
+                "distilled_archive": str(kept_path) if kept_path else None,
+                "resumed": resume}
     except KeyboardInterrupt:
-        _write_state(state_file, "interrupted", "building_native_database", started_at)
+        _write_state(state_file, "interrupted", "building_native_database", started_at,
+                     source_identity=source_identity, staging=staging, workspace=workspace, distilled=distilled)
         raise
     except PthaError:
-        _write_state(state_file, "failed", "building_native_database", started_at)
+        _write_state(state_file, "failed", "building_native_database", started_at,
+                     source_identity=source_identity, staging=staging, workspace=workspace, distilled=distilled)
         raise
     except Exception as exc:  # noqa: BLE001
-        _write_state(state_file, "failed", "building_native_database", started_at)
-        raise ImportFailedError("Archive import failed; the active database was not changed.") from exc
+        _write_state(state_file, "failed", "building_native_database", started_at,
+                     source_identity=source_identity, staging=staging, workspace=workspace, distilled=distilled)
+        raise ImportFailedError(
+            "Archive import failed; the active database was not changed. "
+            "A resumable checkpoint was preserved. Re-run the same command to continue, "
+            "or add --discard-failed to start over."
+        ) from exc
     finally:
-        for candidate in _staging_family(staging):
-            candidate.unlink(missing_ok=True)
-        shutil.rmtree(workspace, ignore_errors=True)
+        if locals().get("published", False):
+            for candidate in _staging_family(staging):
+                candidate.unlink(missing_ok=True)
+            shutil.rmtree(workspace, ignore_errors=True)
 
 
 def _stage(progress: Callable[[str], None] | None, message: str) -> None:
@@ -166,11 +210,14 @@ def _stage(progress: Callable[[str], None] | None, message: str) -> None:
         progress(message)
 
 
-def cleanup_orphan_import_files(active: Path) -> int:
+def cleanup_orphan_import_files(active: Path, *, protected: list[Path] | None = None) -> int:
     """Remove import staging files only when their recorded process is dead."""
     removed = 0
     prefix = f".{active.name}."
+    protected_resolved = {path.expanduser().resolve() for path in (protected or [])}
     for candidate in active.parent.glob(f".{active.name}.*.staging*"):
+        if candidate.expanduser().resolve() in protected_resolved:
+            continue
         if candidate.is_symlink() or not candidate.is_file():
             continue
         suffix = candidate.name.removeprefix(prefix)
@@ -200,6 +247,34 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
-def _write_state(path: Path, status: str, stage: str, started_at: datetime) -> None:
-    path.write_text(json.dumps({"schema_version": 1, "status": status, "stage": stage,
-                                "started_at": started_at.isoformat()}, indent=2) + "\n", encoding="utf-8")
+def _source_identity(source: Path) -> dict[str, Any]:
+    stat = source.stat()
+    return {"path": str(source), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "is_file": source.is_file()}
+
+
+def _read_state(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _discard_state_files(state: dict[str, Any]) -> None:
+    for key in ("staging", "workspace"):
+        value = state.get(key)
+        if not value:
+            continue
+        path = Path(str(value))
+        if key == "workspace":
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            for candidate in _staging_family(path):
+                candidate.unlink(missing_ok=True)
+
+
+def _write_state(path: Path, status: str, stage: str, started_at: datetime, **extra: Any) -> None:
+    payload = {"schema_version": 1, "status": status, "stage": stage, "started_at": started_at.isoformat()}
+    for key, value in extra.items():
+        payload[key] = str(value) if isinstance(value, Path) else value
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

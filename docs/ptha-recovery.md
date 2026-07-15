@@ -17,8 +17,11 @@ For interrupted reindex, confirm the service is stopped and run `ptha reindex
 then starts a new complete rebuild. It never edits the active DB in place.
 
 For interrupted import, the active DB was never replaced. Confirm with doctor,
-then rerun import with the intended source. Import and reindex share an OS
-maintenance lock, so concurrent mutation is rejected.
+then rerun the same import command to resume the preserved distillation,
+canonical/chunk checkpoint, and committed embedding batches. Use
+`--discard-failed` to explicitly remove that checkpoint and start a clean
+build. Import and reindex share an OS maintenance lock, so concurrent mutation
+is rejected.
 
 Never manually remove state reported as `unknown-process` until its PID and
 paths are inspected. PTHA deliberately avoids following symlinks or signalling

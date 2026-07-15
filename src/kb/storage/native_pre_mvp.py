@@ -173,9 +173,12 @@ class NativeBuildStore:
             create_clean_native_schema(self.conn)
         else:
             load_sqlite_vec(self.conn)
-        self._term_ids: dict[str, int] = {}
-        self._dense_rowid = 0
-        self._sparse_rowid = 0
+        self._term_ids: dict[str, int] = {
+            str(row["token_text"]): int(row["term_id"])
+            for row in self.conn.execute("SELECT term_id,token_text FROM sparse_vocabulary")
+        } if not create_schema else {}
+        self._dense_rowid = int(self.conn.execute("SELECT COALESCE(MAX(rowid),0) FROM dense_native_metadata").fetchone()[0]) if not create_schema else 0
+        self._sparse_rowid = int(self.conn.execute("SELECT COALESCE(MAX(rowid),0) FROM sparse_vector_metadata").fetchone()[0]) if not create_schema else 0
 
     def reset_derived(self) -> None:
         """Delete only reproducible retrieval structures from an existing clean DB."""
@@ -329,15 +332,22 @@ class NativeBuildStore:
             yield rows
             after_id = str(rows[-1]["id"])
 
-    def embedding_batches_by_length(self, *, policy_id: str, batch_size: int) -> Iterable[list[sqlite3.Row]]:
+    def embedding_batches_by_length(self, *, policy_id: str, batch_size: int, missing_only: bool = False) -> Iterable[list[sqlite3.Row]]:
         """Yield deterministic length buckets to minimize transformer padding."""
         after_tokens = -1
         after_id = ""
         while True:
+            missing_predicate = ""
+            if missing_only:
+                missing_predicate = (
+                    " AND NOT EXISTS (SELECT 1 FROM dense_native_metadata d WHERE d.chunk_id=rc.id)"
+                    " AND NOT EXISTS (SELECT 1 FROM sparse_vector_metadata s WHERE s.chunk_id=rc.id)"
+                )
             rows = self.conn.execute(
-                "SELECT id,block_id,text,token_count FROM retrieval_chunks "
-                "WHERE chunk_policy_id=? AND (token_count>? OR (token_count=? AND id>?)) "
-                "ORDER BY token_count,id LIMIT ?",
+                "SELECT rc.id,rc.block_id,rc.text,rc.token_count FROM retrieval_chunks rc "
+                "WHERE rc.chunk_policy_id=?" + missing_predicate +
+                " AND (rc.token_count>? OR (rc.token_count=? AND rc.id>?)) "
+                "ORDER BY rc.token_count,rc.id LIMIT ?",
                 (policy_id, after_tokens, after_tokens, after_id, batch_size),
             ).fetchall()
             if not rows:
@@ -345,6 +355,26 @@ class NativeBuildStore:
             yield rows
             after_tokens = int(rows[-1]["token_count"])
             after_id = str(rows[-1]["id"])
+
+    def remove_partial_embeddings(self) -> int:
+        """Remove chunks with only one of the dense/sparse representations."""
+        rows = self.conn.execute(
+            "SELECT rc.id,d.rowid AS dense_rowid,s.rowid AS sparse_rowid "
+            "FROM retrieval_chunks rc "
+            "LEFT JOIN dense_native_metadata d ON d.chunk_id=rc.id "
+            "LEFT JOIN sparse_vector_metadata s ON s.chunk_id=rc.id "
+            "WHERE (d.chunk_id IS NULL) <> (s.chunk_id IS NULL)"
+        ).fetchall()
+        for row in rows:
+            if row["dense_rowid"] is not None:
+                self.conn.execute("DELETE FROM dense_vectors_native WHERE rowid=?", (row["dense_rowid"],))
+                self.conn.execute("DELETE FROM dense_native_metadata WHERE rowid=?", (row["dense_rowid"],))
+            if row["sparse_rowid"] is not None:
+                self.conn.execute("DELETE FROM sparse_vectors_compact WHERE rowid=?", (row["sparse_rowid"],))
+                self.conn.execute("DELETE FROM sparse_vector_metadata WHERE rowid=?", (row["sparse_rowid"],))
+        if rows:
+            self.conn.commit()
+        return len(rows)
 
     def write_embedding_batch(
         self, *, rows: list[sqlite3.Row], dense_vectors: list[list[float]], sparse_vectors: list[dict[str, float]],
@@ -466,15 +496,18 @@ def build_native_pre_mvp_db(
     dense_effective_max_seq_length: int = 512,
     dense_device: str | None = None, sparse_device: str | None = None,
     dense_torch_dtype: str | None = None, sparse_torch_dtype: str | None = None,
+    resume: bool = False,
 ) -> dict[str, Any]:
     """Parse a raw export and create a clean DB without opening any legacy DB."""
     if output_db.exists():
         raise NativePreMvpError(f"Output database already exists: {output_db}")
     building_db = output_db.with_name(output_db.name + ".building")
-    if building_db.exists():
+    if building_db.exists() and not resume:
         raise NativePreMvpError(
             f"Unfinished temporary build exists: {building_db}. Inspect or remove it before a new build."
         )
+    if resume and not building_db.exists():
+        raise NativePreMvpError(f"Cannot resume import; temporary build does not exist: {building_db}")
     if batch_size <= 0:
         raise NativePreMvpError("batch_size must be positive.")
     export_path = export_path.expanduser().resolve()
@@ -510,60 +543,110 @@ def build_native_pre_mvp_db(
         "chunk_policy": policy.id,
     }
     try:
-        with NativeBuildStore(building_db) as store:
-            store.conn.execute(
-                "INSERT INTO native_build_audit(id,schema_version,export_path,status,started_at,contracts_json) VALUES(1,?,?,?,?,?)",
-                (NATIVE_PRE_MVP_SCHEMA_VERSION, str(export_path), "running", datetime.now(UTC).isoformat(), _json(contracts)),
-            )
-            scanned = parsed = failed = 0
-            items = list(scan_tree(export_path))
-            total_chats = sum(item.detected_kind == "chat_md" for item in items)
-            if progress:
-                print("[4/7] Parsing conversations", file=sys.stderr, flush=True)
-            with tqdm(total=total_chats, desc="Parsing conversations", unit="chat", file=sys.stderr,
-                      dynamic_ncols=True, disable=not progress) as bar:
-                for item in items:
-                    scanned += 1
-                    source_id = store.insert_source_document(export_path, item)
-                    if item.detected_kind != "chat_md":
-                        continue
-                    try:
-                        parsed_chat = parse_chat_file(export_path / item.relative_path, source_document_id=source_id, project_id=item.project_path, folder_kind=item.folder_kind)
-                        store.insert_parsed_chat(parsed_chat)
-                        parsed += 1
-                    except Exception as exc:  # noqa: BLE001
-                        failed += 1
-                        raise NativePreMvpError(f"Raw export parse failed path={item.relative_path}: {exc}") from exc
-                    if parsed % 100 == 0:
-                        store.commit()
-                        bar.set_postfix(scanned=scanned)
-                    bar.update(1)
-            store.commit()
-            if progress:
-                print("[5/7] Building search chunks", file=sys.stderr, flush=True)
-            chunk_audit = store.create_chunks(
-                policy=policy,
-                tokenizer_provider=StrictestTokenizer([dense, sparse]),
-                skip_low_interest=skip_low_interest,
-                progress=progress,
-            )
-            required_chunk_conditions = {key: chunk_audit[key] == 0 for key in ("uncovered_characters", "chunks_over_limit", "truncated_chunks", "blocks_with_coverage_gaps")}
+        with NativeBuildStore(building_db, create_schema=not resume) as store:
+            previous_audit: dict[str, Any] = {}
+            chunk_audit: dict[str, Any] | None = None
+            if resume:
+                row = store.conn.execute("SELECT contracts_json,audit_json,status FROM native_build_audit WHERE id=1").fetchone()
+                if row is None:
+                    raise NativePreMvpError("Cannot resume import; build checkpoint is missing.")
+                previous_contracts = json.loads(str(row["contracts_json"]))
+                previous_audit = json.loads(str(row["audit_json"] or "{}"))
+                expected = {
+                    "dense_model": dense.model_name,
+                    "dense_space": dense.embedding_space_id,
+                    "sparse_model": sparse.model_name,
+                    "sparse_space": sparse.embedding_space_id,
+                    "chunk_policy": policy.id,
+                }
+                actual = {
+                    "dense_model": previous_contracts.get("dense", {}).get("model"),
+                    "dense_space": previous_contracts.get("dense", {}).get("embedding_space_id"),
+                    "sparse_model": previous_contracts.get("sparse", {}).get("model"),
+                    "sparse_space": previous_contracts.get("sparse", {}).get("embedding_space_id"),
+                    "chunk_policy": previous_contracts.get("chunk_policy"),
+                }
+                if actual != expected:
+                    raise NativePreMvpError(
+                        "Import checkpoint is incompatible with the current embedding configuration; "
+                        "discard it and start a fresh import."
+                    )
+                chunk_audit = previous_audit.get("chunk_audit")
+                if not isinstance(chunk_audit, dict):
+                    raise NativePreMvpError("Import checkpoint has no completed chunk phase; start a fresh import.")
+                scanned = int(store.conn.execute("SELECT COUNT(*) FROM source_documents").fetchone()[0])
+                parsed = int(store.conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0])
+                failed = 0
+            else:
+                store.conn.execute(
+                    "INSERT INTO native_build_audit(id,schema_version,export_path,status,started_at,contracts_json) VALUES(1,?,?,?,?,?)",
+                    (NATIVE_PRE_MVP_SCHEMA_VERSION, str(export_path), "running", datetime.now(UTC).isoformat(), _json(contracts)),
+                )
+                scanned = parsed = failed = 0
+                items = list(scan_tree(export_path))
+                total_chats = sum(item.detected_kind == "chat_md" for item in items)
+                if progress:
+                    print("[4/7] Parsing conversations", file=sys.stderr, flush=True)
+                with tqdm(total=total_chats, desc="Parsing conversations", unit="chat", file=sys.stderr,
+                          dynamic_ncols=True, disable=not progress) as bar:
+                    for item in items:
+                        scanned += 1
+                        source_id = store.insert_source_document(export_path, item)
+                        if item.detected_kind != "chat_md":
+                            continue
+                        try:
+                            parsed_chat = parse_chat_file(export_path / item.relative_path, source_document_id=source_id, project_id=item.project_path, folder_kind=item.folder_kind)
+                            store.insert_parsed_chat(parsed_chat)
+                            parsed += 1
+                        except Exception as exc:  # noqa: BLE001
+                            failed += 1
+                            raise NativePreMvpError(f"Raw export parse failed path={item.relative_path}: {exc}") from exc
+                        if parsed % 100 == 0:
+                            store.commit()
+                            bar.set_postfix(scanned=scanned)
+                        bar.update(1)
+                store.commit()
+                if progress:
+                    print("[5/7] Building search chunks", file=sys.stderr, flush=True)
+                chunk_audit = store.create_chunks(
+                    policy=policy,
+                    tokenizer_provider=StrictestTokenizer([dense, sparse]),
+                    skip_low_interest=skip_low_interest,
+                    progress=progress,
+                )
+                required_chunk_conditions = {key: chunk_audit[key] == 0 for key in ("uncovered_characters", "chunks_over_limit", "truncated_chunks", "blocks_with_coverage_gaps")}
+                if not all(required_chunk_conditions.values()):
+                    raise NativePreMvpError(f"Chunk audit failed: {required_chunk_conditions}")
+                store.commit()
+                store.conn.execute(
+                    "UPDATE native_build_audit SET audit_json=? WHERE id=1",
+                    (_json({"stage": "chunks_ready", "chunk_audit": chunk_audit, "contracts": contracts}),),
+                )
+                store.commit()
+            assert chunk_audit is not None
+            required_chunk_conditions = {key: chunk_audit.get(key, 0) == 0 for key in ("uncovered_characters", "chunks_over_limit", "truncated_chunks", "blocks_with_coverage_gaps")}
             if not all(required_chunk_conditions.values()):
                 raise NativePreMvpError(f"Chunk audit failed: {required_chunk_conditions}")
-            store.commit()
+            partial_embeddings = store.remove_partial_embeddings()
             dense_space = _chunked_space(dense.embedding_space_id, policy.id)
             sparse_space = _chunked_space(sparse.embedding_space_id, policy.id)
             joint_started = time.perf_counter()
-            dense_processed = 0
-            sparse_processed = 0
+            complete_before = int(store.conn.execute(
+                "SELECT COUNT(*) FROM retrieval_chunks rc "
+                "WHERE rc.chunk_policy_id=? AND EXISTS (SELECT 1 FROM dense_native_metadata d WHERE d.chunk_id=rc.id) "
+                "AND EXISTS (SELECT 1 FROM sparse_vector_metadata s WHERE s.chunk_id=rc.id)", (policy.id,)
+            ).fetchone()[0])
+            dense_processed = complete_before
+            sparse_processed = complete_before
             real_tokens = 0
             padded_tokens = 0
             total_chunks = chunk_audit["total_retrieval_chunks"]
             if progress:
                 print("[6/7] Building dense+sparse search index", file=sys.stderr, flush=True)
-            with tqdm(total=total_chunks, desc="Building dense+sparse index", unit="chunk", file=sys.stderr,
+            with tqdm(total=total_chunks, initial=complete_before, desc="Building dense+sparse index", unit="chunk", file=sys.stderr,
                       dynamic_ncols=True, disable=not progress) as bar:
-                for rows in store.embedding_batches_by_length(policy_id=policy.id, batch_size=batch_size):
+                for rows in store.embedding_batches_by_length(policy_id=policy.id, batch_size=batch_size, missing_only=resume):
+                    batch_len = len(rows)
                     texts = [str(row["text"]) for row in rows]
                     for row, text in zip(rows, texts, strict=True):
                         dense.assert_fits(text, chunk_id=str(row["id"]), block_id=str(row["block_id"]), source_identity=str(row["block_id"]))
@@ -575,16 +658,24 @@ def build_native_pre_mvp_db(
                     store.write_dense_batch(rows=rows, vectors=dense_vectors, model=dense.model_name, space=dense_space)
                     store.write_sparse_batch(rows=rows, vectors=sparse_vectors, model=sparse.model_name, space=sparse_space)
                     store.commit()
-                    dense_processed += len(rows)
-                    sparse_processed += len(rows)
+                    store.conn.execute(
+                        "UPDATE native_build_audit SET audit_json=? WHERE id=1",
+                        (_json({"stage": "embedding", "processed": dense_processed + batch_len,
+                                "total_chunks": total_chunks, "chunk_audit": chunk_audit, "contracts": contracts}),),
+                    )
+                    store.commit()
+                    dense_processed += batch_len
+                    sparse_processed += batch_len
+                    bar.update(batch_len)
                     del dense_vectors, sparse_vectors, texts, rows
                     if dense_processed % (batch_size * 25) == 0:
                         _release_batch_memory()
-                    bar.update(len(rows))
             joint_seconds = time.perf_counter() - joint_started
             _release_batch_memory()
             embedding_metrics = {
                 "chunks": chunk_audit["total_retrieval_chunks"],
+                "reused": complete_before,
+                "partial_embeddings_removed": partial_embeddings,
                 "dense": {"processed": dense_processed, "seconds": joint_seconds,
                           "throughput": dense_processed / joint_seconds if joint_seconds else 0.0,
                           "device": dense.runtime_metadata.get("device"), "shared_joint_pass": True},
