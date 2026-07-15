@@ -85,9 +85,11 @@ uv sync --extra nlp
 
 This installs optional dependencies used only when the NLP mode is explicitly enabled in config.
 
-### Knowledge base dependencies
+### PTHA runtime dependencies
 
-Sentence Transformers support is installed by default because the published `kb-index`, `kb-search`, and `kb-mcp` console scripts use local dense and sparse embedding providers.
+On Apple Silicon, PTHA uses MLX with the pinned FP16 BGE-M3 artifact for local
+dense and sparse retrieval. PyTorch and SentenceTransformers are not required
+for the normal PTHA import, service, or MCP path.
 
 Future extension: Sentence Transformers also supports multimodal models. A later knowledge-base phase can add image or visual attachment indexing for screenshots, diagrams, and rendered pages while preserving `attachment_id`, page, slide, and source-file traceability. This is intentionally outside the text-first MVP and should not be mixed into the current text vector policy without an explicit scoring contract.
 
@@ -114,6 +116,26 @@ Reinstall from GitHub:
 ```bash
 uv tool install --reinstall git+https://github.com/anfedoro/gpt_export_distillation
 ```
+
+## PTHA local archive and MCP quick start
+
+PTHA imports a ChatGPT export into a local SQLite archive, runs retrieval in a
+local background service, and exposes two read-only MCP tools:
+`search_archive` and `construct_archive_context`.
+
+```bash
+ptha init
+time ptha import /path/to/chatgpt-export.zip
+ptha service start
+ptha mcp config --absolute
+```
+
+The MCP client starts `ptha mcp serve`; it requires the retrieval service to be
+running first. Large personal archives typically need roughly 20–50 minutes
+after the model is cached; the import prints `joint_processed` progress while
+it writes dense and sparse indexes. See [PTHA first run](docs/first-run.md) for
+the complete copy-paste path, custom database placement, CLI validation, LM
+Studio setup, service shutdown, and common errors.
 
 ## Quick start
 

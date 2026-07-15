@@ -57,6 +57,16 @@ class PthaShellTests(unittest.TestCase):
             self.assertEqual(payload["schema_version"], 1)
             self.assertEqual(payload["database"]["state"], "missing")
 
+    def test_mcp_absolute_config_uses_selected_config_and_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as root, patch("sys.stdout") as stdout:
+            config = Path(root) / "config.toml"
+            with patch("ptha.cli.shutil.which", return_value="/opt/ptha/bin/ptha"):
+                self.assertEqual(main(["--config", str(config), "mcp", "config", "--absolute"]), 0)
+            payload = json.loads("".join(call.args[0] + "\n" for call in stdout.write.call_args_list))
+            server = payload["mcpServers"]["ptha"]
+            self.assertEqual(server["command"], "/opt/ptha/bin/ptha")
+            self.assertEqual(server["args"], ["--config", str(config.resolve()), "mcp", "serve"])
+
     def test_import_refuses_to_replace_active_database(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             root_path = Path(root)

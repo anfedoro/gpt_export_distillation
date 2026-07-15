@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import traceback
 from pathlib import Path
@@ -74,7 +75,9 @@ def build_parser() -> argparse.ArgumentParser:
     mcp = commands.add_parser("mcp", help="Run or configure the stdio MCP adapter.")
     mcp_commands = mcp.add_subparsers(dest="mcp_command", required=True)
     mcp_commands.add_parser("serve", help="Run the lightweight stdio MCP adapter.")
-    mcp_commands.add_parser("config", help="Print generic MCP configuration.")
+    mcp_config = mcp_commands.add_parser("config", help="Print MCP configuration.")
+    mcp_config.add_argument("--absolute", action="store_true",
+                            help="Print a complete configuration with this executable and config path.")
     return parser
 
 
@@ -159,7 +162,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             serve_stdio(config)
             return 0
         if args.command == "mcp" and args.mcp_command == "config":
-            print(json.dumps({"command": "ptha", "args": ["mcp", "serve"]}, indent=2))
+            if args.absolute:
+                executable = shutil.which("ptha") or sys.argv[0]
+                config_file = str(config.config_file.expanduser().resolve())
+                print(json.dumps({"mcpServers": {"ptha": {
+                    "command": str(Path(executable).expanduser().resolve()),
+                    "args": ["--config", config_file, "mcp", "serve"],
+                }}}, indent=2))
+            else:
+                print(json.dumps({"command": "ptha", "args": ["mcp", "serve"]}, indent=2))
             return 0
         raise PthaError("Command is not implemented.")
     except PthaError as exc:

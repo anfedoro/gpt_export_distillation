@@ -104,7 +104,7 @@ def _import_archive(
             sparse_top_k=config.sparse_top_k,
             batch_size=config.batch_size,
             skip_low_interest=not include_low_interest,
-            progress=False,
+            progress=progress is not None,
         )
         with closing(sqlite3.connect(staging)) as conn:
             conn.execute("UPDATE native_build_audit SET export_path=? WHERE id=1", (source.name,))
