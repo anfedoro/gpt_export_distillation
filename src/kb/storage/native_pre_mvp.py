@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -8,10 +9,11 @@ import sqlite3
 import struct
 import sys
 import time
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 import numpy as np
 from tqdm import tqdm
@@ -205,6 +207,26 @@ class NativeBuildStore:
     def commit(self) -> None:
         self.conn.commit()
 
+    @contextmanager
+    def embedding_batch_transaction(self) -> Iterator[None]:
+        """Commit one complete dense+sparse representation batch atomically."""
+        if self.conn.in_transaction:
+            raise NativePreMvpError("Cannot begin an embedding batch inside another SQLite transaction.")
+        term_ids = dict(self._term_ids)
+        dense_rowid = self._dense_rowid
+        sparse_rowid = self._sparse_rowid
+        self.conn.execute("BEGIN")
+        try:
+            yield
+        except BaseException:
+            self.conn.rollback()
+            self._term_ids = term_ids
+            self._dense_rowid = dense_rowid
+            self._sparse_rowid = sparse_rowid
+            raise
+        else:
+            self.conn.commit()
+
     def insert_source_document(self, root: Path, item: Any) -> str:
         source_id = stable_id(item.relative_path, item.sha256, prefix="src")
         self.conn.execute(
@@ -376,65 +398,68 @@ class NativeBuildStore:
             self.conn.commit()
         return len(rows)
 
+    def partial_embedding_counts(self) -> dict[str, int]:
+        row = self.conn.execute(
+            "SELECT "
+            "SUM(CASE WHEN d.chunk_id IS NOT NULL AND s.chunk_id IS NULL THEN 1 ELSE 0 END) AS dense_only,"
+            "SUM(CASE WHEN d.chunk_id IS NULL AND s.chunk_id IS NOT NULL THEN 1 ELSE 0 END) AS sparse_only "
+            "FROM retrieval_chunks rc "
+            "LEFT JOIN dense_native_metadata d ON d.chunk_id=rc.id "
+            "LEFT JOIN sparse_vector_metadata s ON s.chunk_id=rc.id"
+        ).fetchone()
+        dense_only = int(row["dense_only"] or 0)
+        sparse_only = int(row["sparse_only"] or 0)
+        return {"dense_only": dense_only, "sparse_only": sparse_only, "total": dense_only + sparse_only}
+
     def write_embedding_batch(
         self, *, rows: list[sqlite3.Row], dense_vectors: list[list[float]], sparse_vectors: list[dict[str, float]],
         dense_model: str, dense_space: str, sparse_model: str, sparse_space: str,
     ) -> None:
-        now = datetime.now(UTC).isoformat()
-        for row, dense, sparse in zip(rows, dense_vectors, sparse_vectors, strict=True):
-            chunk_id = str(row["id"])
-            if len(dense) != 1024 or not all(math.isfinite(float(value)) for value in dense):
-                raise NativePreMvpError(f"Non-finite or invalid dense vector chunk_id={chunk_id} block_id={row['block_id']}.")
-            self._dense_rowid += 1
-            self.conn.execute(
-                "INSERT INTO dense_native_metadata(rowid,chunk_id,model_name,embedding_space_id,dim,dtype,created_at) VALUES(?,?,?,?,?,?,?)",
-                (self._dense_rowid, chunk_id, dense_model, dense_space, 1024, NATIVE_DTYPE, now),
-            )
-            self.conn.execute("INSERT INTO dense_vectors_native(rowid,embedding) VALUES(?,?)", (self._dense_rowid, serialize_float32(dense)))
-            pairs: list[tuple[int, float]] = []
-            for token, weight in sorted(sparse.items()):
-                numeric = self._term_ids.get(token)
-                if numeric is None:
-                    numeric = len(self._term_ids) + 1
-                    self._term_ids[token] = numeric
-                    self.conn.execute("INSERT INTO sparse_vocabulary(term_id,token_text) VALUES(?,?)", (numeric, token))
-                pairs.append((numeric, float(weight)))
-            if not pairs or not all(math.isfinite(weight) for _, weight in pairs):
-                raise NativePreMvpError(f"Invalid sparse vector chunk_id={chunk_id} block_id={row['block_id']}.")
-            norm = math.sqrt(sum(weight * weight for _, weight in pairs))
-            if not math.isfinite(norm) or norm == 0:
-                raise NativePreMvpError(f"Invalid sparse norm chunk_id={chunk_id} block_id={row['block_id']}.")
-            self._sparse_rowid += 1
-            self.conn.execute(
-                "INSERT INTO sparse_vector_metadata(rowid,chunk_id,model_name,embedding_space_id,term_count,norm,dtype,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (self._sparse_rowid, chunk_id, sparse_model, sparse_space, len(pairs), norm, "uint32-float32-le", now),
-            )
-            self.conn.execute(
-                "INSERT INTO sparse_vectors_compact(rowid,indices_blob,weights_blob) VALUES(?,?,?)",
-                (self._sparse_rowid, _pack_uint32(term for term, _ in pairs), _pack_float32(weight for _, weight in pairs)),
-            )
+        self.write_dense_batch(rows=rows, vectors=dense_vectors, model=dense_model, space=dense_space)
+        self.write_sparse_batch(rows=rows, vectors=sparse_vectors, model=sparse_model, space=sparse_space)
 
     def write_dense_batch(
         self, *, rows: list[sqlite3.Row], vectors: list[list[float]], model: str, space: str,
     ) -> None:
+        rowids = self.write_dense_metadata_batch(rows=rows, vectors=vectors, model=model, space=space)
+        self.write_dense_vector_payloads(rowids=rowids, vectors=vectors)
+
+    def write_dense_metadata_batch(
+        self, *, rows: list[sqlite3.Row], vectors: list[list[float]], model: str, space: str,
+    ) -> list[int]:
         now = datetime.now(UTC).isoformat()
+        rowids: list[int] = []
         for row, vector in zip(rows, vectors, strict=True):
             chunk_id = str(row["id"])
             if len(vector) != 1024 or not all(math.isfinite(float(value)) for value in vector):
                 raise NativePreMvpError(f"Non-finite or invalid dense vector chunk_id={chunk_id} block_id={row['block_id']}.")
             self._dense_rowid += 1
+            rowids.append(self._dense_rowid)
             self.conn.execute(
                 "INSERT INTO dense_native_metadata(rowid,chunk_id,model_name,embedding_space_id,dim,dtype,created_at) VALUES(?,?,?,?,?,?,?)",
                 (self._dense_rowid, chunk_id, model, space, 1024, NATIVE_DTYPE, now),
             )
-            self.conn.execute("INSERT INTO dense_vectors_native(rowid,embedding) VALUES(?,?)", (self._dense_rowid, serialize_float32(vector)))
+        return rowids
+
+    def write_dense_vector_payloads(self, *, rowids: list[int], vectors: list[list[float]]) -> None:
+        for rowid, vector in zip(rowids, vectors, strict=True):
+            self.conn.execute("INSERT INTO dense_vectors_native(rowid,embedding) VALUES(?,?)", (rowid, serialize_float32(vector)))
 
     def write_sparse_batch(
         self, *, rows: list[sqlite3.Row], vectors: list[dict[str, float]], model: str, space: str,
     ) -> None:
-        now = datetime.now(UTC).isoformat()
+        pairs = self.prepare_sparse_vocabulary(rows=rows, vectors=vectors)
+        rowids = self.write_sparse_metadata_batch(rows=rows, pairs=pairs, model=model, space=space)
+        self.write_sparse_compact_payloads(rowids=rowids, pairs=pairs)
+
+    def prepare_sparse_vocabulary(
+        self, *, rows: list[sqlite3.Row], vectors: list[dict[str, float]],
+    ) -> list[list[tuple[int, float]]]:
+        prepared: list[list[tuple[int, float]]] = []
         for row, vector in zip(rows, vectors, strict=True):
             chunk_id = str(row["id"])
+            if not vector or not all(math.isfinite(float(weight)) for weight in vector.values()):
+                raise NativePreMvpError(f"Invalid sparse vector chunk_id={chunk_id} block_id={row['block_id']}.")
             pairs: list[tuple[int, float]] = []
             for token, weight in sorted(vector.items()):
                 numeric = self._term_ids.get(token)
@@ -443,20 +468,56 @@ class NativeBuildStore:
                     self._term_ids[token] = numeric
                     self.conn.execute("INSERT INTO sparse_vocabulary(term_id,token_text) VALUES(?,?)", (numeric, token))
                 pairs.append((numeric, float(weight)))
-            if not pairs or not all(math.isfinite(weight) for _, weight in pairs):
+            prepared.append(pairs)
+        return prepared
+
+    def write_sparse_metadata_batch(
+        self, *, rows: list[sqlite3.Row], pairs: list[list[tuple[int, float]]], model: str, space: str,
+    ) -> list[int]:
+        now = datetime.now(UTC).isoformat()
+        rowids: list[int] = []
+        for row, vector_pairs in zip(rows, pairs, strict=True):
+            chunk_id = str(row["id"])
+            if not vector_pairs or not all(math.isfinite(weight) for _, weight in vector_pairs):
                 raise NativePreMvpError(f"Invalid sparse vector chunk_id={chunk_id} block_id={row['block_id']}.")
-            norm = math.sqrt(sum(weight * weight for _, weight in pairs))
+            norm = math.sqrt(sum(weight * weight for _, weight in vector_pairs))
             if not math.isfinite(norm) or norm == 0:
                 raise NativePreMvpError(f"Invalid sparse norm chunk_id={chunk_id} block_id={row['block_id']}.")
             self._sparse_rowid += 1
+            rowids.append(self._sparse_rowid)
             self.conn.execute(
                 "INSERT INTO sparse_vector_metadata(rowid,chunk_id,model_name,embedding_space_id,term_count,norm,dtype,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (self._sparse_rowid, chunk_id, model, space, len(pairs), norm, "uint32-float32-le", now),
+                (self._sparse_rowid, chunk_id, model, space, len(vector_pairs), norm, "uint32-float32-le", now),
             )
+        return rowids
+
+    def write_sparse_compact_payloads(self, *, rowids: list[int], pairs: list[list[tuple[int, float]]]) -> None:
+        for rowid, vector_pairs in zip(rowids, pairs, strict=True):
             self.conn.execute(
                 "INSERT INTO sparse_vectors_compact(rowid,indices_blob,weights_blob) VALUES(?,?,?)",
-                (self._sparse_rowid, _pack_uint32(term for term, _ in pairs), _pack_float32(weight for _, weight in pairs)),
+                (rowid, _pack_uint32(term for term, _ in vector_pairs), _pack_float32(weight for _, weight in vector_pairs)),
             )
+
+    def update_embedding_batch_audit(
+        self, audit: dict[str, Any], *, processed_count: int, complete_pair_count: int,
+        total_chunks: int, batch_id: str, updated_at: str,
+    ) -> dict[str, Any]:
+        payload = dict(audit)
+        payload.update({
+            "stage": "embedding",
+            "status": "running",
+            "processed": processed_count,
+            "processed_count": processed_count,
+            "complete_pair_count": complete_pair_count,
+            "total_chunks": total_chunks,
+            "last_committed_batch_id": batch_id,
+            "updated_at": updated_at,
+        })
+        self.conn.execute(
+            "UPDATE native_build_audit SET status='running',audit_json=? WHERE id=1",
+            (_json(payload),),
+        )
+        return payload
 
     def audit(self) -> dict[str, Any]:
         counts = {table: int(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in CANONICAL_TABLES}
@@ -484,6 +545,34 @@ class NativeBuildStore:
         }
 
 
+def _run_batch_fault_injector(injector: Callable[[str], None] | None, boundary: str) -> None:
+    if injector is not None:
+        injector(boundary)
+
+
+def _embedding_batch_id(
+    *, dense_model: str, dense_space: str, sparse_model: str, sparse_space: str,
+    chunk_policy_id: str, rows: list[sqlite3.Row],
+) -> str:
+    if not rows:
+        raise NativePreMvpError("Cannot create an embedding batch ID for an empty batch.")
+    contract = _json({
+        "dense_model": dense_model,
+        "dense_space": dense_space,
+        "sparse_model": sparse_model,
+        "sparse_space": sparse_space,
+        "chunk_policy_id": chunk_policy_id,
+    })
+    contract_fingerprint = hashlib.sha256(contract.encode("utf-8")).hexdigest()
+    material = _json({
+        "contract_fingerprint": contract_fingerprint,
+        "first_chunk_id": str(rows[0]["id"]),
+        "last_chunk_id": str(rows[-1]["id"]),
+        "chunk_count": len(rows),
+    })
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
 def build_native_pre_mvp_db(
     *, export_path: Path, output_db: Path, dense_model: str = "anfedoro/bge-m3-mlx-fp16",
     sparse_model: str = "anfedoro/bge-m3-mlx-fp16", model_revision: str = "58e70901dbba8de8f3df91b5a313bcefcb151bae",
@@ -497,6 +586,7 @@ def build_native_pre_mvp_db(
     dense_device: str | None = None, sparse_device: str | None = None,
     dense_torch_dtype: str | None = None, sparse_torch_dtype: str | None = None,
     resume: bool = False,
+    batch_fault_injector: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Parse a raw export and create a clean DB without opening any legacy DB."""
     if output_db.exists():
@@ -546,6 +636,7 @@ def build_native_pre_mvp_db(
         with NativeBuildStore(building_db, create_schema=not resume) as store:
             previous_audit: dict[str, Any] = {}
             chunk_audit: dict[str, Any] | None = None
+            embedding_audit: dict[str, Any] = {}
             if resume:
                 row = store.conn.execute("SELECT contracts_json,audit_json,status FROM native_build_audit WHERE id=1").fetchone()
                 if row is None:
@@ -577,6 +668,7 @@ def build_native_pre_mvp_db(
                 scanned = int(store.conn.execute("SELECT COUNT(*) FROM source_documents").fetchone()[0])
                 parsed = int(store.conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0])
                 failed = 0
+                embedding_audit = previous_audit
             else:
                 store.conn.execute(
                     "INSERT INTO native_build_audit(id,schema_version,export_path,status,started_at,contracts_json) VALUES(1,?,?,?,?,?)",
@@ -623,11 +715,21 @@ def build_native_pre_mvp_db(
                     (_json({"stage": "chunks_ready", "chunk_audit": chunk_audit, "contracts": contracts}),),
                 )
                 store.commit()
+                embedding_audit = {"stage": "chunks_ready", "chunk_audit": chunk_audit, "contracts": contracts}
             assert chunk_audit is not None
             required_chunk_conditions = {key: chunk_audit.get(key, 0) == 0 for key in ("uncovered_characters", "chunks_over_limit", "truncated_chunks", "blocks_with_coverage_gaps")}
             if not all(required_chunk_conditions.values()):
                 raise NativePreMvpError(f"Chunk audit failed: {required_chunk_conditions}")
+            partial_embedding_counts = store.partial_embedding_counts()
             partial_embeddings = store.remove_partial_embeddings()
+            if partial_embeddings != partial_embedding_counts["total"]:
+                raise NativePreMvpError("Partial embedding repair count changed unexpectedly.")
+            embedding_audit = {
+                **embedding_audit,
+                "partial_pairs_repaired": partial_embeddings,
+                "dense_only_pairs_repaired": partial_embedding_counts["dense_only"],
+                "sparse_only_pairs_repaired": partial_embedding_counts["sparse_only"],
+            }
             dense_space = _chunked_space(dense.embedding_space_id, policy.id)
             sparse_space = _chunked_space(sparse.embedding_space_id, policy.id)
             joint_started = time.perf_counter()
@@ -643,6 +745,11 @@ def build_native_pre_mvp_db(
             total_chunks = chunk_audit["total_retrieval_chunks"]
             if progress:
                 print("[6/7] Building dense+sparse search index", file=sys.stderr, flush=True)
+                if resume:
+                    print(f"[resume] Reusing completed dense+sparse pairs: {complete_before:,} / {total_chunks:,}",
+                          file=sys.stderr, flush=True)
+                    print(f"[resume] Remaining chunks: {total_chunks - complete_before:,}", file=sys.stderr, flush=True)
+                    print(f"[resume] Partial pairs repaired: {partial_embeddings:,}", file=sys.stderr, flush=True)
             with tqdm(total=total_chunks, initial=complete_before, desc="Building dense+sparse index", unit="chunk", file=sys.stderr,
                       dynamic_ncols=True, disable=not progress) as bar:
                 for rows in store.embedding_batches_by_length(policy_id=policy.id, batch_size=batch_size, missing_only=resume):
@@ -655,15 +762,38 @@ def build_native_pre_mvp_db(
                     batch_metrics = getattr(getattr(dense, "backend", None), "last_batch_metrics", {})
                     real_tokens += int(batch_metrics.get("real_tokens", 0))
                     padded_tokens += int(batch_metrics.get("padded_tokens", 0))
-                    store.write_dense_batch(rows=rows, vectors=dense_vectors, model=dense.model_name, space=dense_space)
-                    store.write_sparse_batch(rows=rows, vectors=sparse_vectors, model=sparse.model_name, space=sparse_space)
-                    store.commit()
-                    store.conn.execute(
-                        "UPDATE native_build_audit SET audit_json=? WHERE id=1",
-                        (_json({"stage": "embedding", "processed": dense_processed + batch_len,
-                                "total_chunks": total_chunks, "chunk_audit": chunk_audit, "contracts": contracts}),),
+                    _run_batch_fault_injector(batch_fault_injector, "before_batch_begin")
+                    batch_id = _embedding_batch_id(
+                        dense_model=dense.model_name, dense_space=dense_space,
+                        sparse_model=sparse.model_name, sparse_space=sparse_space,
+                        chunk_policy_id=policy.id, rows=rows,
                     )
-                    store.commit()
+                    with store.embedding_batch_transaction():
+                        sparse_pairs = store.prepare_sparse_vocabulary(rows=rows, vectors=sparse_vectors)
+                        _run_batch_fault_injector(batch_fault_injector, "after_sparse_vocabulary")
+                        dense_rowids = store.write_dense_metadata_batch(
+                            rows=rows, vectors=dense_vectors, model=dense.model_name, space=dense_space,
+                        )
+                        _run_batch_fault_injector(batch_fault_injector, "after_dense_metadata")
+                        store.write_dense_vector_payloads(rowids=dense_rowids, vectors=dense_vectors)
+                        _run_batch_fault_injector(batch_fault_injector, "after_dense_vector")
+                        sparse_rowids = store.write_sparse_metadata_batch(
+                            rows=rows, pairs=sparse_pairs, model=sparse.model_name, space=sparse_space,
+                        )
+                        _run_batch_fault_injector(batch_fault_injector, "after_sparse_metadata")
+                        store.write_sparse_compact_payloads(rowids=sparse_rowids, pairs=sparse_pairs)
+                        _run_batch_fault_injector(batch_fault_injector, "after_sparse_payload")
+                        _run_batch_fault_injector(batch_fault_injector, "before_audit_update")
+                        embedding_audit = store.update_embedding_batch_audit(
+                            embedding_audit,
+                            processed_count=dense_processed + batch_len,
+                            complete_pair_count=dense_processed + batch_len,
+                            total_chunks=total_chunks,
+                            batch_id=batch_id,
+                            updated_at=datetime.now(UTC).isoformat(),
+                        )
+                        _run_batch_fault_injector(batch_fault_injector, "after_audit_update_before_commit")
+                    _run_batch_fault_injector(batch_fault_injector, "after_commit")
                     dense_processed += batch_len
                     sparse_processed += batch_len
                     bar.update(batch_len)
@@ -696,6 +826,13 @@ def build_native_pre_mvp_db(
                           "scanned_source_documents": scanned, "parsed_chats": parsed, "failed_chats": failed,
                           "chunk_audit": chunk_audit, "embedding_build": embedding_metrics,
                           "contracts": {**contracts, "dense_embedding_space_id": dense_space, "sparse_embedding_space_id": sparse_space},
+                          "processed": dense_processed, "processed_count": dense_processed,
+                          "complete_pair_count": dense_processed,
+                          "last_committed_batch_id": embedding_audit.get("last_committed_batch_id"),
+                          "partial_pairs_repaired": embedding_audit.get("partial_pairs_repaired", 0),
+                          "dense_only_pairs_repaired": embedding_audit.get("dense_only_pairs_repaired", 0),
+                          "sparse_only_pairs_repaired": embedding_audit.get("sparse_only_pairs_repaired", 0),
+                          "updated_at": datetime.now(UTC).isoformat(),
                           "timing_ms": {"total": (time.perf_counter() - started) * 1000}})
             conditions = {
                 **required_chunk_conditions,
@@ -717,9 +854,10 @@ def build_native_pre_mvp_db(
         return audit
     except Exception:
         if building_db.exists():
-            with sqlite3.connect(building_db) as conn:
+            with closing(sqlite3.connect(building_db)) as conn:
                 if conn.execute("SELECT 1 FROM sqlite_master WHERE name='native_build_audit'").fetchone():
                     conn.execute("UPDATE native_build_audit SET status='failed',finished_at=? WHERE id=1", (datetime.now(UTC).isoformat(),))
+                    conn.commit()
         raise
 
 
