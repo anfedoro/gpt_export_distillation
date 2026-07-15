@@ -1,6 +1,6 @@
 [project]
 name = "ptha"
-version = "0.4.2"
+version = "0.4.3"
 description = "PTHA — Personal Thought Archive: local ChatGPT archive search and MCP server"
 readme = "README.md"
 authors = [
@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "blake3>=1.0.0,<2",
     "huggingface-hub>=1.0.0",
     "mlx>=0.31.1; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "mlx-embeddings @ git+https://github.com/anfedoro/mlx-embeddings.git@4a8277aa523eb34ff29a5a832fa3f3f654336b54; platform_system == 'Darwin' and platform_machine == 'arm64'",

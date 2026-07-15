@@ -22,7 +22,7 @@ from ptha.database import inspect_database
 from ptha.ipc import IPCError, request
 from ptha.lifecycle import service_status
 from ptha.operations import MaintenanceError, read_maintenance_state
-from kb.storage.native_pre_mvp import NATIVE_PRE_MVP_SCHEMA_VERSION
+from kb.storage.native_pre_mvp import NATIVE_PRE_MVP_SCHEMA_VERSION, SUPPORTED_NATIVE_SCHEMA_VERSIONS
 
 
 @dataclass(frozen=True)
@@ -98,8 +98,8 @@ def _database_checks(config: PthaConfig, database: dict[str, Any]) -> list[Check
     checks.append(_check("database.integrity", "pass" if database.get("integrity_check") == "ok" else "fail",
                          "SQLite integrity check passed." if database.get("integrity_check") == "ok" else "SQLite integrity check failed.",
                          {}, "Restore or re-import the database."))
-    checks.append(_check("database.schema_version", "pass" if database.get("schema_version") == NATIVE_PRE_MVP_SCHEMA_VERSION else "fail",
-                         "Database schema version is supported." if database.get("schema_version") == NATIVE_PRE_MVP_SCHEMA_VERSION else "Database schema version is unsupported.",
+    checks.append(_check("database.schema_version", "pass" if database.get("schema_version") in SUPPORTED_NATIVE_SCHEMA_VERSIONS else "fail",
+                         "Database schema version is supported." if database.get("schema_version") in SUPPORTED_NATIVE_SCHEMA_VERSIONS else "Database schema version is unsupported.",
                          {"schema_version": database.get("schema_version")}, "Re-import with the current PTHA version."))
     mode = config.database.stat().st_mode & 0o777
     checks.append(_check("database.permissions", "pass" if mode & 0o077 == 0 else "warn",
@@ -125,6 +125,17 @@ def _database_checks(config: PthaConfig, database: dict[str, Any]) -> list[Check
     checks.append(_check("database.chunk_policy", "pass" if database.get("chunk_policy") else "fail",
                          "Chunk policy metadata is present." if database.get("chunk_policy") else "Chunk policy metadata is missing.",
                          {"chunk_policy": database.get("chunk_policy")}, "Re-import or reindex the database."))
+    incremental = database.get("incremental_metadata", {})
+    generation = incremental.get("generation", {}) if isinstance(incremental, dict) else {}
+    checks.append(_check(
+        "database.incremental_metadata",
+        "pass" if isinstance(incremental, dict) and incremental.get("available") else "warn",
+        "Incremental identity and generation metadata are available."
+        if isinstance(incremental, dict) and incremental.get("available")
+        else "Incremental metadata is unavailable for this legacy generation.",
+        {"generation_id": generation.get("id")},
+        "New imports publish incremental metadata; this legacy database remains readable.",
+    ))
     try:
         uri = f"file:{config.database.resolve().as_posix()}?mode=ro"
         with closing(sqlite3.connect(uri, uri=True)) as conn:

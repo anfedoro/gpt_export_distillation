@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 import numpy as np
+from blake3 import blake3
 from tqdm import tqdm
 
 from kb.embeddings.bge_m3_provider import build_bge_m3_providers, embed_joint_documents
@@ -25,9 +26,26 @@ from kb.ingest.tree_walker import scan_tree
 from kb.model.entities import Block, Conversation, Message, ParsedChat
 from kb.model.ids import stable_id
 from kb.storage.dense_native import NATIVE_DTYPE, NativeDenseSearchBackend, load_sqlite_vec, serialize_float32
+from ptha.incremental import (
+    BLOCK_BUILDER_VERSION,
+    CANONICALIZER_VERSION,
+    CHUNKER_VERSION,
+    INCREMENTAL_METADATA_SCHEMA_VERSION,
+    block_identity,
+    chunk_content_hash,
+    chunk_derivation_fingerprint,
+    chunk_identity,
+    conversation_identity,
+    conversation_revision,
+    embedding_contract_fingerprint,
+    message_identity,
+    message_revision,
+    new_generation_id,
+)
 
 
-NATIVE_PRE_MVP_SCHEMA_VERSION = "kb.native_pre_mvp.v1"
+NATIVE_PRE_MVP_SCHEMA_VERSION = "kb.native_pre_mvp.v2"
+SUPPORTED_NATIVE_SCHEMA_VERSIONS = {"kb.native_pre_mvp.v1", NATIVE_PRE_MVP_SCHEMA_VERSION}
 CANONICAL_TABLES = ("source_documents", "conversations", "messages", "blocks", "retrieval_chunks")
 LEGACY_TABLES = (
     "dense_vectors", "sparse_terms", "knowledge_blocks", "semantic_nodes", "semantic_node_members",
@@ -150,14 +168,82 @@ def create_clean_native_schema(conn: sqlite3.Connection, *, dimension: int = 102
             status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, contracts_json TEXT NOT NULL,
             audit_json TEXT NOT NULL DEFAULT '{}'
         );
+        CREATE TABLE source_entity_identities (
+            id TEXT PRIMARY KEY,
+            entity_type TEXT NOT NULL CHECK(entity_type IN ('conversation','message')),
+            source_type TEXT NOT NULL,
+            external_id TEXT NOT NULL,
+            identity_method TEXT NOT NULL,
+            identity_version TEXT NOT NULL,
+            UNIQUE(entity_type, source_type, external_id, identity_method, identity_version)
+        );
+        CREATE TABLE source_entity_revisions (
+            id TEXT PRIMARY KEY,
+            source_identity_id TEXT NOT NULL REFERENCES source_entity_identities(id) ON DELETE RESTRICT,
+            canonical_hash TEXT NOT NULL,
+            canonicalizer_version TEXT NOT NULL,
+            UNIQUE(source_identity_id, canonical_hash, canonicalizer_version)
+        );
+        CREATE TABLE conversation_source_lineage (
+            conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+            source_identity_id TEXT NOT NULL REFERENCES source_entity_identities(id) ON DELETE RESTRICT,
+            source_revision_id TEXT NOT NULL REFERENCES source_entity_revisions(id) ON DELETE RESTRICT
+        );
+        CREATE TABLE message_source_lineage (
+            message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+            source_identity_id TEXT NOT NULL REFERENCES source_entity_identities(id) ON DELETE RESTRICT,
+            source_revision_id TEXT NOT NULL REFERENCES source_entity_revisions(id) ON DELETE RESTRICT,
+            conversation_source_identity_id TEXT NOT NULL REFERENCES source_entity_identities(id) ON DELETE RESTRICT,
+            conversation_source_revision_id TEXT NOT NULL REFERENCES source_entity_revisions(id) ON DELETE RESTRICT
+        );
+        CREATE TABLE block_source_lineage (
+            block_id TEXT PRIMARY KEY REFERENCES blocks(id) ON DELETE CASCADE,
+            source_revision_id TEXT NOT NULL REFERENCES source_entity_revisions(id) ON DELETE RESTRICT,
+            block_identity TEXT NOT NULL UNIQUE,
+            block_builder_version TEXT NOT NULL
+        );
+        CREATE TABLE chunk_incremental_metadata (
+            chunk_id TEXT PRIMARY KEY REFERENCES retrieval_chunks(id) ON DELETE CASCADE,
+            source_revision_id TEXT NOT NULL REFERENCES source_entity_revisions(id) ON DELETE RESTRICT,
+            block_identity TEXT NOT NULL,
+            chunk_identity TEXT NOT NULL UNIQUE,
+            chunk_content_hash TEXT NOT NULL,
+            chunk_derivation_fingerprint TEXT NOT NULL,
+            chunker_version TEXT NOT NULL,
+            chunk_policy_id TEXT NOT NULL
+        );
+        CREATE TABLE generation_manifests (
+            generation_id TEXT PRIMARY KEY,
+            manifest_schema_version INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            database_schema_version TEXT NOT NULL,
+            canonicalizer_version TEXT NOT NULL,
+            block_builder_version TEXT NOT NULL,
+            chunker_version TEXT NOT NULL,
+            embedding_contract_fingerprint TEXT NOT NULL,
+            source_entity_count INTEGER NOT NULL,
+            source_revision_count INTEGER NOT NULL,
+            block_count INTEGER NOT NULL,
+            chunk_count INTEGER NOT NULL,
+            dense_count INTEGER NOT NULL,
+            sparse_count INTEGER NOT NULL,
+            database_content_fingerprint TEXT NOT NULL
+        );
+        CREATE TRIGGER generation_manifests_immutable_update
+            BEFORE UPDATE ON generation_manifests BEGIN SELECT RAISE(ABORT, 'generation manifests are immutable'); END;
+        CREATE TRIGGER generation_manifests_immutable_delete
+            BEFORE DELETE ON generation_manifests BEGIN SELECT RAISE(ABORT, 'generation manifests are immutable'); END;
         CREATE INDEX idx_messages_conversation ON messages(conversation_id, ordinal);
         CREATE INDEX idx_blocks_message ON blocks(message_id, ordinal);
         CREATE INDEX idx_retrieval_chunks_block ON retrieval_chunks(block_id, chunk_policy_id, ordinal);
         CREATE INDEX idx_dense_native_metadata_space ON dense_native_metadata(model_name, embedding_space_id, chunk_id);
         CREATE INDEX idx_sparse_vector_metadata_space ON sparse_vector_metadata(model_name, embedding_space_id, chunk_id);
+        CREATE INDEX idx_source_entity_revisions_identity ON source_entity_revisions(source_identity_id, canonicalizer_version);
+        CREATE INDEX idx_chunk_incremental_content ON chunk_incremental_metadata(chunk_content_hash, chunk_derivation_fingerprint);
         """
     )
     conn.execute(f"CREATE VIRTUAL TABLE dense_vectors_native USING vec0(embedding float[{dimension}] distance_metric=cosine)")
+    conn.execute("PRAGMA user_version = 2")
 
 
 class NativeBuildStore:
@@ -184,6 +270,8 @@ class NativeBuildStore:
 
     def reset_derived(self) -> None:
         """Delete only reproducible retrieval structures from an existing clean DB."""
+        if self.incremental_metadata_available():
+            self.conn.execute("DELETE FROM chunk_incremental_metadata")
         self.conn.execute("DELETE FROM dense_vectors_native")
         self.conn.execute("DELETE FROM dense_native_metadata")
         self.conn.execute("DELETE FROM sparse_vectors_compact")
@@ -194,6 +282,14 @@ class NativeBuildStore:
         self._term_ids.clear()
         self._dense_rowid = 0
         self._sparse_rowid = 0
+
+    def incremental_metadata_available(self) -> bool:
+        required = {
+            "source_entity_identities", "source_entity_revisions", "conversation_source_lineage",
+            "message_source_lineage", "block_source_lineage", "chunk_incremental_metadata", "generation_manifests",
+        }
+        names = {str(row[0]) for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        return required <= names
 
     def close(self) -> None:
         self.conn.close()
@@ -244,6 +340,51 @@ class NativeBuildStore:
             self._insert_message(message)
         for block in parsed.blocks:
             self._insert_block(block)
+        if self.incremental_metadata_available():
+            self._record_incremental_lineage(parsed)
+
+    def _record_incremental_lineage(self, parsed: ParsedChat) -> None:
+        conversation_source_identity = conversation_identity(parsed.conversation)
+        conversation_source_revision = conversation_revision(parsed.conversation, identity=conversation_source_identity)
+        self._upsert_source_identity(conversation_source_identity)
+        self._upsert_source_revision(conversation_source_revision)
+        self.conn.execute(
+            "INSERT INTO conversation_source_lineage(conversation_id,source_identity_id,source_revision_id) VALUES(?,?,?)",
+            (parsed.conversation.id, conversation_source_identity.id, conversation_source_revision.id),
+        )
+        message_revisions: dict[str, str] = {}
+        for message in parsed.messages:
+            identity = message_identity(message, conversation_identity_id=conversation_source_identity.id)
+            revision = message_revision(message, identity=identity)
+            self._upsert_source_identity(identity)
+            self._upsert_source_revision(revision)
+            self.conn.execute(
+                "INSERT INTO message_source_lineage("
+                "message_id,source_identity_id,source_revision_id,conversation_source_identity_id,conversation_source_revision_id) "
+                "VALUES(?,?,?,?,?)",
+                (message.id, identity.id, revision.id, conversation_source_identity.id, conversation_source_revision.id),
+            )
+            message_revisions[message.id] = revision.id
+        for block in parsed.blocks:
+            source_revision_id = message_revisions[block.message_id]
+            self.conn.execute(
+                "INSERT INTO block_source_lineage(block_id,source_revision_id,block_identity,block_builder_version) VALUES(?,?,?,?)",
+                (block.id, source_revision_id, block_identity(block, message_revision_id=source_revision_id), BLOCK_BUILDER_VERSION),
+            )
+
+    def _upsert_source_identity(self, identity: Any) -> None:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO source_entity_identities(id,entity_type,source_type,external_id,identity_method,identity_version) "
+            "VALUES(?,?,?,?,?,?)",
+            (identity.id, identity.entity_type, identity.source_type, identity.external_id,
+             identity.identity_method, identity.identity_version),
+        )
+
+    def _upsert_source_revision(self, revision: Any) -> None:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO source_entity_revisions(id,source_identity_id,canonical_hash,canonicalizer_version) VALUES(?,?,?,?)",
+            (revision.id, revision.source_identity_id, revision.canonical_hash, revision.canonicalizer_version),
+        )
 
     def _insert_conversation(self, item: Conversation) -> None:
         self.conn.execute(
@@ -285,6 +426,31 @@ class NativeBuildStore:
         blocks_with_coverage_gaps = chunks_with_overlap = overlap_token_count_total = 0
         chunks_split_on_natural_boundary = chunks_split_by_token_fallback = total_chunks = 0
         pending: list[tuple[str, str, int, int, int, int, str, str, str]] = []
+        pending_incremental: list[tuple[str, str, str, str, str, str, str, str]] = []
+        block_lineage: dict[str, tuple[str, str]] = {}
+        if self.incremental_metadata_available():
+            block_lineage = {
+                str(row["block_id"]): (str(row["source_revision_id"]), str(row["block_identity"]))
+                for row in self.conn.execute("SELECT block_id,source_revision_id,block_identity FROM block_source_lineage")
+            }
+
+        def flush_pending() -> None:
+            if not pending:
+                return
+            self.conn.executemany(
+                "INSERT INTO retrieval_chunks(id,block_id,ordinal,source_char_start,source_char_end,token_count,text,chunk_policy_id,metadata_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?)", pending,
+            )
+            if pending_incremental:
+                self.conn.executemany(
+                    "INSERT INTO chunk_incremental_metadata("
+                    "chunk_id,source_revision_id,block_identity,chunk_identity,chunk_content_hash,"
+                    "chunk_derivation_fingerprint,chunker_version,chunk_policy_id) VALUES(?,?,?,?,?,?,?,?)",
+                    pending_incremental,
+                )
+            pending.clear()
+            pending_incremental.clear()
+
         with tqdm(total=total_blocks, desc="Building retrieval chunks", unit="block", file=sys.stderr,
                   dynamic_ncols=True, disable=not progress) as bar:
             for row in block_rows:
@@ -303,6 +469,30 @@ class NativeBuildStore:
                     pending.append((chunk.id, chunk.block_id, chunk.ordinal, chunk.source_char_start, chunk.source_char_end,
                                     chunk.token_count, chunk.text, chunk.chunk_policy_id,
                                     _json({"split_reason": chunk.split_reason, "overlap_token_count": chunk.overlap_token_count})))
+                    source_lineage = block_lineage.get(chunk.block_id)
+                    if source_lineage is not None:
+                        source_revision_id, stable_block_identity = source_lineage
+                        pending_incremental.append((
+                            chunk.id,
+                            source_revision_id,
+                            stable_block_identity,
+                            chunk_identity(
+                                source_revision_id=source_revision_id,
+                                block_identity_id=stable_block_identity,
+                                chunk_policy_id=chunk.chunk_policy_id,
+                                ordinal=chunk.ordinal,
+                                source_char_start=chunk.source_char_start,
+                                source_char_end=chunk.source_char_end,
+                            ),
+                            chunk_content_hash(chunk.text),
+                            chunk_derivation_fingerprint(
+                                source_revision_id=source_revision_id,
+                                block_identity_id=stable_block_identity,
+                                chunk_policy_id=chunk.chunk_policy_id,
+                            ),
+                            CHUNKER_VERSION,
+                            chunk.chunk_policy_id,
+                        ))
                     token_counts.append(chunk.token_count)
                     total_chunks += 1
                     chunks_with_overlap += int(chunk.overlap_token_count > 0)
@@ -310,14 +500,13 @@ class NativeBuildStore:
                     chunks_split_by_token_fallback += int(chunk.split_reason == "token_window_fallback")
                     chunks_split_on_natural_boundary += int(chunk.split_reason != "token_window_fallback")
                 if len(pending) >= 1024:
-                    self.conn.executemany("INSERT INTO retrieval_chunks(id,block_id,ordinal,source_char_start,source_char_end,token_count,text,chunk_policy_id,metadata_json) VALUES(?,?,?,?,?,?,?,?,?)", pending)
+                    flush_pending()
                     self.conn.commit()
-                    pending.clear()
                     bar.set_postfix(chunks=total_chunks)
                 bar.update(1)
             bar.set_postfix(chunks=total_chunks)
         if pending:
-            self.conn.executemany("INSERT INTO retrieval_chunks(id,block_id,ordinal,source_char_start,source_char_end,token_count,text,chunk_policy_id,metadata_json) VALUES(?,?,?,?,?,?,?,?,?)", pending)
+            flush_pending()
         values = np.asarray(token_counts, dtype=np.int64)
         return {
             "chunk_policy_id": policy.id, "chunk_policy_version": policy.version,
@@ -519,6 +708,68 @@ class NativeBuildStore:
         )
         return payload
 
+    def write_generation_manifest(self, *, embedding_contract_fingerprint: str) -> dict[str, Any] | None:
+        """Append an immutable manifest for this candidate before publication."""
+        if not self.incremental_metadata_available():
+            return None
+        counts = {
+            "source_entity_count": int(self.conn.execute("SELECT COUNT(*) FROM source_entity_identities").fetchone()[0]),
+            "source_revision_count": int(self.conn.execute("SELECT COUNT(*) FROM source_entity_revisions").fetchone()[0]),
+            "block_count": int(self.conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0]),
+            "chunk_count": int(self.conn.execute("SELECT COUNT(*) FROM retrieval_chunks").fetchone()[0]),
+            "dense_count": int(self.conn.execute("SELECT COUNT(*) FROM dense_native_metadata").fetchone()[0]),
+            "sparse_count": int(self.conn.execute("SELECT COUNT(*) FROM sparse_vector_metadata").fetchone()[0]),
+        }
+        manifest = {
+            "generation_id": new_generation_id(),
+            "manifest_schema_version": INCREMENTAL_METADATA_SCHEMA_VERSION,
+            "created_at": datetime.now(UTC).isoformat(),
+            "database_schema_version": NATIVE_PRE_MVP_SCHEMA_VERSION,
+            "canonicalizer_version": CANONICALIZER_VERSION,
+            "block_builder_version": BLOCK_BUILDER_VERSION,
+            "chunker_version": CHUNKER_VERSION,
+            "embedding_contract_fingerprint": embedding_contract_fingerprint,
+            **counts,
+            "database_content_fingerprint": self._database_content_fingerprint(
+                embedding_contract_fingerprint=embedding_contract_fingerprint,
+                counts=counts,
+            ),
+        }
+        self.conn.execute(
+            "INSERT INTO generation_manifests("
+            "generation_id,manifest_schema_version,created_at,database_schema_version,canonicalizer_version,"
+            "block_builder_version,chunker_version,embedding_contract_fingerprint,source_entity_count,"
+            "source_revision_count,block_count,chunk_count,dense_count,sparse_count,database_content_fingerprint) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            tuple(manifest[key] for key in (
+                "generation_id", "manifest_schema_version", "created_at", "database_schema_version",
+                "canonicalizer_version", "block_builder_version", "chunker_version", "embedding_contract_fingerprint",
+                "source_entity_count", "source_revision_count", "block_count", "chunk_count", "dense_count",
+                "sparse_count", "database_content_fingerprint",
+            )),
+        )
+        return manifest
+
+    def _database_content_fingerprint(
+        self, *, embedding_contract_fingerprint: str, counts: dict[str, int],
+    ) -> str:
+        digest = blake3()
+        digest.update(b"ptha:database-content-fingerprint:v1\0")
+        digest.update(_json({"counts": counts, "embedding_contract_fingerprint": embedding_contract_fingerprint}).encode("utf-8"))
+        tables = (
+            ("source_entity_identities", "id"),
+            ("source_entity_revisions", "id"),
+            ("conversation_source_lineage", "conversation_id"),
+            ("message_source_lineage", "message_id"),
+            ("block_source_lineage", "block_id"),
+            ("chunk_incremental_metadata", "chunk_id"),
+        )
+        for table, order_by in tables:
+            digest.update(table.encode("utf-8") + b"\0")
+            for row in self.conn.execute(f"SELECT * FROM {table} ORDER BY {order_by}"):
+                digest.update(_json(list(row)).encode("utf-8") + b"\n")
+        return digest.hexdigest()
+
     def audit(self) -> dict[str, Any]:
         counts = {table: int(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in CANONICAL_TABLES}
         counts["dense_vectors_native"] = int(self.conn.execute("SELECT COUNT(*) FROM dense_vectors_native").fetchone()[0])
@@ -627,10 +878,13 @@ def build_native_pre_mvp_db(
         model_cache=model_cache,
     )
     policy = build_chunk_policy([dense, sparse], version=chunk_policy_version, content_budget_override=chunk_content_budget)
+    embedding_contract, embedding_contract_digest = embedding_contract_fingerprint(dense=dense, sparse=sparse)
     contracts = {
         "dense": {"model": dense.model_name, "embedding_space_id": dense.embedding_space_id, "runtime": dense.runtime_metadata, "provider": dense.contract_dict()},
         "sparse": {"model": sparse.model_name, "embedding_space_id": sparse.embedding_space_id, "runtime": sparse.runtime_metadata, "provider": sparse.contract_dict()},
         "chunk_policy": policy.id,
+        "embedding_contract": embedding_contract,
+        "embedding_contract_fingerprint": embedding_contract_digest,
     }
     try:
         with NativeBuildStore(building_db, create_schema=not resume) as store:
@@ -844,7 +1098,17 @@ def build_native_pre_mvp_db(
                 "legacy_absent": not audit["legacy_tables_present"],
                 "integrity": audit["integrity_check"] == "ok" and audit["foreign_key_errors"] == 0,
             }
+            if store.incremental_metadata_available():
+                source_revisions = int(store.conn.execute("SELECT COUNT(*) FROM source_entity_revisions").fetchone()[0])
+                if source_revisions:
+                    conditions["incremental_chunk_lineage_complete"] = (
+                        int(store.conn.execute("SELECT COUNT(*) FROM chunk_incremental_metadata").fetchone()[0])
+                        == audit["counts"]["retrieval_chunks"]
+                    )
             audit["conditions"] = conditions
+            manifest = store.write_generation_manifest(embedding_contract_fingerprint=embedding_contract_digest)
+            if manifest is not None:
+                audit["generation_manifest"] = manifest
             store.conn.execute("UPDATE native_build_audit SET status=?,finished_at=?,audit_json=? WHERE id=1",
                                ("completed" if all(conditions.values()) else "failed", datetime.now(UTC).isoformat(), _json(audit)))
             store.commit()

@@ -21,7 +21,7 @@ Every `ptha init` invocation prints the actual paths selected on that machine.
 Install from a built wheel:
 
 ```bash
-uv tool install /absolute/path/to/ptha-0.4.2-py3-none-any.whl
+uv tool install /absolute/path/to/ptha-0.4.3-py3-none-any.whl
 ```
 
 Or install the current repository version:
