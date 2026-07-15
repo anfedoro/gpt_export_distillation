@@ -128,28 +128,40 @@ def load_config(path: Path | None = None, *, overrides: Mapping[str, Any] | None
     sparse_model = embedding_model
     if sparse_model == "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1" and dense_model == "BAAI/bge-m3":
         sparse_model = dense_model
+    legacy_model_config = "embedding_backend" not in models
+    embedding_backend = str(models.get("embedding_backend", "mlx"))
+    embedding_dtype = str(models.get("embedding_dtype", models.get("dense_dtype", "float16")))
+    embedding_device = str(models.get("embedding_device", models.get("dense_device", "gpu")))
+    # Legacy Torch configurations used "auto". The MLX production provider
+    # accepts only explicit FP16 and GPU settings, so resolve those legacy
+    # values without requiring users to rewrite an existing config file.
+    if embedding_backend == "mlx":
+        if embedding_dtype in {"", "auto"}:
+            embedding_dtype = "float16"
+        if embedding_device in {"", "auto", "mps"}:
+            embedding_device = "gpu"
     cfg = PthaConfig(
         config_file=selected,
         paths=locations,
         database=database,
         working_dir=_path(path_raw.get("working_dir")),
         model_cache=model_cache,
-        embedding_backend=str(models.get("embedding_backend", "mlx")),
+        embedding_backend=embedding_backend,
         embedding_model=embedding_model,
         embedding_model_revision=str(models.get("embedding_model_revision", PthaConfig.embedding_model_revision)),
-        embedding_dtype=str(models.get("embedding_dtype", models.get("dense_dtype", "float16"))),
-        embedding_device=str(models.get("embedding_device", models.get("dense_device", "gpu"))),
+        embedding_dtype=embedding_dtype,
+        embedding_device=embedding_device,
         embedding_sparse_head=str(models.get("embedding_sparse_head", "sparse_linear.safetensors")),
         embedding_colbert_head=str(models.get("embedding_colbert_head", "colbert_linear.safetensors")),
         embedding_max_padded_tokens=(int(models["embedding_max_padded_tokens"]) if int(models.get("embedding_max_padded_tokens", 0)) > 0 else None),
         dense_model=dense_model,
         sparse_model=sparse_model,
-        dense_device=os.environ.get("PTHA_DENSE_DEVICE", str(models.get("embedding_device", models.get("dense_device", "gpu")))),
-        sparse_device=os.environ.get("PTHA_SPARSE_DEVICE", str(models.get("embedding_device", models.get("sparse_device", "gpu")))),
-        dense_dtype=str(models.get("embedding_dtype", models.get("dense_dtype", "float16"))),
-        sparse_dtype=str(models.get("embedding_dtype", models.get("sparse_dtype", "float16"))),
+        dense_device=os.environ.get("PTHA_DENSE_DEVICE", embedding_device),
+        sparse_device=os.environ.get("PTHA_SPARSE_DEVICE", embedding_device),
+        dense_dtype=embedding_dtype,
+        sparse_dtype=embedding_dtype,
         sparse_top_k=int(models.get("sparse_top_k", 128)),
-        batch_size=int(models.get("embedding_batch_size", models.get("batch_size", 4))),
+        batch_size=int(models.get("embedding_batch_size", 4 if legacy_model_config else models.get("batch_size", 4))),
         candidate_pool=int(retrieval.get("candidate_pool", 500)),
         default_output_tokens=int(retrieval.get("default_output_tokens", 1800)),
         max_output_tokens=int(retrieval.get("max_output_tokens", 6000)),

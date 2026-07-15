@@ -47,6 +47,29 @@ class PthaShellTests(unittest.TestCase):
             self.assertEqual(loaded.dense_model, loaded.embedding_model)
             self.assertEqual(loaded.sparse_model, loaded.embedding_model)
 
+    def test_legacy_auto_runtime_settings_migrate_to_mlx_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            config = Path(root) / "config.toml"
+            config.write_text(
+                "config_version = 1\n[models]\n"
+                'dense_model = "BAAI/bge-m3"\n'
+                'sparse_model = "opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1"\n'
+                'dense_device = "auto"\nsparse_device = "auto"\n'
+                'dense_dtype = "auto"\nsparse_dtype = "auto"\n',
+                encoding="utf-8",
+            )
+
+            loaded = load_config(config)
+
+            self.assertEqual(loaded.embedding_backend, "mlx")
+            self.assertEqual(loaded.embedding_device, "gpu")
+            self.assertEqual(loaded.embedding_dtype, "float16")
+            self.assertEqual(loaded.dense_device, "gpu")
+            self.assertEqual(loaded.sparse_device, "gpu")
+            self.assertEqual(loaded.dense_dtype, "float16")
+            self.assertEqual(loaded.sparse_dtype, "float16")
+            self.assertEqual(loaded.batch_size, 4)
+
     def test_status_json_has_versioned_schema(self) -> None:
         with tempfile.TemporaryDirectory() as root, patch("sys.stdout") as stdout:
             config = Path(root) / "config.toml"
