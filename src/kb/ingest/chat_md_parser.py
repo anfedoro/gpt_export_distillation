@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from kb.ingest.canonical_markdown import canonicalize_message
 from kb.model.entities import Block, Conversation, Message, ParsedChat
 from kb.model.ids import stable_id
 
@@ -29,8 +30,11 @@ def parse_chat_file(path: Path, source_document_id: str, project_id: str | None 
     metadata = _parse_metadata(metadata_text)
     messages = _parse_messages(conversation_text, source_document_id)
     blocks: list[Block] = []
+    relationships = []
     for message in messages:
-        blocks.extend(_parse_blocks(message))
+        message_blocks, message_relationships = canonicalize_message(message)
+        blocks.extend(message_blocks)
+        relationships.extend(message_relationships)
     conversation = _build_conversation(
         source_document_id=source_document_id,
         metadata=metadata,
@@ -39,7 +43,13 @@ def parse_chat_file(path: Path, source_document_id: str, project_id: str | None 
         project_id=project_id,
         folder_kind=folder_kind,
     )
-    return ParsedChat(conversation=conversation, messages=messages, blocks=blocks, metadata=metadata)
+    return ParsedChat(
+        conversation=conversation,
+        messages=messages,
+        blocks=blocks,
+        metadata=metadata,
+        relationships=relationships,
+    )
 
 
 def _split_sections(text: str) -> tuple[str, str]:

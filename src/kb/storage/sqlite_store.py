@@ -68,6 +68,7 @@ def init_db(db_path: Path) -> None:
         _ensure_interest_tier_columns(conn)
         _ensure_embedding_identity_columns(conn)
         _ensure_chunk_columns(conn)
+        _ensure_canonical_block_columns(conn)
         conn.commit()
     finally:
         conn.close()
@@ -90,6 +91,23 @@ def _ensure_embedding_identity_columns(conn: sqlite3.Connection) -> None:
 
 def _ensure_chunk_columns(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "blocks", "parent_block_id", "TEXT REFERENCES blocks(id) ON DELETE CASCADE")
+
+
+def _ensure_canonical_block_columns(conn: sqlite3.Connection) -> None:
+    definitions = {
+        "canonical_content_hash": "TEXT NOT NULL DEFAULT ''",
+        "parser_version": "TEXT NOT NULL DEFAULT ''",
+        "canonicalizer_version": "TEXT NOT NULL DEFAULT ''",
+        "semantic_status": "TEXT NOT NULL DEFAULT 'graph_eligible'",
+        "dense_index_policy": "TEXT NOT NULL DEFAULT 'include'",
+        "sparse_index_policy": "TEXT NOT NULL DEFAULT 'include'",
+        "graph_eligibility": "INTEGER NOT NULL DEFAULT 1",
+        "artifact_policy": "TEXT NOT NULL DEFAULT 'no'",
+        "context_policy": "TEXT NOT NULL DEFAULT 'include'",
+        "exclusion_reasons_json": "TEXT NOT NULL DEFAULT '[]'",
+    }
+    for column, definition in definitions.items():
+        _add_column_if_missing(conn, "blocks", column, definition)
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -198,8 +216,16 @@ class SQLiteStore:
             self._insert_message(message)
         for block in parsed.blocks:
             self._insert_block(block)
+        for relationship in parsed.relationships:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO block_relationships("
+                "source_block_id,target_block_id,relation_type,ordinal,metadata_json) VALUES(?,?,?,?,?)",
+                (relationship.source_block_id, relationship.target_block_id, relationship.relation_type,
+                 relationship.ordinal, _json(relationship.metadata_json)),
+            )
         for block in parsed.blocks:
-            self._insert_knowledge_block(conversation, parsed.messages, block)
+            if block.dense_index_policy == "include" or block.sparse_index_policy == "include":
+                self._insert_knowledge_block(conversation, parsed.messages, block)
 
     def insert_parsed_attachment(self, input_root: Path, item: InventoryItem, source_document_id: str, parsed: ParsedAttachment) -> None:
         attachment_id = stable_id(source_document_id, "attachment", prefix="att")
@@ -312,8 +338,8 @@ class SQLiteStore:
             chunks.extend(
                 build_retrieval_chunks(
                     block_id=str(block["id"]),
-                    block_text=str(block["raw_text"]),
-                    block_char_start=int(block["char_start"]),
+                    block_text=str(block["normalized_text"]),
+                    block_char_start=0,
                     policy=policy,
                     tokenizer_provider=tokenizer_provider,
                 )
@@ -349,13 +375,18 @@ class SQLiteStore:
         return audit_chunks([dict(row) for row in block_rows], chunks, policy)
 
     def _indexable_block_rows(self, *, skip_low_interest_content: bool) -> list[sqlite3.Row]:
-        where = ["b.raw_text <> ''"]
+        where = [
+            "b.normalized_text <> ''",
+            "b.dense_index_policy = 'include'",
+            "b.sparse_index_policy = 'include'",
+            "b.semantic_status IN ('graph_eligible','context_only')",
+        ]
         if skip_low_interest_content:
             where.append("sd.interest_tier NOT IN ('low', 'quarantine')")
         return list(
             self.conn.execute(
                 f"""
-                SELECT b.id, b.raw_text, b.char_start, b.char_end
+                SELECT b.id, b.normalized_text, 0 AS char_start, length(b.normalized_text) AS char_end
                 FROM blocks b
                 JOIN messages m ON m.id = b.message_id
                 JOIN conversations c ON c.id = m.conversation_id
@@ -1475,8 +1506,10 @@ class SQLiteStore:
             """
             INSERT INTO blocks (
                 id, message_id, conversation_id, ordinal, block_type, language, raw_text,
-                normalized_text, char_start, char_end, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                normalized_text, char_start, char_end, canonical_content_hash, parser_version,
+                canonicalizer_version, semantic_status, dense_index_policy, sparse_index_policy,
+                graph_eligibility, artifact_policy, context_policy, exclusion_reasons_json, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 block.id,
@@ -1489,6 +1522,16 @@ class SQLiteStore:
                 block.normalized_text,
                 block.char_start,
                 block.char_end,
+                block.canonical_content_hash,
+                block.parser_version,
+                block.canonicalizer_version,
+                block.semantic_status,
+                block.dense_index_policy,
+                block.sparse_index_policy,
+                int(block.graph_eligibility),
+                block.artifact_policy,
+                block.context_policy,
+                _json(list(block.exclusion_reasons)),
                 _json(block.metadata_json),
             ),
         )
@@ -1497,15 +1540,14 @@ class SQLiteStore:
         message_by_id = {message.id: message for message in messages}
         message = message_by_id[block.message_id]
         interest_tier = self._source_interest_tier(conversation.source_document_id)
-        text_for_display = block.raw_text
+        text_for_display = block.normalized_text
         text_for_embedding = "\n".join(
             part
             for part in [
                 f"Project: {conversation.project_id}" if conversation.project_id else None,
                 f"Conversation: {conversation.title}" if conversation.title else None,
                 f"Role: {message.role.upper()}",
-                f"Block type: {block.block_type}",
-                f"Content: {block.normalized_text or block.raw_text}",
+                f"Content: {block.normalized_text}",
             ]
             if part
         )

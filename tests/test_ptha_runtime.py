@@ -387,7 +387,14 @@ def _create_retrievable_database(path: Path) -> None:
         store.conn.execute("INSERT INTO source_documents VALUES('src','synthetic.md','synthetic.md','chat_md',NULL,'normal',NULL,NULL,'synthetic.md','md','hash',NULL,NULL,'{}')")
         store.conn.execute("INSERT INTO conversations VALUES('conv','src','conversation',NULL,'Synthetic',NULL,NULL,1,0,1,16,0,NULL,NULL,'{}')")
         store.conn.execute("INSERT INTO messages VALUES('msg','conv',1,'user','source-msg',NULL,'synthetic memory','{}')")
-        store.conn.execute("INSERT INTO blocks VALUES('block','msg',NULL,1,'prose',NULL,0,16,'{}')")
+        store.conn.execute(
+            "INSERT INTO blocks(id,message_id,parent_block_id,ordinal,block_type,language,"
+            "source_char_start,source_char_end,raw_content,canonical_content,canonical_content_hash,"
+            "parser_version,canonicalizer_version,semantic_status,dense_index_policy,sparse_index_policy,"
+            "graph_eligibility,artifact_policy,context_policy,exclusion_reasons_json,metadata_json) "
+            "VALUES('block','msg',NULL,1,'prose',NULL,0,16,'synthetic','synthetic','hash',"
+            "'test-parser','test-canonicalizer','graph_eligible','include','include',1,'no','include','[]','{}')"
+        )
         store.conn.execute("INSERT INTO retrieval_chunks VALUES('chunk','block',1,0,16,2,'synthetic memory',?,'{}')", (policy.id,))
         rows = store.conn.execute("SELECT id,block_id,text FROM retrieval_chunks").fetchall()
         store.write_embedding_batch(rows=rows, dense_vectors=[[1.0] + [0.0] * 1023],

@@ -28,9 +28,12 @@ from kb.model.ids import stable_id
 from kb.storage.dense_native import NATIVE_DTYPE, NativeDenseSearchBackend, load_sqlite_vec, serialize_float32
 from ptha.incremental import (
     BLOCK_BUILDER_VERSION,
+    CANONICAL_REPRESENTATION_VERSION,
     CANONICALIZER_VERSION,
     CHUNKER_VERSION,
     INCREMENTAL_METADATA_SCHEMA_VERSION,
+    PARSER_CONTRACT,
+    SOURCE_TRANSFORM_VERSION,
     block_identity,
     chunk_content_hash,
     chunk_derivation_fingerprint,
@@ -44,8 +47,9 @@ from ptha.incremental import (
 )
 
 
-NATIVE_PRE_MVP_SCHEMA_VERSION = "kb.native_pre_mvp.v2"
-SUPPORTED_NATIVE_SCHEMA_VERSIONS = {"kb.native_pre_mvp.v1", NATIVE_PRE_MVP_SCHEMA_VERSION}
+NATIVE_PRE_MVP_SCHEMA_VERSION = "kb.native_pre_mvp.v3"
+SUPPORTED_NATIVE_SCHEMA_VERSIONS = {"kb.native_pre_mvp.v1", "kb.native_pre_mvp.v2", NATIVE_PRE_MVP_SCHEMA_VERSION}
+DEFAULT_CANONICAL_CHUNK_CONTENT_BUDGET = 256
 CANONICAL_TABLES = ("source_documents", "conversations", "messages", "blocks", "retrieval_chunks")
 LEGACY_TABLES = (
     "dense_vectors", "sparse_terms", "knowledge_blocks", "semantic_nodes", "semantic_node_members",
@@ -136,7 +140,21 @@ def create_clean_native_schema(conn: sqlite3.Connection, *, dimension: int = 102
             id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
             parent_block_id TEXT REFERENCES blocks(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, block_type TEXT NOT NULL,
             language TEXT, source_char_start INTEGER NOT NULL, source_char_end INTEGER NOT NULL,
+            raw_content TEXT NOT NULL, canonical_content TEXT NOT NULL, canonical_content_hash TEXT NOT NULL,
+            parser_version TEXT NOT NULL, canonicalizer_version TEXT NOT NULL,
+            semantic_status TEXT NOT NULL CHECK(semantic_status IN ('graph_eligible','context_only','artifact','excluded')),
+            dense_index_policy TEXT NOT NULL, sparse_index_policy TEXT NOT NULL,
+            graph_eligibility INTEGER NOT NULL CHECK(graph_eligibility IN (0,1)),
+            artifact_policy TEXT NOT NULL, context_policy TEXT NOT NULL,
+            exclusion_reasons_json TEXT NOT NULL DEFAULT '[]',
             metadata_json TEXT NOT NULL DEFAULT '{}', UNIQUE(message_id, ordinal)
+        );
+        CREATE TABLE block_relationships (
+            source_block_id TEXT NOT NULL REFERENCES blocks(id) ON DELETE CASCADE,
+            target_block_id TEXT NOT NULL REFERENCES blocks(id) ON DELETE CASCADE,
+            relation_type TEXT NOT NULL, ordinal INTEGER NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY(source_block_id,target_block_id,relation_type)
         );
         CREATE TABLE retrieval_chunks (
             id TEXT PRIMARY KEY, block_id TEXT NOT NULL REFERENCES blocks(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL,
@@ -217,7 +235,10 @@ def create_clean_native_schema(conn: sqlite3.Connection, *, dimension: int = 102
             manifest_schema_version INTEGER NOT NULL,
             created_at TEXT NOT NULL,
             database_schema_version TEXT NOT NULL,
+            parser_contract TEXT NOT NULL,
+            canonical_representation_version INTEGER NOT NULL,
             canonicalizer_version TEXT NOT NULL,
+            source_transform_version TEXT NOT NULL,
             block_builder_version TEXT NOT NULL,
             chunker_version TEXT NOT NULL,
             embedding_contract_fingerprint TEXT NOT NULL,
@@ -235,6 +256,8 @@ def create_clean_native_schema(conn: sqlite3.Connection, *, dimension: int = 102
             BEFORE DELETE ON generation_manifests BEGIN SELECT RAISE(ABORT, 'generation manifests are immutable'); END;
         CREATE INDEX idx_messages_conversation ON messages(conversation_id, ordinal);
         CREATE INDEX idx_blocks_message ON blocks(message_id, ordinal);
+        CREATE INDEX idx_blocks_policy ON blocks(semantic_status,dense_index_policy,sparse_index_policy,graph_eligibility);
+        CREATE INDEX idx_block_relationships_target ON block_relationships(target_block_id,relation_type);
         CREATE INDEX idx_retrieval_chunks_block ON retrieval_chunks(block_id, chunk_policy_id, ordinal);
         CREATE INDEX idx_dense_native_metadata_space ON dense_native_metadata(model_name, embedding_space_id, chunk_id);
         CREATE INDEX idx_sparse_vector_metadata_space ON sparse_vector_metadata(model_name, embedding_space_id, chunk_id);
@@ -243,7 +266,7 @@ def create_clean_native_schema(conn: sqlite3.Connection, *, dimension: int = 102
         """
     )
     conn.execute(f"CREATE VIRTUAL TABLE dense_vectors_native USING vec0(embedding float[{dimension}] distance_metric=cosine)")
-    conn.execute("PRAGMA user_version = 2")
+    conn.execute("PRAGMA user_version = 3")
 
 
 class NativeBuildStore:
@@ -340,6 +363,13 @@ class NativeBuildStore:
             self._insert_message(message)
         for block in parsed.blocks:
             self._insert_block(block)
+        for relationship in parsed.relationships:
+            self.conn.execute(
+                "INSERT INTO block_relationships(source_block_id,target_block_id,relation_type,ordinal,metadata_json) "
+                "VALUES(?,?,?,?,?)",
+                (relationship.source_block_id, relationship.target_block_id, relationship.relation_type,
+                 relationship.ordinal, _json(relationship.metadata_json)),
+            )
         if self.incremental_metadata_available():
             self._record_incremental_lineage(parsed)
 
@@ -355,7 +385,11 @@ class NativeBuildStore:
         message_revisions: dict[str, str] = {}
         for message in parsed.messages:
             identity = message_identity(message, conversation_identity_id=conversation_source_identity.id)
-            revision = message_revision(message, identity=identity)
+            revision = message_revision(
+                message,
+                identity=identity,
+                canonical_blocks=[block for block in parsed.blocks if block.message_id == message.id],
+            )
             self._upsert_source_identity(identity)
             self._upsert_source_revision(revision)
             self.conn.execute(
@@ -403,16 +437,29 @@ class NativeBuildStore:
 
     def _insert_block(self, item: Block) -> None:
         self.conn.execute(
-            "INSERT INTO blocks(id,message_id,parent_block_id,ordinal,block_type,language,source_char_start,source_char_end,metadata_json) VALUES(?,?,?,?,?,?,?,?,?)",
-            (item.id, item.message_id, None, item.ordinal, item.block_type, item.language, item.char_start, item.char_end, _json(item.metadata_json)),
+            "INSERT INTO blocks("
+            "id,message_id,parent_block_id,ordinal,block_type,language,source_char_start,source_char_end,"
+            "raw_content,canonical_content,canonical_content_hash,parser_version,canonicalizer_version,"
+            "semantic_status,dense_index_policy,sparse_index_policy,graph_eligibility,artifact_policy,"
+            "context_policy,exclusion_reasons_json,metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                item.id, item.message_id, None, item.ordinal, item.block_type, item.language, item.char_start, item.char_end,
+                item.raw_text, item.normalized_text, item.canonical_content_hash, item.parser_version,
+                item.canonicalizer_version, item.semantic_status, item.dense_index_policy, item.sparse_index_policy,
+                int(item.graph_eligibility), item.artifact_policy, item.context_policy,
+                _json(list(item.exclusion_reasons)), _json(item.metadata_json),
+            ),
         )
 
     def create_chunks(self, *, policy: ChunkPolicy, tokenizer_provider: Any, skip_low_interest: bool, progress: bool = False) -> dict[str, Any]:
-        where = "b.source_char_end > b.source_char_start"
+        where = (
+            "b.dense_index_policy = 'include' AND b.sparse_index_policy = 'include' "
+            "AND b.semantic_status IN ('graph_eligible','context_only')"
+        )
         if skip_low_interest:
             where += " AND sd.interest_tier NOT IN ('low','quarantine')"
         block_rows = self.conn.execute(
-            "SELECT b.id,m.raw_text,b.source_char_start,b.source_char_end FROM blocks b "
+            "SELECT b.id,b.canonical_content FROM blocks b "
             "JOIN messages m ON m.id=b.message_id JOIN conversations c ON c.id=m.conversation_id "
             "JOIN source_documents sd ON sd.id=c.source_document_id WHERE " + where + " ORDER BY b.id"
         )
@@ -454,12 +501,12 @@ class NativeBuildStore:
         with tqdm(total=total_blocks, desc="Building retrieval chunks", unit="block", file=sys.stderr,
                   dynamic_ncols=True, disable=not progress) as bar:
             for row in block_rows:
-                text = str(row["raw_text"])[int(row["source_char_start"]):int(row["source_char_end"])]
+                text = str(row["canonical_content"])
                 chunks = build_retrieval_chunks(
-                    block_id=str(row["id"]), block_text=text, block_char_start=int(row["source_char_start"]),
+                    block_id=str(row["id"]), block_text=text, block_char_start=0,
                     policy=policy, tokenizer_provider=tokenizer_provider,
                 )
-                block_start, block_end = int(row["source_char_start"]), int(row["source_char_end"])
+                block_start, block_end = 0, len(text)
                 total_source_characters += block_end - block_start
                 covered = _covered_length([(chunk.source_char_start, chunk.source_char_end) for chunk in chunks])
                 covered_unique_characters += covered
@@ -524,6 +571,58 @@ class NativeBuildStore:
             "chunks_with_overlap": chunks_with_overlap, "overlap_token_count_total": overlap_token_count_total,
             "chunks_split_on_natural_boundary": chunks_split_on_natural_boundary,
             "chunks_split_by_token_fallback": chunks_split_by_token_fallback,
+        }
+
+    def finalize_semantic_eligibility(self) -> dict[str, int]:
+        """Downgrade repeated canonical prose while preserving every source block."""
+        groups = self.conn.execute(
+            """
+            SELECT canonical_content_hash
+            FROM blocks
+            WHERE block_type='prose' AND semantic_status='graph_eligible'
+            GROUP BY canonical_content_hash HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        downgraded = 0
+        next_ordinal = int(self.conn.execute(
+            "SELECT COALESCE(MAX(ordinal),0)+1 FROM block_relationships"
+        ).fetchone()[0])
+        for group in groups:
+            rows = self.conn.execute(
+                """
+                SELECT b.id,b.exclusion_reasons_json
+                FROM blocks b JOIN messages m ON m.id=b.message_id
+                WHERE b.canonical_content_hash=? AND b.block_type='prose'
+                  AND b.semantic_status='graph_eligible'
+                ORDER BY m.conversation_id,m.ordinal,b.ordinal,b.id
+                """,
+                (group["canonical_content_hash"],),
+            ).fetchall()
+            canonical_id = str(rows[0]["id"])
+            for row in rows[1:]:
+                reasons = json.loads(str(row["exclusion_reasons_json"] or "[]"))
+                if "exact_duplicate_canonical_content" not in reasons:
+                    reasons.append("exact_duplicate_canonical_content")
+                self.conn.execute(
+                    """
+                    UPDATE blocks
+                    SET semantic_status='context_only',dense_index_policy='exclude',
+                        sparse_index_policy='exclude',graph_eligibility=0,
+                        exclusion_reasons_json=?
+                    WHERE id=?
+                    """,
+                    (_json(reasons), row["id"]),
+                )
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO block_relationships("
+                    "source_block_id,target_block_id,relation_type,ordinal,metadata_json) VALUES(?,?,?,?,?)",
+                    (row["id"], canonical_id, "exact_duplicate_of", next_ordinal, "{}"),
+                )
+                next_ordinal += 1
+                downgraded += 1
+        return {
+            "duplicate_blocks_downgraded": downgraded,
+            "duplicate_relationships": downgraded,
         }
 
     def embedding_batches(self, *, policy_id: str, batch_size: int) -> Iterable[list[sqlite3.Row]]:
@@ -725,7 +824,10 @@ class NativeBuildStore:
             "manifest_schema_version": INCREMENTAL_METADATA_SCHEMA_VERSION,
             "created_at": datetime.now(UTC).isoformat(),
             "database_schema_version": NATIVE_PRE_MVP_SCHEMA_VERSION,
+            "parser_contract": PARSER_CONTRACT,
+            "canonical_representation_version": CANONICAL_REPRESENTATION_VERSION,
             "canonicalizer_version": CANONICALIZER_VERSION,
+            "source_transform_version": SOURCE_TRANSFORM_VERSION,
             "block_builder_version": BLOCK_BUILDER_VERSION,
             "chunker_version": CHUNKER_VERSION,
             "embedding_contract_fingerprint": embedding_contract_fingerprint,
@@ -737,13 +839,15 @@ class NativeBuildStore:
         }
         self.conn.execute(
             "INSERT INTO generation_manifests("
-            "generation_id,manifest_schema_version,created_at,database_schema_version,canonicalizer_version,"
+            "generation_id,manifest_schema_version,created_at,database_schema_version,parser_contract,"
+            "canonical_representation_version,canonicalizer_version,source_transform_version,"
             "block_builder_version,chunker_version,embedding_contract_fingerprint,source_entity_count,"
             "source_revision_count,block_count,chunk_count,dense_count,sparse_count,database_content_fingerprint) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             tuple(manifest[key] for key in (
                 "generation_id", "manifest_schema_version", "created_at", "database_schema_version",
-                "canonicalizer_version", "block_builder_version", "chunker_version", "embedding_contract_fingerprint",
+                "parser_contract", "canonical_representation_version", "canonicalizer_version",
+                "source_transform_version", "block_builder_version", "chunker_version", "embedding_contract_fingerprint",
                 "source_entity_count", "source_revision_count", "block_count", "chunk_count", "dense_count",
                 "sparse_count", "database_content_fingerprint",
             )),
@@ -831,7 +935,8 @@ def build_native_pre_mvp_db(
     embedding_max_padded_tokens: int | None = None,
     sparse_head: str = "sparse_linear.safetensors", colbert_head: str = "colbert_linear.safetensors",
     model_cache: Path | None = None, chunk_policy_version: str = "v2",
-    chunk_content_budget: int = 506, sparse_top_k: int = 128, batch_size: int = 4,
+    chunk_content_budget: int = DEFAULT_CANONICAL_CHUNK_CONTENT_BUDGET,
+    sparse_top_k: int = 128, batch_size: int = 4,
     skip_low_interest: bool = True, progress: bool = True,
     dense_effective_max_seq_length: int = 512,
     dense_device: str | None = None, sparse_device: str | None = None,
@@ -883,6 +988,11 @@ def build_native_pre_mvp_db(
         "dense": {"model": dense.model_name, "embedding_space_id": dense.embedding_space_id, "runtime": dense.runtime_metadata, "provider": dense.contract_dict()},
         "sparse": {"model": sparse.model_name, "embedding_space_id": sparse.embedding_space_id, "runtime": sparse.runtime_metadata, "provider": sparse.contract_dict()},
         "chunk_policy": policy.id,
+        "parser": PARSER_CONTRACT,
+        "canonical_representation_version": CANONICAL_REPRESENTATION_VERSION,
+        "canonicalizer_version": CANONICALIZER_VERSION,
+        "source_transform_version": SOURCE_TRANSFORM_VERSION,
+        "chunking_contract_version": CHUNKER_VERSION,
         "embedding_contract": embedding_contract,
         "embedding_contract_fingerprint": embedding_contract_digest,
     }
@@ -951,6 +1061,7 @@ def build_native_pre_mvp_db(
                             store.commit()
                             bar.set_postfix(scanned=scanned)
                         bar.update(1)
+                eligibility_audit = store.finalize_semantic_eligibility()
                 store.commit()
                 if progress:
                     print("[5/7] Building search chunks", file=sys.stderr, flush=True)
@@ -960,6 +1071,7 @@ def build_native_pre_mvp_db(
                     skip_low_interest=skip_low_interest,
                     progress=progress,
                 )
+                chunk_audit.update(eligibility_audit)
                 required_chunk_conditions = {key: chunk_audit[key] == 0 for key in ("uncovered_characters", "chunks_over_limit", "truncated_chunks", "blocks_with_coverage_gaps")}
                 if not all(required_chunk_conditions.values()):
                     raise NativePreMvpError(f"Chunk audit failed: {required_chunk_conditions}")

@@ -118,7 +118,14 @@ class ResumableIndexBatchTests(unittest.TestCase):
             store.conn.execute("INSERT INTO source_documents VALUES('src','synthetic.md','synthetic.md','chat_md',NULL,'normal',NULL,NULL,'synthetic.md','md','hash',NULL,NULL,'{}')")
             store.conn.execute("INSERT INTO conversations VALUES('conv','src','conversation',NULL,'Synthetic',NULL,NULL,1,0,1,64,0,NULL,NULL,'{}')")
             store.conn.execute("INSERT INTO messages VALUES('msg','conv',1,'user','source-msg',NULL,'synthetic text','{}')")
-            store.conn.execute("INSERT INTO blocks VALUES('block','msg',NULL,1,'prose',NULL,0,64,'{}')")
+            store.conn.execute(
+                "INSERT INTO blocks(id,message_id,parent_block_id,ordinal,block_type,language,"
+                "source_char_start,source_char_end,raw_content,canonical_content,canonical_content_hash,"
+                "parser_version,canonicalizer_version,semantic_status,dense_index_policy,sparse_index_policy,"
+                "graph_eligibility,artifact_policy,context_policy,exclusion_reasons_json,metadata_json) "
+                "VALUES('block','msg',NULL,1,'prose',NULL,0,64,'synthetic','synthetic','hash',"
+                "'test-parser','test-canonicalizer','graph_eligible','include','include',1,'no','include','[]','{}')"
+            )
             store.conn.executemany(
                 "INSERT INTO retrieval_chunks VALUES(?,?,?,?,?,?,?,?,?)",
                 [(f"chunk-{index}", "block", index, 0, 10, 3, f"synthetic chunk {index}", policy.id, "{}") for index in range(1, total + 1)],

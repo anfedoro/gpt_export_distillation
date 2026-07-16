@@ -1,5 +1,8 @@
 # PTHA architecture
 
+The source representation before chunking is defined in
+[Canonical semantic ingestion](canonical-semantic-ingestion.md).
+
 PTHA is a local pipeline with explicit boundaries between import, storage,
 retrieval service, and MCP transport.
 

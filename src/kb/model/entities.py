@@ -65,6 +65,25 @@ class Block:
     char_start: int
     char_end: int
     metadata_json: JsonDict = field(default_factory=dict)
+    canonical_content_hash: str = ""
+    parser_version: str = ""
+    canonicalizer_version: str = ""
+    semantic_status: str = "graph_eligible"
+    dense_index_policy: str = "include"
+    sparse_index_policy: str = "include"
+    graph_eligibility: bool = True
+    artifact_policy: str = "no"
+    context_policy: str = "include"
+    exclusion_reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class BlockRelationship:
+    source_block_id: str
+    target_block_id: str
+    relation_type: str
+    ordinal: int
+    metadata_json: JsonDict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -73,3 +92,4 @@ class ParsedChat:
     messages: list[Message]
     blocks: list[Block]
     metadata: JsonDict
+    relationships: list[BlockRelationship] = field(default_factory=list)

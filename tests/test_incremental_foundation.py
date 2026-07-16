@@ -13,7 +13,12 @@ from unittest.mock import patch
 from kb.index.chunk_builder import StrictestTokenizer, build_chunk_policy
 from kb.model.entities import Block, Conversation, Message, ParsedChat
 from kb.storage import native_pre_mvp as native
-from kb.storage.native_pre_mvp import NativeBuildStore, build_native_pre_mvp_db, create_clean_native_schema
+from kb.storage.native_pre_mvp import (
+    DEFAULT_CANONICAL_CHUNK_CONTENT_BUDGET,
+    NativeBuildStore,
+    build_native_pre_mvp_db,
+    create_clean_native_schema,
+)
 from ptha.database import inspect_database
 from ptha.incremental import (
     BLOCK_BUILDER_VERSION,
@@ -22,6 +27,7 @@ from ptha.incremental import (
     canonical_bytes,
     chunk_content_hash,
     chunk_identity,
+    block_identity,
     compare_source_revisions,
     content_hash,
     conversation_identity,
@@ -29,6 +35,9 @@ from ptha.incremental import (
     embedding_contract_fingerprint,
     message_identity,
     message_revision,
+    PARSER_CONTRACT,
+    SOURCE_TRANSFORM_VERSION,
+    CANONICAL_REPRESENTATION_VERSION,
 )
 
 
@@ -183,6 +192,14 @@ class IncrementalFoundationTests(unittest.TestCase):
                   "source_char_start": 0, "source_char_end": 10}
         self.assertEqual(chunk_identity(**kwargs), chunk_identity(**kwargs))
 
+    def test_block_identity_is_stable_for_formatting_only_offset_changes(self) -> None:
+        original = self._parsed_chat().blocks[0]
+        shifted = replace(original, char_start=10, char_end=27)
+        self.assertEqual(
+            block_identity(original, message_revision_id="rev_same"),
+            block_identity(shifted, message_revision_id="rev_same"),
+        )
+
     def test_chunk_content_hash_is_separate_from_chunk_identity(self) -> None:
         identifier = chunk_identity(source_revision_id="rev_1", block_identity_id="block_1", chunk_policy_id="policy", ordinal=1,
                                     source_char_start=0, source_char_end=10)
@@ -210,6 +227,9 @@ class IncrementalFoundationTests(unittest.TestCase):
         self.assertEqual(generation["canonicalizer_version"], CANONICALIZER_VERSION)
         self.assertEqual(generation["block_builder_version"], BLOCK_BUILDER_VERSION)
         self.assertEqual(generation["chunker_version"], CHUNKER_VERSION)
+        self.assertEqual(generation["parser_contract"], PARSER_CONTRACT)
+        self.assertEqual(generation["source_transform_version"], SOURCE_TRANSFORM_VERSION)
+        self.assertEqual(generation["canonical_representation_version"], CANONICAL_REPRESENTATION_VERSION)
 
     def test_embedding_contract_fingerprint_is_deterministic(self) -> None:
         first = embedding_contract_fingerprint(dense=FakeProvider(space="dense"), sparse=FakeProvider(space="sparse;top_k=8"))[1]
@@ -283,6 +303,9 @@ class IncrementalFoundationTests(unittest.TestCase):
                     raise RuntimeError("synthetic pre-publication fault")
             self.assertEqual(store.conn.execute("SELECT COUNT(*) FROM generation_manifests").fetchone()[0], 0)
 
+    def test_canonical_default_chunk_budget_remains_256(self) -> None:
+        self.assertEqual(DEFAULT_CANONICAL_CHUNK_CONTENT_BUDGET, 256)
+
     def test_legacy_database_remains_readable(self) -> None:
         path = self.root / "legacy.db"
         self._assert_inside(path)
@@ -336,7 +359,7 @@ class IncrementalFoundationTests(unittest.TestCase):
             conn.execute("PRAGMA foreign_keys = ON")
             self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
 
 
 if __name__ == "__main__":

@@ -11,14 +11,18 @@ import uuid
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from importlib.metadata import version
 from typing import Any
 
 from blake3 import blake3
 
 
-INCREMENTAL_METADATA_SCHEMA_VERSION = 1
-CANONICALIZER_VERSION = "ptha.canonical.v1"
-BLOCK_BUILDER_VERSION = "ptha.block-builder.v1"
+INCREMENTAL_METADATA_SCHEMA_VERSION = 2
+CANONICAL_REPRESENTATION_VERSION = 1
+PARSER_CONTRACT = f"markdown-it-py:{version('markdown-it-py')}"
+CANONICALIZER_VERSION = "ptha.canonical-blocks.v1"
+SOURCE_TRANSFORM_VERSION = "ptha.chat-md-source-transform.v1"
+BLOCK_BUILDER_VERSION = "ptha.block-builder.v2"
 CHUNKER_VERSION = "ptha.chunker.v2"
 IDENTITY_VERSION = "ptha.source-identity.v1"
 SPARSE_REPRESENTATION_VERSION = "ptha.sparse-compact.v1"
@@ -132,25 +136,39 @@ def conversation_revision(conversation: Any, *, identity: SourceIdentity) -> Sou
     })
 
 
-def message_revision(message: Any, *, identity: SourceIdentity) -> SourceRevision:
+def message_revision(
+    message: Any, *, identity: SourceIdentity, canonical_blocks: Sequence[Any] | None = None,
+) -> SourceRevision:
+    semantic_content: Any
+    if canonical_blocks is None:
+        semantic_content = {"raw_text": getattr(message, "raw_text", None)}
+    else:
+        semantic_content = [
+            {
+                "ordinal": getattr(block, "ordinal", None),
+                "block_type": getattr(block, "block_type", None),
+                "language": getattr(block, "language", None),
+                "canonical_content_hash": getattr(block, "canonical_content_hash", None),
+            }
+            for block in canonical_blocks
+        ]
     return _revision(identity, "ptha:canonical-message:v1", {
         "message_id": getattr(message, "message_id", None),
         "role": getattr(message, "role", None),
         "time_utc": getattr(message, "time_utc", None),
-        "raw_text": getattr(message, "raw_text", None),
+        "canonical_blocks": semantic_content,
         "metadata": getattr(message, "metadata_json", {}),
     })
 
 
 def block_identity(block: Any, *, message_revision_id: str) -> str:
-    return "block_" + content_hash("ptha:block-identity:v1", {
+    return "block_" + content_hash("ptha:block-identity:v2", {
         "source_revision_id": message_revision_id,
         "block_builder_version": BLOCK_BUILDER_VERSION,
         "ordinal": getattr(block, "ordinal", None),
         "block_type": getattr(block, "block_type", None),
         "language": getattr(block, "language", None),
-        "source_char_start": getattr(block, "char_start", None),
-        "source_char_end": getattr(block, "char_end", None),
+        "canonical_content_hash": getattr(block, "canonical_content_hash", None),
     })
 
 

@@ -207,7 +207,14 @@ class KBMilestone1Tests(unittest.TestCase):
                 store.conn.execute("INSERT INTO source_documents VALUES('src','/tmp/x','x.md','chat_md',NULL,'normal',NULL,NULL,'x.md','md','hash',NULL,NULL,'{}')")
                 store.conn.execute("INSERT INTO conversations VALUES('conv','src','c',NULL,NULL,NULL,NULL,1,0,1,10,0,NULL,NULL,'{}')")
                 store.conn.execute("INSERT INTO messages VALUES('msg','conv',1,'user','m',NULL,'alpha beta','{}')")
-                store.conn.execute("INSERT INTO blocks VALUES('block','msg',NULL,1,'prose',NULL,0,10,'{}')")
+                store.conn.execute(
+                    "INSERT INTO blocks(id,message_id,parent_block_id,ordinal,block_type,language,"
+                    "source_char_start,source_char_end,raw_content,canonical_content,canonical_content_hash,"
+                    "parser_version,canonicalizer_version,semantic_status,dense_index_policy,sparse_index_policy,"
+                    "graph_eligibility,artifact_policy,context_policy,exclusion_reasons_json,metadata_json) "
+                    "VALUES('block','msg',NULL,1,'prose',NULL,0,10,'alpha beta','alpha beta','hash',"
+                    "'test-parser','test-canonicalizer','graph_eligible','include','include',1,'no','include','[]','{}')"
+                )
                 store.conn.executemany(
                     "INSERT INTO retrieval_chunks VALUES(?,?,?,?,?,?,?,?,?)",
                     [
@@ -791,7 +798,10 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertGreater(payload["results"][0]["source_char_start"], 0)
             with SQLiteStore(db) as store:
                 table_stats = store.stats()
-                self.assertGreater(table_stats["retrieval_chunks"], table_stats["blocks"])
+                semantic_blocks = store.conn.execute(
+                    "SELECT COUNT(*) FROM blocks WHERE dense_index_policy='include' AND sparse_index_policy='include'"
+                ).fetchone()[0]
+                self.assertGreater(table_stats["retrieval_chunks"], semantic_blocks)
                 self.assertEqual(
                     store.conn.execute("SELECT COUNT(*) FROM dense_vectors WHERE owner_type != 'retrieval_chunk'").fetchone()[0],
                     0,
@@ -1037,7 +1047,7 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertEqual(parsed.messages[0].message_id, "msg-user-1")
             self.assertIn("How should memory", parsed.messages[0].raw_text)
             self.assertIn("code", {block.block_type for block in parsed.blocks})
-            self.assertIn("mermaid", {block.block_type for block in parsed.blocks})
+            self.assertIn("diagram", {block.block_type for block in parsed.blocks})
 
     def test_parse_chat_ignores_numbered_content_headings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1099,7 +1109,11 @@ class KBMilestone1Tests(unittest.TestCase):
             self.assertEqual(stats["conversations"], 1)
             self.assertEqual(stats["messages"], 2)
             self.assertGreaterEqual(stats["blocks"], 4)
-            self.assertEqual(stats["knowledge_blocks"], stats["blocks"])
+            with SQLiteStore(db) as store:
+                semantic_blocks = store.conn.execute(
+                    "SELECT COUNT(*) FROM blocks WHERE dense_index_policy='include' OR sparse_index_policy='include'"
+                ).fetchone()[0]
+            self.assertEqual(stats["knowledge_blocks"], semantic_blocks)
 
     def test_ingest_attachments_extracts_text_and_tracks_unsupported(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1189,10 +1203,10 @@ class KBMilestone1Tests(unittest.TestCase):
                 limit=3,
             )
 
-            self.assertEqual(stats["candidate_blocks"], 3)
-            self.assertEqual(stats["blocks_embedded"], 3)
-            self.assertEqual(stats["dense_vectors"], 3)
-            self.assertEqual(stats["sparse_vectors"], 3)
+            self.assertEqual(stats["candidate_blocks"], 2)
+            self.assertEqual(stats["blocks_embedded"], 2)
+            self.assertEqual(stats["dense_vectors"], 2)
+            self.assertEqual(stats["sparse_vectors"], 2)
 
     def test_embed_separate_pass_mode_preserves_dense_and_sparse_links(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1214,8 +1228,8 @@ class KBMilestone1Tests(unittest.TestCase):
             )
 
             self.assertEqual(stats["embedding_pass_mode"], "separate")
-            self.assertEqual(stats["dense_vectors"], 3)
-            self.assertEqual(stats["sparse_vectors"], 3)
+            self.assertEqual(stats["dense_vectors"], 2)
+            self.assertEqual(stats["sparse_vectors"], 2)
             with SQLiteStore(db) as store:
                 dense_chunks = store.conn.execute(
                     "SELECT COUNT(*) FROM dense_vectors WHERE owner_type = 'retrieval_chunk'"
@@ -1223,8 +1237,8 @@ class KBMilestone1Tests(unittest.TestCase):
                 sparse_chunks = store.conn.execute(
                     "SELECT COUNT(DISTINCT owner_id) FROM sparse_terms WHERE owner_type = 'retrieval_chunk'"
                 ).fetchone()[0]
-            self.assertEqual(dense_chunks, 3)
-            self.assertEqual(sparse_chunks, 3)
+            self.assertEqual(dense_chunks, 2)
+            self.assertEqual(sparse_chunks, 2)
 
     def test_low_interest_content_is_skipped_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

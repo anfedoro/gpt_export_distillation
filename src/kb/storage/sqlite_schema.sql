@@ -68,8 +68,27 @@ CREATE TABLE IF NOT EXISTS blocks (
     normalized_text TEXT NOT NULL,
     char_start INTEGER NOT NULL,
     char_end INTEGER NOT NULL,
+    canonical_content_hash TEXT NOT NULL DEFAULT '',
+    parser_version TEXT NOT NULL DEFAULT '',
+    canonicalizer_version TEXT NOT NULL DEFAULT '',
+    semantic_status TEXT NOT NULL DEFAULT 'graph_eligible',
+    dense_index_policy TEXT NOT NULL DEFAULT 'include',
+    sparse_index_policy TEXT NOT NULL DEFAULT 'include',
+    graph_eligibility INTEGER NOT NULL DEFAULT 1,
+    artifact_policy TEXT NOT NULL DEFAULT 'no',
+    context_policy TEXT NOT NULL DEFAULT 'include',
+    exclusion_reasons_json TEXT NOT NULL DEFAULT '[]',
     metadata_json TEXT NOT NULL DEFAULT '{}',
     UNIQUE(message_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS block_relationships (
+    source_block_id TEXT NOT NULL REFERENCES blocks(id) ON DELETE CASCADE,
+    target_block_id TEXT NOT NULL REFERENCES blocks(id) ON DELETE CASCADE,
+    relation_type TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(source_block_id, target_block_id, relation_type)
 );
 
 CREATE TABLE IF NOT EXISTS retrieval_chunks (
@@ -204,6 +223,8 @@ CREATE INDEX IF NOT EXISTS idx_source_documents_kind ON source_documents(source_
 CREATE INDEX IF NOT EXISTS idx_source_documents_interest ON source_documents(interest_tier);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_blocks_conversation ON blocks(conversation_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_blocks_policy ON blocks(semantic_status, dense_index_policy, sparse_index_policy);
+CREATE INDEX IF NOT EXISTS idx_block_relationships_target ON block_relationships(target_block_id, relation_type);
 CREATE INDEX IF NOT EXISTS idx_retrieval_chunks_block ON retrieval_chunks(block_id, chunk_policy_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_knowledge_blocks_project ON knowledge_blocks(project_id, folder_kind, block_type);
 CREATE INDEX IF NOT EXISTS idx_knowledge_blocks_interest ON knowledge_blocks(interest_tier);
